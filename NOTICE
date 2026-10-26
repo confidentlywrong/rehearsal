@@ -1,0 +1,22 @@
+The Rehearsal
+Copyright 2026 Christian Haeussinger
+Code and software architecture created and maintained by Christian Haeussinger at https://github.com/confidentlywrong/rehearsal.
+Open-source companion to Chapters 4 and 5 and Appendices B, D and F of the book "Confidently Wrong", ISBN 979-8178685112.
+
+This product is derived from and includes software originally developed by
+Google LLC as part of the "race-condition" project at
+https://github.com/GoogleCloudPlatform/race-condition.
+Copyright 2026 Google LLC
+Licensed under the Apache License, Version 2.0.
+
+Summary of changes for The Rehearsal
+- Adapted the multi-agent simulation framework into a two-phase leadership
+  rehearsal workflow covering pre-rollout stakeholder network mapping,
+  consensus pathway calculation, six-axis plan evaluation and round-by-round
+  stakeholder simulation across three organizational tiers.
+- Added leadership planner, evaluator, cross-session memory, terrain runner
+  and stakeholder persona agents alongside post-simulation diagnostic cards
+  for executive coaching, 90-day action planning, translation diagnostics
+  and compliance with the knowledge withheld checks.
+
+Google, Gemini and Vertex AI are trademarks of Google LLC.
