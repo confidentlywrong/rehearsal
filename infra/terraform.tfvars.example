@@ -1,0 +1,256 @@
+# =============================================================================
+# OSS Deployment Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in your values.
+#
+# Required:
+#   project_id          Your GCP project ID
+#
+# Optional:
+#   region              GCP region (default: us-central1)
+#   developers          List of developer principals for IAM access
+#   db_initial_password Initial database password
+#
+# Feature toggles (all default to false):
+#   enable_alloydb          Use AlloyDB instead of Cloud SQL
+#   enable_gke              Deploy GKE cluster for GPU runner workloads
+#   enable_runner_cloudrun  Deploy LLM-powered runner on Cloud Run
+#   enable_maps_api_key     Create Maps/Places/Weather API key
+#   enable_monitoring       Deploy monitoring alerts
+# =============================================================================
+
+project_id = "your-gcp-project-id"
+region     = "us-central1"
+
+# Add your identity for IAM access to databases and APIs
+developers = [
+  # "user:you@example.com",
+]
+
+# Uncomment to enable optional features:
+# enable_alloydb         = true
+# enable_gke             = true
+# enable_runner_cloudrun = true
+# enable_maps_api_key    = true
+# enable_monitoring      = true
+# alert_email            = "you@example.com"
+
+# Database password (change this!)
+# db_initial_password = "YourSecurePassword123!"
+
+# =============================================================================
+# Per-user SaaS deploy
+#
+# The deployed stack is always per-user (one users table; user_id
+# everywhere). Pick an identity provider and (optionally) wire Stripe
+# billing + Firebase Auth.
+# =============================================================================
+
+# identity_provider  = "firebase"   # one of: local, firebase, iap
+# metering_sink      = "pubsub"     # one of: stdout, sqlite, pubsub
+
+# --- Stripe billing (optional add-on) ---
+# enable_billing_service = true    # deploys cmd/billing as its own Cloud Run service
+# enable_stripe_billing  = true    # provisions empty Secret Manager stubs for the Stripe keys
+# billing_provider       = "stripe"
+# stripe_price_map       = "price_1ABC:pro,price_1XYZ:team"
+# stripe_return_base_url = "https://frontend-PROJECTNUM.us-central1.run.app"
+#
+# After `terraform apply` with the above flags, populate the secrets:
+#   gcloud secrets versions add stripe-api-key        --data-file=- --project=YOUR_PROJECT
+#   gcloud secrets versions add stripe-webhook-secret --data-file=- --project=YOUR_PROJECT
+# Then copy `terraform output stripe_webhook_url` into the Stripe Dashboard.
+# See docs/ops/billing_stripe.md for the full operator runbook.
+
+# --- Firebase Auth (required when identity_provider="firebase") ---
+# Copy these values from Firebase console > Project settings > General.
+# The web API key is PUBLIC by design (it identifies the project to the
+# browser SDK; security is enforced by Firebase Rules + server-side
+# ID-token verification), so it's safe to commit a real value.
+# firebase_project_id  = "my-firebase-project"            # empty defaults to var.project_id
+# firebase_web_api_key = "AIzaSy...redacted..."
+# firebase_auth_domain = "my-firebase-project.firebaseapp.com"  # empty derives <project_id>.firebaseapp.com
+
+# --- Stateful infra safety ---
+# database_deletion_protection = true   # default; set false ONLY when tearing down
+
+# --- Payment-failed read-only gate (Phase 12, opt-in) ---
+# When enabled, writes from orgs with a past-due Stripe invoice are
+# 402'd after the grace period. Reads always pass; the user can still
+# reach /api/v1/me and /api/v1/billing/* to update their card. Default
+# off preserves byte-identical behavior for existing deployments.
+# enforce_payment_failed    = true
+# payment_failed_grace_days = 7
+
+# --- Cost protection (optional, off by default) ---
+# Provisions a project-level GCP billing budget with 50/90/100% email
+# alerts (and a 100% forecasted-spend warning). Advisory only -- does
+# NOT auto-shut-down anything. Find your billing_account_id with
+# `gcloud beta billing accounts list`.
+# enable_billing_budget = true
+# billing_account_id    = "01ABCD-234567-EF8901"
+# monthly_budget_amount = 100
+# budget_currency_code  = "USD"
+# budget_alert_emails   = ["ops@example.com", "founder@example.com"]
+
+# =============================================================================
+# E3a: Custom domain + HTTPS Load Balancer (optional)
+#
+# Empty `domain_names` (the default) keeps the deploy on *.run.app URLs
+# and CORS_ALLOWED_ORIGINS stays empty (legacy `*` behavior in the
+# middleware), byte-identical to the OSS demo.
+#
+# When non-empty, the loadbalancer module provisions:
+#   - a single global HTTPS LB (reserved IP + managed SSL cert with
+#     every domain as a SAN + URL map with one host_rule per entry)
+#   - a port-80 forwarding rule that 301s to https://
+#   - CORS_ALLOWED_ORIGINS on the public Cloud Run services is
+#     automatically locked down to `https://<fqdn>` for each entry.
+#
+# After `terraform apply` with these set:
+#   1. `terraform output loadbalancer_ip` -> point DNS A records at it
+#      (or set `dns_zone_name` below to have Terraform publish them).
+#   2. Wait 5-60 minutes for the managed SSL cert to leave PROVISIONING:
+#      gcloud compute ssl-certificates describe \
+#        $(terraform output -raw loadbalancer_ssl_certificate) \
+#        --global --project=YOUR_PROJECT
+#   3. Hit the URLs.
+# =============================================================================
+
+# domain_names = {
+#   frontend = "app.example.com"
+#   gateway  = "api.example.com"
+#   admin    = "admin.example.com"
+#   billing  = "hooks.example.com"   # only when enable_billing_service=true
+# }
+#
+# # Set when the DNS zone is in this same GCP project; the LB module
+# # will then publish the A records automatically. Otherwise leave
+# # empty and point DNS by hand.
+# dns_zone_name = ""
+
+# =============================================================================
+# E3b: Secret rotation runbook
+#
+# Secrets that already live in Google Secret Manager and are mounted
+# on Cloud Run via `secret_key_ref` (the GCP-native path; no Go change
+# needed when the underlying value rotates):
+#
+#   - cloudsql-postgres-password (auto-generated by cloud-sql-postgres
+#     module; rotate via the module).
+#   - stripe-api-key             (enable_stripe_billing=true)
+#   - stripe-webhook-secret      (enable_stripe_billing=true)
+#   - iap-oauth2-client-id       (modules/secrets, when IAP path used)
+#   - iap-oauth2-client-secret   (modules/secrets, when IAP path used)
+#
+# Rotation (no terraform apply required for the rotation itself
+# because the Cloud Run env mount uses `version: "latest"`):
+#
+#   gcloud secrets versions add stripe-api-key        --data-file=- --project=YOUR_PROJECT
+#   gcloud secrets versions add stripe-webhook-secret --data-file=- --project=YOUR_PROJECT
+#
+# Cloud Run picks up the new "latest" version on the next cold-start
+# of the instance; force an immediate cycle with:
+#
+#   gcloud run services update gateway --region=us-central1 \
+#     --project=YOUR_PROJECT --clear-secrets --update-secrets STRIPE_API_KEY=stripe-api-key:latest
+#
+# The Firebase Web API key is intentionally NOT in Secret Manager: it
+# identifies the Firebase project to the browser and is designed to
+# ship in the client bundle. Access control is enforced by Firebase
+# Security Rules + the gateway's server-side ID-token verification.
+
+# =============================================================================
+# E3c: Monitoring (operational alerts)
+#
+# Provisioned by `enable_monitoring = true`. In addition to the
+# pre-existing Redis/NAT/Gateway-uptime alerts, the module also fires
+# on: gateway 5xx rate >5% (5m), Cloud Run instance saturation (10m),
+# Cloud SQL CPU >80% (10m), Pub/Sub oldest_unacked_message_age >10m.
+# All alerts share the alert_email channel configured below.
+# =============================================================================
+
+# =============================================================================
+# Observability + hardening (default empty/false = legacy behavior)
+#
+# All of these flow into `local.common_env` on every Go Cloud Run
+# service. Each `cmd/*/main.go` reads them via os.Getenv at boot;
+# leaving them at the defaults emits NO env entry and preserves the
+# existing code path byte-identically.
+# =============================================================================
+
+# --- Structured logging ---
+# 'gcp' renames level->severity / msg->message / time->timestamp so
+# Cloud Logging categorizes by severity without a side agent. Flip
+# this on early; it costs nothing and unlocks log-based metrics.
+# log_format = "gcp"
+
+# --- OpenTelemetry -> Cloud Trace ---
+# Defaults to 10% sampling when otel_sample_ratio is empty (keeps
+# spend inside the 2.5M-spans/month free tier). Set otel_exporter
+# AFTER confirming the Cloud Trace API is enabled in the project.
+# otel_exporter    = "gcp"
+# otel_sample_ratio = ""   # "" = pkg default 0.1; set "1.0" for full
+
+# --- CSP enforce ---
+# Run CSP in report-only for ~1 week first (the default). Watch
+# Cloud Logging for `Content-Security-Policy-Report-Only` violation
+# reports, fix any third-party scripts you find, THEN flip:
+# csp_enforce = true
+
+# --- HSTS ---
+# Only flip ONCE the HTTPS LB + managed SSL certs are live and you
+# are committed to HTTPS-only for the host. HSTS pins are cached by
+# browsers; rolling back to plain HTTP is painful.
+# security_hsts = true
+
+# --- App Check (reCAPTCHA Enterprise) for Firebase Auth ---
+# 1) Firebase Console > App Check > register the web app > add the
+#    reCAPTCHA Enterprise provider > copy the SITE KEY (NOT the API
+#    key). 2) Paste below. 3) Soft-launch (App Check unenforced) for
+#    a day to confirm legitimate signups still succeed. 4) In the
+#    Firebase Console enable enforcement on the Authentication API.
+# recaptcha_enterprise_site_key = "6Lc...redacted..."
+
+# --- Multi-user planner isolation ---
+# Enforces owner_id row-level scoping in the planner agents. Required
+# when more than one user shares the planner backend; default off
+# preserves single-tenant legacy behavior for the OSS demo.
+# planner_per_user_isolation = true
+
+# =============================================================================
+# Cloud Run IAM: customer vs operator tier ($0/mo)
+#
+# For an EXTERNAL SaaS (customers have no Google identity):
+#
+#   1) Keep customer_uis_unauthenticated = true (the default). The
+#      frontend BFF must be allUsers because customers reach /login
+#      from arbitrary browsers. The real auth gate is Firebase ID-token
+#      verification in middleware.Account on every /api/v1/* call.
+#
+#   2) Set operator_principals to the Google identities that should be
+#      able to reach the OPERATOR-ONLY services (admin dashboard, live
+#      telemetry dash, and the load-generator `tester`). These three
+#      services are NEVER bound to allUsers in this module - leaving
+#      operator_principals empty makes them effectively unreachable
+#      (only the Cloud Build SA can invoke them).
+#
+#      Tester is the critical one: it proxies to Vertex AEs with the
+#      compute SA's OIDC token, so allUsers there = open Vertex quota
+#      burn. Locking it down is the actual P0.
+#
+# Access pattern for operators after applying:
+#
+#   gcloud run services proxy admin --region=us-central1 --port=8080
+#   # then browse http://localhost:8080 (gcloud handles auth headers)
+#
+# OR install a "Cloud Run Invoker" Chrome extension that injects:
+#   Authorization: Bearer $(gcloud auth print-identity-token)
+# =============================================================================
+
+# customer_uis_unauthenticated = true   # keep true for external SaaS
+
+# operator_principals = [
+#   "user:you@example.com",
+#   # "group:ops-team@example.com",
+# ]

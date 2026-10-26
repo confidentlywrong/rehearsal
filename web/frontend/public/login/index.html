@@ -1,0 +1,277 @@
+<!--
+ Copyright 2026 Christian Haeussinger
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+<!DOCTYPE html>
+<!--
+  The Rehearsal login UI.
+
+  Why this is a static HTML page and not an Angular route:
+  - The existing Angular app has NO router for the login flow.
+    Bootstrapping one just for a single sign-in screen would force
+    a structural change across the SPA.
+  - Keeping login outside the SPA bundle also means the auth flow
+    keeps working even when the Angular build is broken.
+
+  Behavior (Firebase-only since 2026-06-22 hardening, B-6):
+  - The page requires window.__firebaseConfig + apiKey. If either
+    is missing, the form is disabled and a "Sign-in is not
+    configured" banner is shown (login-app.js fail-closed guard).
+    There is NO local-dev fallback in this page anymore — the
+    previous client-side 'local-dev' POST to /api/v1/auth/exchange
+    was a silent auth-bypass risk and is gone.
+  - In local dev (IDENTITY_PROVIDER=local) this page is never
+    reached: cmd/frontend/main.go:loginHandler 302s /login → /
+    before the static file is served, because LocalResolver
+    auto-authenticates every request.
+  - On GCP (IDENTITY_PROVIDER=firebase) the page uses the Firebase
+    Web SDK from gstatic.com to perform:
+      \u2022 email/password SIGN-IN (signInWithEmailAndPassword)
+      \u2022 email/password SIGN-UP (createUserWithEmailAndPassword)
+      \u2022 PASSWORD RESET via Firebase's own SMTP
+        (sendPasswordResetEmail \u2014 zero app-side mail server needed,
+         which is what lets us add this feature without taking on
+         a dependency on SendGrid/Mailgun/SES)
+
+    The ID token is exchanged for an HttpOnly __session cookie via
+    POST /api/v1/auth/exchange, then the page redirects to the
+    original target. The token is also kept in localStorage so the
+    SPA's fetch interceptor can attach it as Authorization: Bearer.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · The Rehearsal</title>
+  <link rel="icon" href="/favicon.ico" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0e14;
+      --panel: #11161f;
+      --border: #1c2531;
+      --cyan: #00e5ff;
+      --green: #00ff9d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --error: #ff5b6e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+      background: radial-gradient(circle at 30% 20%, #0e1a2b 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    .card {
+      width: min(420px, 92vw);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px 28px;
+      box-shadow: 0 8px 40px rgba(0, 229, 255, 0.06);
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--cyan);
+      letter-spacing: 0.3px;
+    }
+    .subtitle {
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 14px 0 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      background: #0a0e14;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: var(--cyan); }
+    button {
+      width: 100%;
+      margin-top: 20px;
+      padding: 11px;
+      background: linear-gradient(135deg, var(--cyan), var(--green));
+      color: #001218;
+      border: 0;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      letter-spacing: 0.3px;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      margin-top: 10px;
+    }
+    .error {
+      margin-top: 14px;
+      padding: 10px 12px;
+      background: rgba(255, 91, 110, 0.08);
+      border: 1px solid rgba(255, 91, 110, 0.3);
+      border-radius: 6px;
+      color: var(--error);
+      font-size: 13px;
+      display: none;
+    }
+    .error.show { display: block; }
+    .notice {
+      margin-top: 14px;
+      padding: 10px 12px;
+      background: rgba(0, 255, 157, 0.08);
+      border: 1px solid rgba(0, 255, 157, 0.3);
+      border-radius: 6px;
+      color: var(--green);
+      font-size: 13px;
+      display: none;
+    }
+    .notice.show { display: block; }
+    .mode-pill {
+      display: inline-block;
+      margin-bottom: 16px;
+      padding: 3px 10px;
+      background: rgba(0, 229, 255, 0.1);
+      border: 1px solid rgba(0, 229, 255, 0.3);
+      border-radius: 999px;
+      font-size: 11px;
+      color: var(--cyan);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .footer {
+      margin-top: 22px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      text-align: center;
+    }
+    /* G1: signup / reset toggles live inline below the fields so
+       the page stays one card with one button visible at a time. */
+    .toggles {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    .toggles a {
+      color: var(--cyan);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .toggles a:hover { text-decoration: underline; }
+    .toggles[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <!-- Default text shown until login-app.js runs and replaces
+         it with "Firebase" (configured) or "Not configured"
+         (missing FIREBASE_API_KEY). Pre-2026-06-22 default was
+         "Local", which lied about an extinct mode whenever the
+         script failed to execute (e.g. CSP regression). -->
+    <span class="mode-pill" id="mode-pill">Loading...</span>
+    <h1 id="card-title">The Rehearsal</h1>
+    <p class="subtitle" id="card-subtitle">Sign in to your workspace.</p>
+
+    <form id="login-form">
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="username" required />
+
+      <!-- G1: shown in sign-in and sign-up modes; hidden in reset mode -->
+      <div id="password-row">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" />
+      </div>
+
+      <button type="submit" id="submit">Continue</button>
+
+      <!-- G1: mode toggles. Hidden in local mode (toggles are no-ops
+           against LocalResolver). Hidden in reset mode (only "back"
+           is shown there to keep the surface small). -->
+      <div class="toggles" id="toggles" hidden>
+        <a id="toggle-signup" data-mode="signup">Create an account</a>
+        <a id="toggle-reset" data-mode="reset">Forgot password?</a>
+      </div>
+      <div class="toggles" id="toggles-back" hidden>
+        <a id="toggle-signin" data-mode="signin">Back to sign in</a>
+      </div>
+
+      <div class="error" id="error"></div>
+      <div class="notice" id="notice"></div>
+    </form>
+
+    <!--
+      Footer kept (hidden by default) so login-app.js can still call
+      footerEl.style.display without a null-check. The previous
+      "Single-tenant mode? Just click Continue — no password needed."
+      hint was removed 2026-06-22 along with the client-side local
+      fallback: the page is now Firebase-only.
+    -->
+    <div class="footer" id="footer" hidden></div>
+  </div>
+
+  <!--
+    Pull SaaS config from the BFF. The same /config.js drives the
+    Angular AuthService \u2014 keeping one source of truth.
+  -->
+  <script src="/config.js"></script>
+  <!--
+    CSP fix (2026-06-22): the window.ENV → window.__firebaseConfig
+    setter that used to live inline here now lives in /login/config-init.js
+    so it survives the deployed CSP `script-src 'self'
+    https://www.gstatic.com https://apis.google.com` (no `'unsafe-inline'`,
+    no nonce, no hash). Classic scripts execute in document order, so
+    this MUST stay between /config.js and /login/login-app.js — the
+    latter reads window.__firebaseConfig.
+  -->
+  <script src="/login/config-init.js"></script>
+
+  <!--
+    CSP fix (2026-06-22): the form / submit-handler / Firebase SDK
+    loader IIFE that used to live inline here now lives in
+    /login/login-app.js. Same reason as config-init.js above: the
+    deployed CSP `script-src 'self' …` (no `'unsafe-inline'`, no
+    nonce, no hash) blocked the inline version, leaving the login
+    form with no submit handler and the page stuck in "Local" mode
+    in production. Must load AFTER /login/config-init.js so
+    window.__firebaseConfig is set by the time this runs.
+  -->
+  <script src="/login/login-app.js"></script>
+</body>
+</html>
