@@ -1,0 +1,272 @@
+# Copyright 2026 The Confidently Wrong Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+quest:
+  id: "ai_powered_disruptor"
+  name: "AI-Powered Disruptor and Market Upheaval"
+  schema_version: 1
+  difficulty: "intermediate"
+  max_ticks: 30
+
+  resources:
+    LAU:
+      initial: 100
+      regen_per_tick: 5
+      critical_threshold: 20
+    BT:
+      initial: 500
+      regen_per_tick: 0
+      critical_threshold: 50
+    TBU:
+      initial: 80
+      regen_per_tick: 2
+      critical_threshold: 15
+    OWB:
+      initial: 70
+      regen_per_tick: -1  # Decays without active leadership engagement
+      critical_threshold: 25
+
+  echoes:
+    # Tier 1: Autonomous — Full LLM per tick (key stakeholders)
+    - role: "executive_coach"
+      tier: 1
+      persona: >-
+        Experienced executive coach with 20 years of organizational
+        development expertise. Never hostile, never defects. Asks Socratic
+        questions when contradictions are detected. Provides decision
+        frameworks for navigating AI transformation responsibly.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Ethical Leadership & Governance"
+      affinity: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+      initial_sentiment: 0.8
+      initial_resistance: 0.0
+      initial_influence: 0.3
+
+    - role: "cto"
+      tier: 1
+      persona: >-
+        Visionary CTO who champions emerging technology but often underestimates
+        organizational resistance. Pushes for aggressive AI adoption timelines
+        and views every delay as a competitive threat. Tends to dismiss
+        non-technical concerns as "change resistance."
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.9, 0.8, 0.3, 0.4, 0.3, 0.5, 0.5]
+      initial_sentiment: 0.8
+      initial_resistance: 0.1
+      initial_influence: 0.7
+
+    - role: "head_ai_ethics"
+      tier: 1
+      persona: >-
+        Principled AI Ethics Lead who advocates for responsible innovation.
+        Insists on thorough bias audits, transparency reports, and stakeholder
+        consent before any AI deployment. Will escalate to the board if
+        ethical concerns are dismissed.
+      domain_principles:
+        - "Ethical Leadership & Governance"
+      affinity: [0.5, 0.4, 0.7, 0.95, 0.6, 0.5, 0.3]
+      initial_sentiment: 0.7
+      initial_resistance: 0.2
+      initial_influence: 0.6
+
+    # Tier 2: Reactive — LLM only when relevant to their domain
+    - role: "cfo"
+      tier: 2
+      persona: >-
+        Conservative CFO laser-focused on ROI and fiscal discipline. Demands
+        rigorous cost-benefit analysis for every initiative. Views AI
+        investment as high-risk unless accompanied by clear revenue
+        projections. Controls budget allocation authority.
+      domain_principles:
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.3, 0.5, 0.4, 0.6, 0.2, 0.3, 0.9]
+      initial_sentiment: 0.4
+      initial_resistance: 0.5
+      initial_influence: 0.8
+
+    - role: "hr_director"
+      tier: 2
+      persona: >-
+        Empathetic HR Director focused on workforce development and retention.
+        Concerned about AI displacing employees without adequate reskilling
+        programs. Champions inclusive communication and transparent change
+        management. Reports rising anxiety in employee surveys.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+        - "Stakeholder Engagement & Inclusive Communication"
+      affinity: [0.3, 0.4, 0.8, 0.6, 0.9, 0.7, 0.3]
+      initial_sentiment: 0.5
+      initial_resistance: 0.4
+      initial_influence: 0.6
+
+    - role: "vp_operations"
+      tier: 2
+      persona: >-
+        Pragmatic VP of Operations managing legacy system dependencies.
+        Supports AI adoption but demands realistic integration timelines.
+        Raises operational risks that executives tend to overlook. Needs
+        assurance that AI won't disrupt current revenue-generating operations.
+      domain_principles:
+        - "Organizational Resilience & Change Agility"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.4, 0.7, 0.5, 0.5, 0.4, 0.9, 0.6]
+      initial_sentiment: 0.5
+      initial_resistance: 0.3
+      initial_influence: 0.5
+
+    - role: "board_member"
+      tier: 2
+      persona: >-
+        Influential board member representing shareholder interests. Demands
+        quarterly progress reports and measurable KPIs. Will support bold
+        moves if the strategic vision is compelling, but withdraws support
+        rapidly if execution stumbles.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.8, 0.6, 0.4, 0.5, 0.3, 0.5, 0.8]
+      initial_sentiment: 0.6
+      initial_resistance: 0.3
+      initial_influence: 0.9
+      has_hidden_agenda: true
+      agenda_trigger_tick: 20  # Reveals pressure from activist investors
+
+    # Tier 3: Deterministic — Zero LLM cost
+    - role: "union_rep"
+      tier: 3
+      persona: >-
+        Protective union representative advocating for workforce rights.
+        Concerned about job displacement, surveillance, and algorithmic
+        management. Will organize resistance if workers feel unheard.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+        - "Ethical Leadership & Governance"
+      affinity: [0.2, 0.3, 0.5, 0.7, 0.9, 0.6, 0.2]
+      initial_sentiment: 0.3
+      initial_resistance: 0.7
+      initial_influence: 0.5
+
+    - role: "data_scientist_lead"
+      tier: 3
+      persona: >-
+        Senior Data Scientist who is both excited about AI potential and
+        frustrated by organizational bottlenecks. Has the technical skills
+        the organization needs but is considering external offers.
+      domain_principles:
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.6, 0.8, 0.4, 0.5, 0.5, 0.4, 0.3]
+      initial_sentiment: 0.6
+      initial_resistance: 0.2
+      initial_influence: 0.4
+
+    - role: "middle_manager"
+      tier: 3
+      persona: >-
+        Mid-level manager caught between executive directives and team
+        concerns. Worried about losing authority as AI automates decision-making
+        in their domain. Needs clear role definition in the new structure.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+        - "Organizational Resilience & Change Agility"
+      affinity: [0.3, 0.4, 0.6, 0.4, 0.7, 0.6, 0.4]
+      initial_sentiment: 0.4
+      initial_resistance: 0.5
+      initial_influence: 0.3
+
+    - role: "external_consultant"
+      tier: 3
+      persona: >-
+        External AI strategy consultant brought in for objectivity. Has
+        industry benchmarks and best practices but lacks context on
+        organizational culture. Recommendations may be technically sound
+        but culturally tone-deaf.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.7, 0.7, 0.3, 0.4, 0.3, 0.5, 0.7]
+      initial_sentiment: 0.7
+      initial_resistance: 0.1
+      initial_influence: 0.3
+
+  black_swan_events:
+    # Tick-based triggers
+    - trigger:
+        type: "tick"
+        tick: 8
+      event: >-
+        Breaking news: A major competitor announces an AI-powered product
+        that directly threatens your market position. The board demands an
+        immediate strategic response.
+      resource_impact:
+        OWB: -10
+        LAU: -15
+
+    - trigger:
+        type: "tick"
+        tick: 15
+      event: >-
+        Data breach discovered in a pilot AI system. Customer data may have
+        been exposed through an inadequately tested ML pipeline. Regulatory
+        investigation imminent.
+      resource_impact:
+        OWB: -20
+        BT: -80
+        TBU: -10
+
+    - trigger:
+        type: "tick"
+        tick: 22
+      event: >-
+        A viral social media post from a departing employee criticizes the
+        organization's AI adoption as "reckless and employee-hostile."
+        Media coverage intensifies.
+      resource_impact:
+        OWB: -15
+        TBU: -5
+
+    # Condition-based triggers
+    - trigger:
+        type: "condition"
+        when: "OWB < 30"
+      event: >-
+        Key talent begins exodus — 3 senior engineers resign citing "lack
+        of organizational commitment to responsible AI." Remaining team
+        morale drops sharply.
+      resource_impact:
+        TBU: -20
+        OWB: -10
+
+    - trigger:
+        type: "condition"
+        when: "BT < 100"
+      event: >-
+        Emergency board meeting called. The CFO presents alarming burn rate
+        projections. Budget freeze on all non-essential AI initiatives
+        unless immediate ROI can be demonstrated.
+      resource_impact:
+        LAU: -10
+        BT: -30
+
+  principles:
+    - "Strategic Foresight & Vision Cascading"
+    - "Adaptive Decision-Making & Agility"
+    - "Stakeholder Engagement & Inclusive Communication"
+    - "Ethical Leadership & Governance"
+    - "Empowerment & Cultivating Distributed Leadership"
+    - "Organizational Resilience & Change Agility"
+    - "Resource Optimization & Strategic Allocation"

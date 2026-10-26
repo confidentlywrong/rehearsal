@@ -1,0 +1,124 @@
+# Copyright 2026 Google LLC
+# Modifications copyright 2026 The Confidently Wrong Authors
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:568.0.0
+    command: gcloud beta emulators pubsub start --host-port=0.0.0.0:8085
+    restart: unless-stopped  # L25: auto-restart on crash
+    ports:
+      - "9103:8085"
+    environment:
+      - PUBSUB_PROJECT_ID=test-project
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085/v1/projects || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass localdev --maxclients 2048 --tcp-backlog 128 --save "" --stop-writes-on-bgsave-error no
+    restart: unless-stopped  # L25: auto-restart on crash
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    ports:
+      - "9102:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=localdev redis-cli ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+  postgres:
+    container_name: leadership-sim-postgres
+    build:
+      context: .
+      dockerfile: infra/postgres/Dockerfile.local
+    image: leadership-sim-postgres-local:pg16
+    command: ["postgres", "-c", "log_checkpoints=off", "-c", "log_min_messages=warning"]
+    restart: unless-stopped  # L25: auto-restart on crash
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: postgres
+    ports:
+      - "9113:5432"
+    volumes:
+      - alloydb-local-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # ───────────────────────── SaaS shell (Phase 1) ─────────────────────────
+  # The services below are GATED behind the `saas` profile and only
+  # start when the developer explicitly opts in with:
+  #   docker compose --profile saas up
+  # (or `make saas-local` once that target lands). They are NEVER
+  # required for the legacy single-tenant `make start` flow, which
+  # must continue to behave byte-identically.
+
+  firebase-auth-emulator:
+    # andreysenov/firebase-tools is a community image that bundles the
+    # Firebase CLI + Auth emulator. We pin to a stable major version.
+    # The emulator does NOT validate API keys, so we pass a stub one
+    # via the FIREBASE_API_KEY env var in .env (default "demo-key").
+    image: andreysenov/firebase-tools:13.0.2
+    profiles:
+      - saas
+    command:
+      - firebase
+      - emulators:start
+      - --only=auth
+      - --project=${FIREBASE_PROJECT_ID:-rc-local-dev}
+    ports:
+      - "9099:9099"   # Auth emulator REST API
+      - "9100:4000"   # Emulator UI (host port 9100 reserved for SaaS)
+    environment:
+      - GCLOUD_PROJECT=${FIREBASE_PROJECT_ID:-rc-local-dev}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9099/emulator/v1/projects || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '1.0'
+
+volumes:
+  # NOTE: This volume persists data across restarts. If migrations change,
+  # run `docker compose down -v` to force re-initialization.
+  alloydb-local-data:

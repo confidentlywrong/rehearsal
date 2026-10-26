@@ -1,0 +1,87 @@
+<!doctype html>
+<!--
+ Copyright 2026 Google LLC
+ Modifications copyright 2026 The Confidently Wrong Authors
+ Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leadership Simulation | Admin</title>
+    <link rel="stylesheet" href="style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Outfit:wght@300;400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <div class="glass-container">
+      <header>
+        <div class="logo">
+          <span class="pulse-icon"></span>
+          <h1>Simulation Admin</h1>
+        </div>
+        <div class="status-summary">
+          <span id="global-status" class="status-badge status-unknown"
+            >System Pulse: Scanning...</span
+          >
+        </div>
+      </header>
+
+      <nav class="tab-bar" id="tab-bar" role="tablist" aria-label="Admin sections">
+        <button class="tab-btn tab-active" role="tab" data-tab="health" aria-selected="true">
+          <span class="tab-icon">📡</span>Health
+        </button>
+        <button class="tab-btn" role="tab" data-tab="users" aria-selected="false">
+          <span class="tab-icon">👤</span>Users
+        </button>
+        <button class="tab-btn" role="tab" data-tab="audit" aria-selected="false">
+          <span class="tab-icon">📜</span>Audit
+        </button>
+        <button class="tab-btn" role="tab" data-tab="ops" aria-selected="false">
+          <span class="tab-icon">🛠️</span>Operations
+        </button>
+      </nav>
+
+      <main>
+        <section id="tab-health" class="tab-panel tab-panel-active" role="tabpanel">
+          <div id="categories-container">
+            <!-- Categories and Service Cards will be injected here -->
+          </div>
+        </section>
+        <section id="tab-users" class="tab-panel" role="tabpanel" hidden>
+          <div id="users-container"><!-- populated by users.js --></div>
+        </section>
+        <section id="tab-audit" class="tab-panel" role="tabpanel" hidden>
+          <div id="audit-container"><!-- populated by audit.js --></div>
+        </section>
+        <section id="tab-ops" class="tab-panel" role="tabpanel" hidden>
+          <div id="ops-container"><!-- populated by ops.js --></div>
+        </section>
+      </main>
+
+      <footer>
+        <p>&copy; 2026 Google N26 DevKey Simulation Team</p>
+        <div id="last-update">Last Check: --:--:--</div>
+      </footer>
+    </div>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

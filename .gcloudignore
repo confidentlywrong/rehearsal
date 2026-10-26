@@ -1,0 +1,115 @@
+# .gcloudignore — files NOT uploaded to Cloud Build by `gcloud builds submit`.
+#
+# When this file is absent, gcloud uses `.gitignore` as the upload-exclude
+# basis. That breaks deploys because `infra/terraform.tfvars` is gitignored
+# (it contains secrets like db_initial_password), but Cloud Build needs it
+# to apply the configured deployment (identity_provider, billing flags,
+# firebase keys, monitoring, etc. — none of which the YAML passes as
+# explicit -var flags).
+#
+# This file makes the upload rules explicit and KEEPS infra/terraform.tfvars
+# included.
+
+# --- VCS / IDE / Agent noise ---
+.git/
+.gitignore
+.gcloudignore
+.dockerignore
+.github/
+.vscode/
+.idea/
+.claude/
+.gemini/
+.cursorrules
+.cursor/
+.windsurf/
+.agents/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.DS_Store
+**/.DS_Store
+
+# --- Local dev environment files (MUST NOT ship to Cloud Build) ---
+# scripts/deploy/deploy.py calls load_dotenv(override=True), so any .env
+# file in the upload would override Cloud Build's PROJECT_ID env var.
+# .env.example stays out too (harmless, but no reason to ship it).
+.env
+.env.*
+**/.env
+**/.env.*
+!infra/terraform.tfvars   # explicit allow — see note below
+
+# --- Local dev / build / test caches (don't ship to Cloud Build) ---
+.venv/
+.venv*/
+.ruff_cache/
+.pytest_cache/
+.uv_cache/
+.mypy_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+node_modules/
+**/node_modules/
+dist/
+build/
+**/dist/
+**/build/
+.angular/
+**/.angular/
+tests/
+concepts/
+.harness-runs/
+docs/plans/
+agents/catalog.json
+.adk/
+.port-slot
+.worktrees/
+docker-compose.override.yml
+.coverage
+coverage.out
+coverage.html
+coverage.xml
+htmlcov/
+
+# --- Logs and runtime data ---
+logs/
+**/logs/
+*.log
+data/
+**/data/
+scratch/
+scratch.py
+
+# --- Terraform local state (state lives in GCS) ---
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfstate
+infra/*.tfstate.*
+infra/errored.tfstate*
+infra/*.tfplan
+infra/tfplan
+infra/services.auto.tfvars.json
+infra/tests.disabled/
+# Each module subdir gets its own .terraform/providers/ when tofu init is
+# run locally — ~115 MiB per provider mirror. Cloud Build downloads fresh
+# providers from the registry; don't ship the local cache.
+infra/modules/**/.terraform/
+infra/**/.terraform.lock.hcl
+
+# --- Stale local binaries at repo root (Cloud Build rebuilds from src) ---
+/admin
+/billing
+/frontend
+/gateway
+/tester
+/stress
+alloydb-auth-proxy
+
+# NOTE: infra/terraform.tfvars IS uploaded so Cloud Build's terraform apply
+# can read identity_provider, enable_billing_service, firebase_*,
+# alert_email, etc. The file contains db_initial_password —
+# the Cloud Build staging bucket is project-internal (IAM-controlled).
+# Rotate the password via Secret Manager after first apply.
