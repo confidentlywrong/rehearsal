@@ -1,0 +1,81 @@
+# Copyright 2026 The Confidently Wrong Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# --- VCS / IDE / Agent directories ---
+.git
+.github
+.vscode
+.idea
+.claude
+.gemini
+.cursor*
+.windsurf
+.agents
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.DS_Store
+**/.DS_Store
+
+# --- Local environment & credentials ---
+.env
+.env.*
+**/.env
+**/.env.*
+
+# --- Python caches & virtual environments ---
+.venv*
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.ruff_cache
+.pytest_cache
+.uv_cache
+.mypy_cache
+
+# --- Node / frontend caches & unit test bundles ---
+**/node_modules
+web/admin-dash/dist
+web/tester/dist
+web/frontend/dist/test-out
+**/*.map
+.angular
+**/.angular
+
+# --- Logs, runtime data, scratch & local test harnesses ---
+logs
+**/logs
+*.log
+data
+**/data
+tests
+scratch
+scratch.py
+concepts
+docs/plans
+.harness-runs
+agents/catalog.json
+.coverage
+coverage.*
+htmlcov
+
+# --- Terraform state & local provider caches ---
+infra/.terraform
+infra/**/.terraform
+infra/*.tfstate*
+infra/errored.tfstate*
+infra/*.tfplan
+infra/tfplan
+infra/terraform.tfvars
+infra/services.auto.tfvars.json

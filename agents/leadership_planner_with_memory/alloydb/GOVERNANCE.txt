@@ -1,0 +1,29 @@
+BUDGET GOVERNANCE FRAMEWORK
+1. Budget Approval Thresholds
+   - <$50K: Department head approval only
+   - $50K-$250K: VP approval + finance review
+   - $250K-$1M: C-suite approval + board notification
+   - >$1M: Full board approval required
+2. Emergency Budget Authority
+   - Crisis declaration allows 48-hour interim spend up to $100K
+   - Must be ratified by CFO within 5 business days
+
+STAKEHOLDER QUORUM RULES
+1. Decision Quorum Requirements
+   - Strategic decisions: 2/3 of named stakeholders must participate
+   - Operational decisions: Simple majority (>50%)
+   - Emergency decisions: Minimum 3 senior stakeholders
+2. Consensus Thresholds
+   - Unanimous consent required for: org restructuring, M&A, CEO succession
+   - Supermajority (75%) for: budget reallocation >20%, new market entry
+   - Simple majority for: hiring, vendor selection, process changes
+
+CRISIS MANAGEMENT PROTOCOL
+1. Crisis Classification
+   - Level 1 (Monitor): Potential risk identified, no immediate action required
+   - Level 2 (Respond): Active threat, response team assembled within 4 hours
+   - Level 3 (Escalate): Material impact, CEO briefed within 1 hour, board within 24 hours
+2. Communication Cadence
+   - Level 1: Weekly status updates to stakeholders
+   - Level 2: Daily briefings, external comms hold
+   - Level 3: Continuous situation room, hourly updates, external PR activated

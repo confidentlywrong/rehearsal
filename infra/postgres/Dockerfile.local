@@ -1,0 +1,46 @@
+# Copyright 2026 The Confidently Wrong Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM pgvector/pgvector:pg16
+
+# Bake local init SQL into the image so docker-compose does not need
+# host file bind-mounts under /Users/... (which currently fail in this environment).
+COPY scripts/postgres-init/ /docker-entrypoint-initdb.d/
+
+# planner_with_memory regulations + planned_routes (only applied on first volume init)
+COPY agents/leadership_planner_with_memory/alloydb/schema_local.sql /docker-entrypoint-initdb.d/05_memory_schema.sql
+COPY agents/leadership_planner_with_memory/alloydb/seed_local.sql /docker-entrypoint-initdb.d/06_memory_seed.sql
+
+# Per-user schema. There is no tenancy / multi-org concept in this
+# codebase any more. The migration is fully idempotent (every
+# CREATE uses IF NOT EXISTS, seed INSERTs are guarded by NOT EXISTS)
+# so applying it on first boot is safe. Without this line the
+# gateway/admin/billing services would 500 on the first request
+# until they each apply the migration themselves on cold start — a
+# fragile dependency for local dev.
+#
+# Numbered 99_ so it runs AFTER 01-04 in alphabetical order
+# (Postgres entrypoint convention).
+# Core user/billing schema
+COPY migrations/0001_users.sql /docker-entrypoint-initdb.d/91_users.sql
+# Analysis tables (analyses, analysis_documents)
+COPY migrations/0002_analyses.sql /docker-entrypoint-initdb.d/92_analyses.sql
+# Full-text search indexes on nodes
+COPY migrations/0003_node_fts.sql /docker-entrypoint-initdb.d/93_node_fts.sql
+# Analysis proposals tables
+COPY migrations/0004_analysis_proposals.sql /docker-entrypoint-initdb.d/94_proposals.sql
+# Schema nullable fix
+COPY migrations/0005_analyses_org_name_nullable.sql /docker-entrypoint-initdb.d/95_org_nullable.sql
+# Document chunks
+COPY migrations/0006_document_chunks.sql /docker-entrypoint-initdb.d/96_doc_chunks.sql

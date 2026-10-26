@@ -1,0 +1,39 @@
+<!--
+ Copyright 2026 Google LLC
+ Modifications copyright 2026 The Confidently Wrong Authors
+ Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<!--
+  The settings gear + unfold/collapse toggle that used to live here
+  were removed on 2026-06-22. The demo runtime knobs (Download
+  recording, AI Connection Cached/Live, Replay speed, Planner
+  security, Cloud Assist) are now reachable from the user-menu
+  dropdown at the top-right corner (see app/auth/user-menu.component.ts
+  + app/components/ChatNavPanel/screens/AgentScreen/agent-runtime-controls.service.ts).
+  The chat panel no longer has an expand toggle; it sizes itself.
+-->
+<div class="agent-panel-header">
+  <div class="agent-panel-header__title-row">
+    <app-agent-tab-strip
+      [host]="host"
+      [panelExpanded]="panelExpanded"
+      [activeTab]="activeTab"
+      [tabBtnWide]="tabBtnWide"
+      [showTabLabels]="showTabLabels"
+      [isAgentWorking]="isAgentWorking"
+    />
+  </div>
+</div>

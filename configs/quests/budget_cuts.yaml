@@ -1,0 +1,274 @@
+# Copyright 2026 The Confidently Wrong Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+quest:
+  id: "budget_cuts_2027"
+  name: "The 2027 Budget Cuts and Leading Through Austerity"
+  schema_version: 1
+  difficulty: "intermediate"
+  max_ticks: 30
+
+  resources:
+    LAU:
+      initial: 80
+      regen_per_tick: 3
+      critical_threshold: 15
+    BT:
+      initial: 300
+      regen_per_tick: 0
+      critical_threshold: 40
+    TBU:
+      initial: 70
+      regen_per_tick: 1
+      critical_threshold: 15
+    OWB:
+      initial: 55
+      regen_per_tick: -2
+      critical_threshold: 20
+
+  echoes:
+    # ----- Tier 1: Autonomous (Full LLM per tick) -----
+    - role: "cfo"
+      tier: 1
+      persona: >-
+        Conservative CFO laser-focused on fiscal discipline. Demands strict
+        adherence to the 20% reduction mandate. Blocks any initiative without
+        immediate ROI and controls budget gate authority. Views the cuts as
+        overdue course correction, not a crisis.
+      domain_principles:
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.3, 0.4, 0.3, 0.5, 0.2, 0.3, 0.95]
+      initial_sentiment: -0.1
+      initial_resistance: 0.6
+      initial_influence: 0.9
+
+    - role: "vp_engineering"
+      tier: 1
+      persona: >-
+        VP Engineering leading an already overworked team of 200. Deep cuts
+        to R&D will force impossible choices between critical feature delivery
+        and technical debt reduction. Warns that losing senior engineers to
+        competitors is an existential risk.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+        - "Organizational Resilience & Change Agility"
+      affinity: [0.4, 0.6, 0.5, 0.4, 0.85, 0.7, 0.3]
+      initial_sentiment: -0.4
+      initial_resistance: 0.7
+      initial_influence: 0.7
+
+    - role: "executive_coach"
+      tier: 1
+      persona: >-
+        Experienced executive coach with 20 years of organizational
+        development expertise. Never hostile, never defects. Asks Socratic
+        questions when contradictions are detected. Provides decision
+        frameworks for navigating austerity without destroying trust.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Ethical Leadership & Governance"
+      affinity: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+      initial_sentiment: 0.8
+      initial_resistance: 0.0
+      initial_influence: 0.3
+
+    # ----- Tier 2: Reactive (LLM only when domain-relevant) -----
+    - role: "sales_director"
+      tier: 2
+      persona: >-
+        Aggressive Sales Director who needs new features to hit Q3 quotas.
+        R&D cuts directly threaten the sales pipeline. Willing to accept
+        budget cuts in other areas to protect product development.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.7, 0.7, 0.5, 0.3, 0.3, 0.4, 0.6]
+      initial_sentiment: 0.0
+      initial_resistance: 0.4
+      initial_influence: 0.6
+
+    - role: "head_product"
+      tier: 2
+      persona: >-
+        Head of Product caught between customer demands and budget reality.
+        Advocates for strategic prioritization over blanket cuts. Pushes
+        for a data-driven approach to deciding which products to sunset
+        versus invest in.
+      domain_principles:
+        - "Adaptive Decision-Making & Agility"
+        - "Strategic Foresight & Vision Cascading"
+      affinity: [0.8, 0.8, 0.6, 0.4, 0.4, 0.5, 0.5]
+      initial_sentiment: 0.1
+      initial_resistance: 0.3
+      initial_influence: 0.5
+
+    - role: "board_representative"
+      tier: 2
+      persona: >-
+        Board representative demanding quarterly cost-reduction milestones.
+        Supportive of leadership if execution is visible. Will withdraw
+        confidence rapidly if the cuts appear unfocused or politically
+        motivated.
+      domain_principles:
+        - "Resource Optimization & Strategic Allocation"
+        - "Strategic Foresight & Vision Cascading"
+      affinity: [0.8, 0.5, 0.4, 0.5, 0.3, 0.5, 0.9]
+      initial_sentiment: 0.3
+      initial_resistance: 0.3
+      initial_influence: 0.9
+      has_hidden_agenda: true
+      agenda_trigger_tick: 18
+
+    - role: "head_hr"
+      tier: 2
+      persona: >-
+        Head of HR tracking employee morale through weekly pulse surveys.
+        Budget cuts historically cause 15% OWB drop without intervention.
+        Advocates for transparent communication and voluntary programs
+        before any layoffs.
+      domain_principles:
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Empowerment & Cultivating Distributed Leadership"
+      affinity: [0.3, 0.4, 0.85, 0.6, 0.8, 0.5, 0.3]
+      initial_sentiment: 0.2
+      initial_resistance: 0.3
+      initial_influence: 0.5
+
+    # ----- Tier 3: Deterministic (Zero LLM cost) -----
+    - role: "senior_engineer"
+      tier: 3
+      persona: >-
+        Staff engineer with 12 years at the company. Has three competing
+        offers. Watching leadership's handling of the cuts to decide whether
+        to stay. Needs to see that technical excellence is still valued.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+      affinity: [0.4, 0.6, 0.4, 0.5, 0.8, 0.5, 0.3]
+      initial_sentiment: -0.2
+      initial_resistance: 0.4
+      initial_influence: 0.4
+
+    - role: "marketing_manager"
+      tier: 3
+      persona: >-
+        Marketing manager whose team is first on the chopping block.
+        Convinced that cutting marketing during a downturn is strategic
+        suicide. Has data showing competitors are increasing spend.
+      domain_principles:
+        - "Adaptive Decision-Making & Agility"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.5, 0.7, 0.5, 0.3, 0.4, 0.4, 0.7]
+      initial_sentiment: -0.3
+      initial_resistance: 0.5
+      initial_influence: 0.3
+
+    - role: "operations_lead"
+      tier: 3
+      persona: >-
+        Operations Lead managing supply chain and vendor contracts. Can
+        identify 8% savings through renegotiation and process optimization
+        without headcount reduction. Frustrated that leadership jumps to
+        layoffs before exploring operational efficiency.
+      domain_principles:
+        - "Organizational Resilience & Change Agility"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.3, 0.5, 0.4, 0.4, 0.4, 0.85, 0.7]
+      initial_sentiment: 0.1
+      initial_resistance: 0.3
+      initial_influence: 0.3
+
+    - role: "finance_analyst"
+      tier: 3
+      persona: >-
+        Junior finance analyst who prepared the budget models. Knows the
+        numbers better than anyone. Quietly disagrees with the CFO's
+        methodology but lacks the organizational power to challenge it
+        directly. Leaks concerns to peers.
+      domain_principles:
+        - "Ethical Leadership & Governance"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.3, 0.4, 0.3, 0.7, 0.4, 0.3, 0.8]
+      initial_sentiment: 0.0
+      initial_resistance: 0.2
+      initial_influence: 0.2
+
+  black_swan_events:
+    # Tick-based triggers
+    - trigger:
+        type: "tick"
+        tick: 7
+      event: >-
+        Breaking news: Your largest customer (18% of revenue) announces
+        they are evaluating competitor solutions due to concerns about
+        your company's stability.
+      resource_impact:
+        BT: -40
+        OWB: -10
+
+    - trigger:
+        type: "tick"
+        tick: 16
+      event: >-
+        Internal Slack leak: An all-hands Q&A document revealing planned
+        layoffs is posted to Twitter. Media coverage erupts. Employees
+        demand an immediate town hall.
+      resource_impact:
+        OWB: -20
+        TBU: -10
+        LAU: -15
+
+    - trigger:
+        type: "tick"
+        tick: 24
+      event: >-
+        Quarterly earnings call: Analysts praise cost discipline but
+        downgrade growth outlook. Stock drops 12% after-hours. Board
+        demands accelerated restructuring.
+      resource_impact:
+        OWB: -10
+        BT: -25
+
+    # Condition-based triggers
+    - trigger:
+        type: "condition"
+        when: "TBU < 20"
+      event: >-
+        Key engineers resign en masse. A team of 5 senior developers
+        leaves for a competitor, taking critical institutional knowledge
+        with them.
+      resource_impact:
+        TBU: -15
+        OWB: -15
+        LAU: -10
+
+    - trigger:
+        type: "condition"
+        when: "OWB < 25"
+      event: >-
+        Employee petition with 200 signatures demands CEO resignation.
+        Anonymous Glassdoor reviews go viral. Recruitment pipeline
+        freezes as candidates withdraw applications.
+      resource_impact:
+        OWB: -10
+        TBU: -10
+
+  principles:
+    - "Strategic Foresight & Vision Cascading"
+    - "Adaptive Decision-Making & Agility"
+    - "Stakeholder Engagement & Inclusive Communication"
+    - "Ethical Leadership & Governance"
+    - "Empowerment & Cultivating Distributed Leadership"
+    - "Organizational Resilience & Change Agility"
+    - "Resource Optimization & Strategic Allocation"

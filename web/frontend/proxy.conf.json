@@ -1,0 +1,21 @@
+{
+  "/api": {
+    "target": "http://localhost:9118",
+    "secure": false,
+    "changeOrigin": true,
+    "logLevel": "warn"
+  },
+  "/ws": {
+    "target": "ws://localhost:9118",
+    "ws": true,
+    "secure": false,
+    "changeOrigin": true,
+    "logLevel": "warn"
+  },
+  "/config.js": {
+    "target": "http://localhost:9118",
+    "secure": false,
+    "changeOrigin": true,
+    "logLevel": "warn"
+  }
+}
