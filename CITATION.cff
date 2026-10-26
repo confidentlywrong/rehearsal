@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "The Rehearsal"
+abstract: "See how the people who hold a decision today will read an AI rollout plan before you send it, what they will ask first and where the draft misfires."
+authors:
+  - family-names: Haeussinger
+    given-names: Christian
+license: Apache-2.0
+url: "https://github.com/confidentlywrong/rehearsal"
+repository-code: "https://github.com/confidentlywrong/rehearsal"
+date-released: 2026-10-26
+references:
+  - type: book
+    title: "Confidently Wrong: What Good Companies Must Settle Before AI Decides"
+    authors:
+      - name: "The Confidently Wrong Authors"
+    year: 2026
+    isbn: "979-8178685112"
+    url: "https://www.amazon.com/dp/B0HP61JD82"
+  - type: software
+    title: "race-condition"
+    authors:
+      - name: "Google LLC"
+    repository-code: "https://github.com/GoogleCloudPlatform/race-condition"
+    license: Apache-2.0
+    year: 2026

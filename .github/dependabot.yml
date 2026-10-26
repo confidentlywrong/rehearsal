@@ -1,0 +1,125 @@
+# Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: 2
+updates:
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Go modules (root module)
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      go-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Python (uv-managed; Dependabot reads pyproject.toml + uv.lock)
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # google-adk pins a2a-sdk<0.4.0 (verified in 1.31.1 and 2.0.0b1).
+      # Bumping a2a-sdk to 1.x breaks ADK's deep imports of TransportProtocol,
+      # TextPart, etc. The migration code itself is straightforward (see the
+      # closed PR #68); revisit when ADK ships a release that supports
+      # a2a-sdk 1.x.
+      - dependency-name: a2a-sdk
+        update-types: [version-update:semver-major]
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Frontend (Angular)
+  - package-ecosystem: npm
+    directory: /web/frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      frontend-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Admin dashboard
+  - package-ecosystem: npm
+    directory: /web/admin-dash
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      admin-dash-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Tester UI
+  - package-ecosystem: npm
+    directory: /web/tester
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      tester-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  # Docker base images
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Node major version must stay in sync across .nvmrc, Dockerfile, and
+      # cloudbuild-bootstrap.yaml (enforced by scripts/check-node-versions.sh).
+      - dependency-name: node
+        update-types: [version-update:semver-major]
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]

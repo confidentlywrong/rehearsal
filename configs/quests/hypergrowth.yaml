@@ -1,0 +1,284 @@
+# Copyright 2026 Christian Haeussinger
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+quest:
+  id: "scaling_hypergrowth_2028"
+  name: "Hypergrowth Coordination Crisis"
+  schema_version: 1
+  difficulty: "advanced"
+  max_ticks: 30
+
+  resources:
+    LAU:
+      initial: 90
+      regen_per_tick: 4
+      critical_threshold: 15
+    BT:
+      initial: 500
+      regen_per_tick: 0
+      critical_threshold: 60
+    TBU:
+      initial: 20
+      regen_per_tick: -1
+      critical_threshold: 5
+    OWB:
+      initial: 50
+      regen_per_tick: -2
+      critical_threshold: 15
+
+  echoes:
+    # ----- Tier 1: Autonomous (Full LLM per tick) -----
+    - role: "cto"
+      tier: 1
+      persona: >-
+        CTO in full crisis mode. The system has been on fire for 48 hours
+        with 500% traffic increase. Demands an immediate feature freeze and
+        100% engineering focus on infrastructure scaling and stability.
+        Views any non-infrastructure work as organizational malpractice.
+      domain_principles:
+        - "Organizational Resilience & Change Agility"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.4, 0.8, 0.3, 0.5, 0.5, 0.95, 0.4]
+      initial_sentiment: -0.5
+      initial_resistance: 0.6
+      initial_influence: 0.8
+
+    - role: "cmo"
+      tier: 1
+      persona: >-
+        Euphoric CMO who sees the virality as a once-in-a-lifetime marketing
+        opportunity. Wants to launch a massive ad campaign to capitalize on
+        the momentum, acquire new users at historic low CAC, and cement
+        market leadership — despite ongoing outages.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Adaptive Decision-Making & Agility"
+      affinity: [0.8, 0.8, 0.4, 0.3, 0.3, 0.3, 0.6]
+      initial_sentiment: 0.7
+      initial_resistance: 0.2
+      initial_influence: 0.6
+
+    - role: "executive_coach"
+      tier: 1
+      persona: >-
+        Experienced executive coach specializing in hypergrowth scaling.
+        Never hostile, never defects. Asks Socratic questions when
+        contradictions are detected. Helps frame the tension between
+        growth capture and operational stability as a both/and challenge.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Ethical Leadership & Governance"
+      affinity: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+      initial_sentiment: 0.8
+      initial_resistance: 0.0
+      initial_influence: 0.3
+
+    # ----- Tier 2: Reactive (LLM only when domain-relevant) -----
+    - role: "head_cs"
+      tier: 2
+      persona: >-
+        Head of Customer Success drowning in 10x support ticket volume.
+        Team has been working 16-hour shifts. Needs immediate budget to
+        hire 50 contractors and deploy AI-assisted triage. Will escalate
+        to the board if customer churn data is ignored.
+      domain_principles:
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.3, 0.5, 0.9, 0.5, 0.6, 0.5, 0.7]
+      initial_sentiment: -0.3
+      initial_resistance: 0.5
+      initial_influence: 0.5
+
+    - role: "lead_investor"
+      tier: 2
+      persona: >-
+        Lead investor from the Series C round. Thrilled with the growth
+        metrics but increasingly concerned about churn if the platform
+        stays unstable. Has Board representation and controls the next
+        funding tranche. Privately evaluating acquisition offers.
+      domain_principles:
+        - "Strategic Foresight & Vision Cascading"
+        - "Resource Optimization & Strategic Allocation"
+      affinity: [0.9, 0.5, 0.4, 0.4, 0.3, 0.4, 0.8]
+      initial_sentiment: 0.5
+      initial_resistance: 0.2
+      initial_influence: 0.9
+      has_hidden_agenda: true
+      agenda_trigger_tick: 15
+
+    - role: "vp_infrastructure"
+      tier: 2
+      persona: >-
+        VP Infrastructure who predicted this scaling failure 6 months ago
+        in a memo that was deprioritized. Now managing the crisis with a
+        team built for 50K users, not 250K. Needs authority to make
+        emergency architectural decisions without committee approval.
+      domain_principles:
+        - "Organizational Resilience & Change Agility"
+        - "Empowerment & Cultivating Distributed Leadership"
+      affinity: [0.3, 0.6, 0.4, 0.4, 0.7, 0.9, 0.5]
+      initial_sentiment: -0.4
+      initial_resistance: 0.5
+      initial_influence: 0.6
+
+    - role: "head_product"
+      tier: 2
+      persona: >-
+        Head of Product torn between protecting the user experience for
+        existing customers and capitalizing on virality to ship the features
+        that new users demand. Advocates for a product triage framework:
+        fix critical bugs, freeze nice-to-haves, ship one hero feature.
+      domain_principles:
+        - "Adaptive Decision-Making & Agility"
+        - "Strategic Foresight & Vision Cascading"
+      affinity: [0.7, 0.9, 0.5, 0.4, 0.4, 0.6, 0.5]
+      initial_sentiment: 0.1
+      initial_resistance: 0.3
+      initial_influence: 0.5
+
+    # ----- Tier 3: Deterministic (Zero LLM cost) -----
+    - role: "sre_lead"
+      tier: 3
+      persona: >-
+        SRE Lead who has been awake for 36 hours managing incident response.
+        Demands a 72-hour ops rotation schedule and a hard freeze on
+        deployments. Threatens to invoke the "SRE override" clause if
+        marketing pushes any campaign that increases traffic before
+        autoscaling is complete.
+      domain_principles:
+        - "Organizational Resilience & Change Agility"
+      affinity: [0.2, 0.4, 0.3, 0.5, 0.6, 0.95, 0.3]
+      initial_sentiment: -0.6
+      initial_resistance: 0.7
+      initial_influence: 0.4
+
+    - role: "support_team_lead"
+      tier: 3
+      persona: >-
+        Support Team Lead managing a team of 15 that normally handles 500
+        tickets/day, now facing 5000. Half the team is on the verge of
+        burnout. Has been promised contractor reinforcements three times
+        but they never materialize.
+      domain_principles:
+        - "Empowerment & Cultivating Distributed Leadership"
+        - "Stakeholder Engagement & Inclusive Communication"
+      affinity: [0.3, 0.4, 0.8, 0.5, 0.8, 0.5, 0.3]
+      initial_sentiment: -0.4
+      initial_resistance: 0.5
+      initial_influence: 0.3
+
+    - role: "pr_director"
+      tier: 3
+      persona: >-
+        PR Director managing media coverage of the outages. TechCrunch has
+        published two articles about downtime. Needs leadership to commit
+        to a public statement and SLA guarantees. Worried that the CMO's
+        ad campaign will backfire spectacularly during an outage.
+      domain_principles:
+        - "Stakeholder Engagement & Inclusive Communication"
+        - "Ethical Leadership & Governance"
+      affinity: [0.4, 0.3, 0.85, 0.7, 0.3, 0.5, 0.3]
+      initial_sentiment: -0.1
+      initial_resistance: 0.3
+      initial_influence: 0.4
+
+    - role: "junior_pm"
+      tier: 3
+      persona: >-
+        Junior PM who joined two months ago from a big-tech company. Sees
+        the chaos as both exciting and alarming. Has fresh perspective on
+        scaling best practices but lacks organizational capital to push
+        ideas. Could be a champion or a flight risk.
+      domain_principles:
+        - "Adaptive Decision-Making & Agility"
+        - "Empowerment & Cultivating Distributed Leadership"
+      affinity: [0.5, 0.7, 0.4, 0.4, 0.6, 0.5, 0.3]
+      initial_sentiment: 0.3
+      initial_resistance: 0.1
+      initial_influence: 0.2
+
+  black_swan_events:
+    # Tick-based triggers
+    - trigger:
+        type: "tick"
+        tick: 5
+      event: >-
+        Platform-wide outage lasting 4 hours. All 250K users affected.
+        #ProductDown trends on X/Twitter. CNN tech segment covers the
+        story. Customer data was not at risk but public perception is
+        catastrophic.
+      resource_impact:
+        OWB: -15
+        TBU: -5
+        LAU: -10
+
+    - trigger:
+        type: "tick"
+        tick: 14
+      event: >-
+        Competitor launches a targeted campaign: "Switch to us — we never
+        go down." Offers free migration tools and 6-month discounts.
+        Customer churn accelerates from 2% to 8% weekly.
+      resource_impact:
+        BT: -60
+        OWB: -10
+
+    - trigger:
+        type: "tick"
+        tick: 23
+      event: >-
+        Viral TikTok from an SRE showing the "war room" at 3am gets
+        2M views. Public reaction is mixed — some praise the team's
+        dedication, others question management's failure to prepare.
+        Recruiting pipeline surges but so do Glassdoor reviews about
+        work-life balance.
+      resource_impact:
+        OWB: -10
+        TBU: -5
+
+    # Condition-based triggers
+    - trigger:
+        type: "condition"
+        when: "TBU < 8"
+      event: >-
+        Critical incident: The primary database cluster suffers a
+        split-brain failure due to rushed scaling patches deployed by
+        an exhausted engineer. 6 hours of data may be lost. The CTO
+        calls for an immediate post-mortem.
+      resource_impact:
+        LAU: -20
+        OWB: -15
+        BT: -40
+
+    - trigger:
+        type: "condition"
+        when: "OWB < 20"
+      event: >-
+        The SRE team collectively invokes their "right to disconnect"
+        clause and refuses to work weekends until a sustainable on-call
+        rotation is established. Incident response capability drops
+        by 60%.
+      resource_impact:
+        TBU: -10
+        LAU: -15
+
+  principles:
+    - "Strategic Foresight & Vision Cascading"
+    - "Adaptive Decision-Making & Agility"
+    - "Stakeholder Engagement & Inclusive Communication"
+    - "Ethical Leadership & Governance"
+    - "Empowerment & Cultivating Distributed Leadership"
+    - "Organizational Resilience & Change Agility"
+    - "Resource Optimization & Strategic Allocation"

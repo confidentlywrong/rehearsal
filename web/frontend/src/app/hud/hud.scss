@@ -1,0 +1,410 @@
+/**
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@use '../../mixins.scss' as *;
+
+
+
+
+:host {
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    font-family:
+        'DM Sans',
+        -apple-system,
+        BlinkMacSystemFont,
+        sans-serif;
+}
+
+* {
+    user-select: none;
+    -webkit-user-select: none;
+    box-sizing: border-box;
+}
+
+input,
+select {
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+/* ── Hamburger menu (top-left) ── */
+.menu-wrapper {
+    pointer-events: all;
+    position: fixed;
+    top: 0px;
+    left: 0px;
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: container-scaled-cqw(8);
+
+    width: 40vw;
+    // background-color: red;
+    container-type: inline-size;
+    --container-width: var(--hud-container-width);
+
+
+
+
+    .information-wrapper {
+        display: flex;
+        justify-content: flex-start;
+        align-items: center;
+        position: relative;
+        z-index: 100;
+        gap: container-scaled-cqw(12);
+        padding: container-scaled-cqw(30) container-scaled-cqw(20);
+
+        .menu-button {
+            position: relative;
+            z-index: 2;
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            padding: 0;
+            transition:
+                background 0.18s,
+                border-color 0.18s,
+                box-shadow 0.18s;
+
+            span {
+                font-size: container-scaled-cqw(24);
+                color: var(--neutral-white-80);
+            }
+        }
+
+
+
+        // .demo-title selector removed on 2026-06-22 along with the
+        // <h4 class="demo-title"> element it styled. Kept intentionally
+        // empty so a future re-introduction won't drift from the
+        // original spacing/typography.
+    }
+
+
+
+
+    .menu {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-start;
+        padding: 0;
+        overflow-y: auto;
+        pointer-events: none;
+        background: rgba(0, 0, 0, 0);
+        transition: background 0.2s ease;
+
+        @include PanelBackground;
+        border-radius: container-scaled-cqw(60);
+
+        overflow: hidden;
+        box-shadow:
+            0 8px 32px rgba(0, 0, 0, 0.5),
+            0 2px 8px rgba(0, 0, 0, 0.3);
+        transform: translateX(-100%);
+        transition: all 0.2s ease;
+
+        width: 100cqw;
+
+        padding: container-scaled-cqw(120) container-scaled-cqw(32) container-scaled-cqw(32) container-scaled-cqw(32);
+        gap: container-scaled-cqw(30);
+
+        &.isOpen {
+            pointer-events: all;
+            opacity: 1;
+
+            background: rgba(0, 0, 0, 0.55);
+
+            transform: translateX(0) !important;
+
+        }
+
+
+        .menu-title {
+            color: var(--neutral-white-40);
+            font-family: "Google Sans Display";
+            font-size: container-scaled-cqw(20);
+            font-style: normal;
+            font-weight: 500;
+            line-height: 125%;
+        }
+
+
+
+        .menu-panel {
+
+
+
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            align-items: flex-start;
+            gap: container-scaled-cqw(4);
+            overflow-y: scroll;
+            flex: 1;
+
+
+
+            /* Hide scrollbar for Webkit browsers (Chrome, Safari) */
+            &::-webkit-scrollbar {
+                display: none;
+            }
+
+            /* Hide scrollbar for Firefox */
+            scrollbar-width: none;
+
+            /* Hide scrollbar for IE and Edge */
+            -ms-overflow-style: none;
+
+
+
+            .menu-item {
+                display: flex;
+                justify-content: flex-start;
+                align-items: center;
+                width: 100%;
+                gap: container-scaled-cqw(24);
+                padding: container-scaled-cqw(25) container-scaled-cqw(32);
+
+                border-radius: container-scaled-cqw(80);
+                cursor: pointer;
+
+                &.active {
+                    background: var(--neutral-white-5);
+
+                    &:hover {
+                        background: var(--neutral-white-10);
+
+                        .icon {
+                            transform: translateX(0) rotate(180deg);
+                        }
+                    }
+
+                    .icon {
+                        opacity: 1;
+                        transform: translateX(0);
+                    }
+                }
+
+
+                &:hover {
+                    background: var(--neutral-white-5);
+
+
+
+                    .icon {
+                        opacity: 1;
+                        transform: translateX(0);
+                    }
+                }
+
+
+
+                .demo-number {
+                    @include Headline6;
+                    color: white;
+                    font-size: container-scaled-cqw(12);
+
+                }
+
+                .demo-name {
+                    @include Headline1;
+                    color: white;
+                    font-size: container-scaled-cqw(28);
+                }
+
+                .icon {
+                    color: white;
+                    font-size: container-scaled-cqw(24);
+                    margin-left: auto;
+
+                    opacity: 0;
+                    transform: translateX(-50%);
+                    transition: all 0.2s ease;
+                }
+            }
+        }
+    }
+}
+
+
+.mode-switch-label {
+    --container-width: 1920;
+    position: fixed;
+    bottom: container-scaled-cqw(16);
+    left: container-scaled-cqw(16);
+    z-index: 100001;
+    pointer-events: none;
+    background: rgba(255, 0, 0, 0.85);
+    border: container-scaled-cqw(1) solid rgba(255, 255, 255, 0.15);
+    border-radius: container-scaled-cqw(8);
+    padding: container-scaled-cqw(18);
+    color: #fff;
+    font-size: container-scaled-cqw(24);
+}
+/* ── Leadership Crucible HUD Overlays ── */
+.resource-gauges-panel {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 100000;
+  background: rgba(0,0,0,0.85);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  padding: 16px;
+  color: #fff;
+  width: 250px;
+  pointer-events: all;
+  
+  .panel-title {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 500;
+    opacity: 0.8;
+  }
+  
+  .resource-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+    gap: 8px;
+    
+    .resource-label {
+      width: 40px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    
+    .progress-bar {
+      flex: 1;
+      height: 8px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 4px;
+      overflow: hidden;
+      
+      .progress-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.3s ease;
+      }
+      .lau-fill { background: #4caf50; }
+      .bt-fill { background: #2196f3; }
+      .tbu-fill { background: #ff9800; }
+      .owb-fill { background: #f44336; }
+    }
+    
+    .resource-value {
+      width: 30px;
+      text-align: right;
+      font-size: 12px;
+    }
+  }
+}
+
+.alert-feed-panel {
+  position: fixed;
+  bottom: 80px;
+  left: 16px;
+  z-index: 100000;
+  width: 300px;
+  max-height: 400px;
+  overflow-y: auto;
+  pointer-events: none;
+  
+  .panel-title {
+    margin: 0 0 8px 0;
+    font-size: 14px;
+    color: #fff;
+    opacity: 0.8;
+  }
+  
+  .alert-item {
+    background: rgba(255,152,0,0.8);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 8px;
+    color: #fff;
+    
+    &.critical {
+      background: rgba(244,67,54,0.9);
+    }
+    
+    .alert-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: bold;
+      font-size: 13px;
+      margin-bottom: 4px;
+      
+      .alert-icon {
+        font-size: 16px;
+      }
+    }
+    
+    .alert-desc {
+      font-size: 12px;
+      line-height: 1.3;
+    }
+  }
+}
+
+.status-panel {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 100000;
+  background: rgba(0,0,0,0.85);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  padding: 12px 16px;
+  color: #fff;
+  display: flex;
+  gap: 16px;
+  pointer-events: all;
+  
+  .status-row {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    
+    .status-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      opacity: 0.6;
+      margin-bottom: 4px;
+    }
+    
+    .status-value {
+      font-size: 18px;
+      font-weight: bold;
+    }
+  }
+}
