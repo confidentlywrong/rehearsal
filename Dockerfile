@@ -34,7 +34,7 @@
 # --- Go: build base with deps and shared source ---
 # Use $BUILDPLATFORM so the Go compiler runs natively (no QEMU emulation).
 # Cross-compilation is handled via GOOS/GOARCH env vars.
-FROM --platform=$BUILDPLATFORM golang:1.25 AS go-base
+FROM --platform=$BUILDPLATFORM golang:1.27 AS go-base
 ARG TARGETOS TARGETARCH
 ENV GOOS=${TARGETOS} GOARCH=${TARGETARCH}
 WORKDIR /app
@@ -65,7 +65,7 @@ RUN npm run build
 WORKDIR /app
 
 # --- Python: dependency cache (rebuilt only when pyproject.toml/uv.lock change) ---
-FROM python:3.13-slim AS python-deps
+FROM python:3.15-slim AS python-deps
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 RUN pip install --no-cache-dir uv==0.7.12
