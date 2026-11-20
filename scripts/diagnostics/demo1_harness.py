@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: update default gateway port to 9101.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +27,7 @@ reliability). Replaces manual browser-driven Demo 1 runs.
 
 Usage::
 
-    # Run 5 trials with default prompt and default gateway (localhost:8101)
+    # Run 5 trials with default prompt and default gateway (localhost:9101)
     uv run python scripts/diagnostics/demo1_harness.py
 
     # 10 trials, custom timeout
@@ -46,7 +48,7 @@ ALWAYS reported; the script does not fail on poor reliability — that's
 the metric you're measuring.
 
 Prerequisites:
-  - Local stack running (gateway on port 8101, planner on 8204).
+  - Local stack running (gateway on port 9101, leadership_planner on 9114 / planner on 9105 if enabled).
   - Honcho or equivalent: ``uv run start`` from the worktree root.
 """
 
@@ -66,7 +68,7 @@ from typing import Any
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8101")
+GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:9101")
 GATEWAY_WS_URL = os.getenv(
     "GATEWAY_WS_URL",
     GATEWAY_HTTP_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws",

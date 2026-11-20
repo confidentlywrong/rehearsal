@@ -61,8 +61,8 @@ CREATE INDEX IF NOT EXISTS idx_leadership_scenarios_owner_created
 
 
 -- ============================================================
--- 5. LEADERSHIP STAKEHOLDER ARTIFACTS TABLE
---    (Artifacts 1-4 from leadership_planner_with_memory)
+-- 3. LEADERSHIP STAKEHOLDER ARTIFACTS TABLE
+--    (Artifacts 1-6 from leadership_planner_with_memory)
 -- ============================================================
 -- Persists the six state-key payloads produced by the emit_* tools
 -- (stakeholder_graph, stakeholder_personas, stakeholder_reactions,

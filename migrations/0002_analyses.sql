@@ -44,7 +44,7 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS analyses (
     id                 UUID        PRIMARY KEY,
-    operator_id        TEXT        NOT NULL REFERENCES users(id),
+    operator_id        TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     org_name           TEXT,
     title              TEXT        NOT NULL,
     description        TEXT,
@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS analyses (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at         TIMESTAMPTZ
 );
+
+-- Upgrade legacy databases where analyses_operator_id_fkey lacked ON DELETE CASCADE
+-- so GDPR EraseUser (DELETE FROM users WHERE id = $1) does not fail with 23503.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analyses_operator_id_fkey'
+           AND conrelid = 'analyses'::regclass
+           AND confdeltype <> 'c'
+    ) THEN
+        ALTER TABLE analyses DROP CONSTRAINT analyses_operator_id_fkey;
+        ALTER TABLE analyses
+            ADD CONSTRAINT analyses_operator_id_fkey
+            FOREIGN KEY (operator_id) REFERENCES users(id) ON DELETE CASCADE;
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS analyses_operator_idx
     ON analyses(operator_id)
@@ -120,15 +137,52 @@ CREATE TABLE IF NOT EXISTS analysis_nodes (
     payload         JSONB       NOT NULL DEFAULT '{}'::jsonb,
     governing       BOOLEAN     NOT NULL DEFAULT false,
     confidence      NUMERIC(3,2),
-    source_doc_id   UUID        REFERENCES analysis_documents(id),
+    source_doc_id   UUID        REFERENCES analysis_documents(id) ON DELETE SET NULL,
     valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
     valid_until     TIMESTAMPTZ,
     accepted_at     TIMESTAMPTZ,
-    accepted_by     TEXT        REFERENCES users(id),
+    accepted_by     TEXT        REFERENCES users(id) ON DELETE SET NULL,
     rejected_at     TIMESTAMPTZ,
-    rejected_by     TEXT        REFERENCES users(id),
+    rejected_by     TEXT        REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_nodes_source_doc_id_fkey'
+           AND conrelid = 'analysis_nodes'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_nodes DROP CONSTRAINT analysis_nodes_source_doc_id_fkey;
+        ALTER TABLE analysis_nodes
+            ADD CONSTRAINT analysis_nodes_source_doc_id_fkey
+            FOREIGN KEY (source_doc_id) REFERENCES analysis_documents(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_nodes_accepted_by_fkey'
+           AND conrelid = 'analysis_nodes'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_nodes DROP CONSTRAINT analysis_nodes_accepted_by_fkey;
+        ALTER TABLE analysis_nodes
+            ADD CONSTRAINT analysis_nodes_accepted_by_fkey
+            FOREIGN KEY (accepted_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_nodes_rejected_by_fkey'
+           AND conrelid = 'analysis_nodes'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_nodes DROP CONSTRAINT analysis_nodes_rejected_by_fkey;
+        ALTER TABLE analysis_nodes
+            ADD CONSTRAINT analysis_nodes_rejected_by_fkey
+            FOREIGN KEY (rejected_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 -- Hot path A: Phase 3 retrieval for currently-valid nodes of a given bin.
 CREATE INDEX IF NOT EXISTS analysis_nodes_live_idx
@@ -157,15 +211,52 @@ CREATE TABLE IF NOT EXISTS analysis_edges (
     dst_node_id     UUID        NOT NULL REFERENCES analysis_nodes(id) ON DELETE CASCADE,
     payload         JSONB       NOT NULL DEFAULT '{}'::jsonb,
     confidence      NUMERIC(3,2),
-    source_doc_id   UUID        REFERENCES analysis_documents(id),
+    source_doc_id   UUID        REFERENCES analysis_documents(id) ON DELETE SET NULL,
     valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
     valid_until     TIMESTAMPTZ,
     accepted_at     TIMESTAMPTZ,
-    accepted_by     TEXT        REFERENCES users(id),
+    accepted_by     TEXT        REFERENCES users(id) ON DELETE SET NULL,
     rejected_at     TIMESTAMPTZ,
-    rejected_by     TEXT        REFERENCES users(id),
+    rejected_by     TEXT        REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_edges_source_doc_id_fkey'
+           AND conrelid = 'analysis_edges'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_edges DROP CONSTRAINT analysis_edges_source_doc_id_fkey;
+        ALTER TABLE analysis_edges
+            ADD CONSTRAINT analysis_edges_source_doc_id_fkey
+            FOREIGN KEY (source_doc_id) REFERENCES analysis_documents(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_edges_accepted_by_fkey'
+           AND conrelid = 'analysis_edges'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_edges DROP CONSTRAINT analysis_edges_accepted_by_fkey;
+        ALTER TABLE analysis_edges
+            ADD CONSTRAINT analysis_edges_accepted_by_fkey
+            FOREIGN KEY (accepted_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_edges_rejected_by_fkey'
+           AND conrelid = 'analysis_edges'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_edges DROP CONSTRAINT analysis_edges_rejected_by_fkey;
+        ALTER TABLE analysis_edges
+            ADD CONSTRAINT analysis_edges_rejected_by_fkey
+            FOREIGN KEY (rejected_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 -- Phase 3 retrieval: "give me all live outbound edges from this node".
 CREATE INDEX IF NOT EXISTS analysis_edges_src_live_idx

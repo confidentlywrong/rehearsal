@@ -381,6 +381,45 @@ class TestEmitSimResultsA2UI:
             result_string = await emit_sim_results_a2ui(
                 tool_context=ctx,
                 scenario_name="No ID Test",
+                overall_score=75,
+                stakeholder_alignment=75,
+                decision_quality=75,
+                crisis_readiness=75,
+                coaching_kotter_title="N/A",
+                coaching_kotter_desc="N/A",
+                coaching_adkar_title="N/A",
+                coaching_adkar_desc="N/A",
+                coaching_synthesis="N/A",
+            )
+
+            assert "SUCCESS" in result_string
+            # load_simulation_data should NOT be called with missing ID
+            mock_load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_zero_scores_without_state_eval_returns_error(self):
+        """When overall_score <= 0 and no valid state evaluation exists, return explicit ERROR."""
+        ctx = MagicMock()
+        ctx.session.id = "test-session"
+        ctx.state = {}
+
+        with (
+            patch(
+                "agents.utils.simdata.load_simulation_data",
+                new_callable=AsyncMock,
+            ) as mock_load,
+            patch(
+                "agents.leadership_planner_with_eval.skills.consultant.tools.emit_gateway_message",
+                new_callable=AsyncMock,
+            ) as mock_emit,
+        ):
+            from agents.leadership_planner_with_eval.skills.consultant.tools import (
+                emit_sim_results_a2ui,
+            )
+
+            result_string = await emit_sim_results_a2ui(
+                tool_context=ctx,
+                scenario_name="Zero Score Test",
                 overall_score=0,
                 stakeholder_alignment=0,
                 decision_quality=0,
@@ -392,9 +431,9 @@ class TestEmitSimResultsA2UI:
                 coaching_synthesis="N/A",
             )
 
-            assert "SUCCESS" in result_string
-            # load_simulation_data should NOT be called with missing ID
+            assert result_string.startswith("ERROR:")
             mock_load.assert_not_called()
+            mock_emit.assert_not_called()
 
 
 class TestEmitActionPlanA2UI:
@@ -449,6 +488,29 @@ Measure transformation KPIs."""
                 "data", mock_emit.call_args_list[1][1].get("data", {})
             )
             assert "beginRendering" in second_call_data
+
+    @pytest.mark.asyncio
+    async def test_empty_plan_markdown_returns_error(self):
+        """Empty plan_markdown must return explicit ERROR without emitting."""
+        ctx = MagicMock()
+        ctx.session.id = "test-session"
+        ctx.state = {"simulation_id": "sim-001"}
+
+        with patch(
+            "agents.leadership_planner_with_eval.skills.consultant.tools.emit_gateway_message",
+            new_callable=AsyncMock,
+        ) as mock_emit:
+            from agents.leadership_planner_with_eval.skills.consultant.tools import (
+                emit_action_plan_a2ui,
+            )
+
+            result_string = await emit_action_plan_a2ui(
+                tool_context=ctx,
+                plan_markdown="",
+            )
+
+            assert result_string.startswith("ERROR:")
+            mock_emit.assert_not_called()
 
 
 class TestPromptCompleteness:

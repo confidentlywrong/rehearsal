@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard empty LUT/paths, zero-length paths, and non-finite progress values in CatmullRomPathAdapter and MapPath.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,6 +46,8 @@ export class CatmullRomPathAdapter implements IMapPath {
   }
 
   getPositionAt(t: number): THREE.Vector3 {
+    if (this.lut.length === 0) return _scratchPos.set(0, 0, 0);
+    if (!Number.isFinite(t)) t = 0;
     t = Math.max(0, Math.min(1, t));
     const ft = t * (this.lut.length - 1);
     const i = Math.floor(ft);
@@ -53,12 +57,16 @@ export class CatmullRomPathAdapter implements IMapPath {
   }
 
   getTangentAt(t: number): THREE.Vector3 {
+    if (this.lut.length < 2) return _scratchTan.set(0, 0, 1);
+    if (!Number.isFinite(t)) t = 0;
     t = Math.max(0, Math.min(1, t));
     const ft = t * (this.lut.length - 1);
     const i = Math.floor(ft);
     const next = Math.min(i + 1, this.lut.length - 1);
     if (i === next) return _scratchTan.set(0, 0, 1);
-    return _scratchTan.subVectors(this.lut[next], this.lut[i]).normalize();
+    _scratchTan.subVectors(this.lut[next], this.lut[i]);
+    if (_scratchTan.lengthSq() < 1e-12) return _scratchTan.set(0, 0, 1);
+    return _scratchTan.normalize();
   }
 
   getTotalLength(): number {
@@ -215,6 +223,7 @@ export class MapPath {
 
   getPositionAt(t: number): THREE.Vector3 {
     if (!this.pts.length) return _mapScratchPos.set(0, 0, 0);
+    if (!Number.isFinite(t)) t = 0;
     const clamped = Math.max(0, Math.min(1, t));
     const tgt = clamped * this.totalLen;
     if (tgt <= 0) return _mapScratchPos.copy(this.pts[0]);
@@ -231,10 +240,13 @@ export class MapPath {
 
   getTangentAt(t: number): THREE.Vector3 {
     if (this.pts.length < 2) return _mapScratchTan.set(1, 0, 0);
+    if (!Number.isFinite(t)) t = 0;
     const tgt = Math.max(0, Math.min(1, t)) * this.totalLen;
     for (let i = 1; i < this.cumLen.length; i++) {
       if (this.cumLen[i] >= tgt || i === this.cumLen.length - 1) {
-        return _mapScratchTan.copy(this.pts[i]).sub(this.pts[i - 1]).normalize();
+        _mapScratchTan.copy(this.pts[i]).sub(this.pts[i - 1]);
+        if (_mapScratchTan.lengthSq() < 1e-12) return _mapScratchTan.set(1, 0, 0);
+        return _mapScratchTan.normalize();
       }
     }
     return _mapScratchTan.set(1, 0, 0);
@@ -256,6 +268,7 @@ export class MapPath {
   }
 
   worldPosToT(worldPos: THREE.Vector3): number {
+    if (this.pts.length === 0 || this.totalLen <= 0) return 0;
     let best = 0, bestDist = Infinity;
     for (let i = 0; i < this.pts.length; i++) {
       const d = worldPos.distanceTo(this.pts[i]);

@@ -40,6 +40,7 @@ from types import SimpleNamespace
 import pytest
 
 from agents.utils import metering
+from agents.utils.models import DEFAULT_PLANNER_MODEL
 
 
 @pytest.fixture(autouse=True)
@@ -122,11 +123,11 @@ class TestBuildSinkFromEnv:
         assert isinstance(sink, metering.SqliteSink)
         assert sink.path == tmp_path / "metering.db"
 
-    def test_unknown_sink_falls_back_to_null(self, monkeypatch):
-        """A typo in METERING_SINK must not break the simulation."""
+    def test_unknown_sink_raises_value_error(self, monkeypatch):
+        """A typo in METERING_SINK must fail loudly rather than silently disable metering."""
         monkeypatch.setenv("METERING_SINK", "bigquery-typo")
-        sink = metering.build_sink_from_env()
-        assert isinstance(sink, metering.NullSink)
+        with pytest.raises(ValueError, match="Unrecognized METERING_SINK"):
+            metering.build_sink_from_env()
 
     def test_none_default_does_not_touch_filesystem(self, monkeypatch, tmp_path):
         """Even with METERING_SQLITE_PATH set, no sink env → no file."""
@@ -175,7 +176,7 @@ class TestStdoutSink:
             user_id="u-1",
             sim_id="s-1",
             agent_type="planner",
-            model="gemini-3-flash-preview",
+            model=DEFAULT_PLANNER_MODEL,
             prompt_tokens=100,
             completion_tokens=20,
             total_tokens=120,
@@ -240,7 +241,7 @@ class TestSqliteSink:
             user_id="u-1",
             sim_id="s-1",
             agent_type="planner",
-            model="gemini-3-flash-preview",
+            model=DEFAULT_PLANNER_MODEL,
             prompt_tokens=10,
             completion_tokens=5,
             total_tokens=15,
@@ -315,11 +316,11 @@ class TestBuildEvent:
             agent_name="leadership_planner",
         )
         resp = _fake_response(prompt=100, completion=20, total=120)
-        ev = metering.build_event(ctx, resp, model="gemini-3-flash-preview")
+        ev = metering.build_event(ctx, resp, model=DEFAULT_PLANNER_MODEL)
         assert ev.user_id == "u-1"
         assert ev.sim_id == "sim-42"
         assert ev.agent_type == "leadership_planner"
-        assert ev.model == "gemini-3-flash-preview"
+        assert ev.model == DEFAULT_PLANNER_MODEL
         assert ev.prompt_tokens == 100
         assert ev.completion_tokens == 20
         assert ev.total_tokens == 120
@@ -401,7 +402,7 @@ class TestMeteringPlugin:
         sink = _RecordingSink()
         plugin = metering.MeteringPlugin(sink=sink)
         ctx = _fake_ctx(state={"tenant": {"user_id": "u-1"}}, invocation_id="inv-99")
-        req = SimpleNamespace(model="gemini-3-flash-preview")
+        req = SimpleNamespace(model=DEFAULT_PLANNER_MODEL)
         resp = _fake_response(prompt=1, completion=1, total=2)
 
         asyncio.run(
@@ -417,7 +418,7 @@ class TestMeteringPlugin:
             )
         )
 
-        assert sink.events[0].model == "gemini-3-flash-preview"
+        assert sink.events[0].model == DEFAULT_PLANNER_MODEL
         # Model map cleared after read so memory doesn't grow.
         assert "inv-99" not in plugin._model_for_invocation
 

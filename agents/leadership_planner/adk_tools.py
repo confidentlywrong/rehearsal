@@ -24,7 +24,7 @@ import logging
 import pathlib
 
 from google.adk.skills import load_skill_from_dir
-from google.adk.tools import FunctionTool
+from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 from google.adk.tools.skill_toolset import SkillToolset
 

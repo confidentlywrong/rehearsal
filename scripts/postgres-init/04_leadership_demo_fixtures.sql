@@ -18,29 +18,34 @@
 -- cards before any simulation has been run.  See "never invent data"
 -- rule in project conventions.
 
-INSERT INTO leadership_scenarios (scenario_id, scenario_data, created_at, eval_score, eval_result)
+INSERT INTO leadership_scenarios (scenario_id, scenario_data, created_at, eval_score, eval_result, owner_id)
 VALUES
   ('seed-leadership-001',
    '{"scenario_id": "seed-leadership-001", "name": "Budget Crisis", "scenario_type": "crisis", "stakeholder_count": 5, "complexity": "complex", "summary": "A sudden 40% budget cut forces the leadership team to make rapid decisions about layoffs, project cancellations, and strategic pivots."}',
    '2026-01-01T00:00:00Z', 78,
-   '{"overall_score": 78, "scores": {"stakeholder_alignment": 75, "decision_quality": 80, "resource_stewardship": 82, "crisis_readiness": 85, "strategic_coherence": 70, "ethical_alignment": 76}}'),
+   '{"overall_score": 78, "scores": {"stakeholder_alignment": 75, "decision_quality": 80, "resource_stewardship": 82, "crisis_readiness": 85, "strategic_coherence": 70, "ethical_alignment": 76}}',
+   '__seed__'),
 
   ('seed-leadership-002',
    '{"scenario_id": "seed-leadership-002", "name": "Stakeholder Revolt", "scenario_type": "transformation", "stakeholder_count": 10, "complexity": "complex", "summary": "Key engineering leaders threaten to resign over a controversial AI adoption strategy, forcing the CEO to balance innovation with retention."}',
    '2026-01-02T00:00:00Z', 85,
-   '{"overall_score": 85, "scores": {"stakeholder_alignment": 90, "decision_quality": 88, "resource_stewardship": 78, "crisis_readiness": 82, "strategic_coherence": 86, "ethical_alignment": 84}}'),
+   '{"overall_score": 85, "scores": {"stakeholder_alignment": 90, "decision_quality": 88, "resource_stewardship": 78, "crisis_readiness": 82, "strategic_coherence": 86, "ethical_alignment": 84}}',
+   '__seed__'),
 
   ('seed-leadership-003',
    '{"scenario_id": "seed-leadership-003", "name": "Innovation Pivot", "scenario_type": "transformation", "stakeholder_count": 8, "complexity": "moderate", "summary": "The board demands a shift from on-premise to cloud-native AI, requiring massive retraining and infrastructure investment."}',
    '2026-01-03T00:00:00Z', 72,
-   '{"overall_score": 72, "scores": {"stakeholder_alignment": 68, "decision_quality": 75, "resource_stewardship": 70, "crisis_readiness": 65, "strategic_coherence": 78, "ethical_alignment": 76}}'),
+   '{"overall_score": 72, "scores": {"stakeholder_alignment": 68, "decision_quality": 75, "resource_stewardship": 70, "crisis_readiness": 65, "strategic_coherence": 78, "ethical_alignment": 76}}',
+   '__seed__'),
 
   ('seed-leadership-004',
    '{"scenario_id": "seed-leadership-004", "name": "Compliance Challenge", "scenario_type": "compliance", "stakeholder_count": 7, "complexity": "moderate", "summary": "New AI regulation requires comprehensive model governance, explainability, and bias auditing across all deployed systems."}',
    '2026-01-04T00:00:00Z', 80,
-   '{"overall_score": 80, "scores": {"stakeholder_alignment": 78, "decision_quality": 82, "resource_stewardship": 75, "crisis_readiness": 80, "strategic_coherence": 84, "ethical_alignment": 81}}')
+   '{"overall_score": 80, "scores": {"stakeholder_alignment": 78, "decision_quality": 82, "resource_stewardship": 75, "crisis_readiness": 80, "strategic_coherence": 84, "ethical_alignment": 81}}',
+   '__seed__')
 
-ON CONFLICT (scenario_id) DO NOTHING;
+ON CONFLICT (scenario_id) DO UPDATE SET
+    owner_id = COALESCE(leadership_scenarios.owner_id, EXCLUDED.owner_id);
 
 
 
@@ -57,7 +62,7 @@ ON CONFLICT (scenario_id) DO NOTHING;
 -- Kinds: Actor | Group | Structure | Friction | Belief
 -- Keep to 5–10 nodes / 4–8 edges per graph (mirrors the emit_stakeholder_graph
 -- validator caps in agents/leadership_planner_with_memory/stakeholder_graph.py).
-INSERT INTO leadership_stakeholder_artifacts (scenario_id, stakeholder_graph)
+INSERT INTO leadership_stakeholder_artifacts (scenario_id, stakeholder_graph, owner_id)
 VALUES
   ('seed-leadership-001',
    $$
@@ -81,7 +86,8 @@ VALUES
      ],
      "rationale": "A cash crisis flowing top-down from the CFO through department heads, with layoff fear driving stakeholder resistance to the cuts."
    }
-   $$::jsonb),
+   $$::jsonb,
+   '__seed__'),
   ('seed-leadership-002',
    $$
    {
@@ -106,7 +112,8 @@ VALUES
      ],
      "rationale": "Board-driven AI adoption meets engineering ownership-loss fear; senior engineers signal exit, forcing HR and VP Engineering to negotiate retention."
    }
-   $$::jsonb),
+   $$::jsonb,
+   '__seed__'),
   ('seed-leadership-003',
    $$
    {
@@ -131,7 +138,8 @@ VALUES
      ],
      "rationale": "Board mandate drives a cloud-native pivot; retraining cost and legacy attachment inside engineering are the primary drag."
    }
-   $$::jsonb),
+   $$::jsonb,
+   '__seed__'),
   ('seed-leadership-004',
    $$
    {
@@ -156,7 +164,9 @@ VALUES
      ],
      "rationale": "Regulator imposes a governance regime; the CCO becomes the coordination hub between Legal and the ML team, whose explainability gap and audit backlog are the operational bottleneck."
    }
-   $$::jsonb)
+   $$::jsonb,
+   '__seed__')
 ON CONFLICT (scenario_id) DO UPDATE
    SET stakeholder_graph = EXCLUDED.stakeholder_graph,
+       owner_id          = COALESCE(leadership_stakeholder_artifacts.owner_id, EXCLUDED.owner_id),
        updated_at        = now();

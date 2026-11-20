@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: ignore non-finite or negative frame deltas and sanitize non-finite rounded values.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -150,6 +152,7 @@ export class PerfMonitor {
    * @param renderer The WebGLRenderer whose `.info` stats are read.
    */
   tick(delta: number, renderer: THREE.WebGLRenderer): void {
+    if (!Number.isFinite(delta) || delta < 0) return;
     const ft = delta * 1000; // frame time in ms
     const currentFps = delta > 0 ? 1 / delta : 0;
     const info = renderer.info;
@@ -351,6 +354,7 @@ export class PerfMonitor {
 }
 
 function round(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) return 0;
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
 }

@@ -323,3 +323,77 @@ async def test_compile_results_longitudinal_tracking_with_adk_state(tmp_path, mo
     assert "learning_trajectory" in result
     assert "next_quest" in result
     assert list(tmp_path.glob("*/runs.ndjson")), "run summary was not persisted"
+
+
+@pytest.mark.asyncio
+async def test_compile_results_returns_error_on_simdata_error():
+    """compile_results must surface SimDataError as explicit status='error'."""
+    from agents.utils.simdata import SimDataError
+
+    ctx = _make_tool_context(
+        state={
+            "tick_snapshots": _sample_tick_snapshots(),
+            "runner_count": 3,
+            "finished_runner_ids": ["r-1"],
+            "simulation_id": "sim-simdata-err",
+        }
+    )
+
+    with patch.object(
+        tools_module,
+        "store_simulation_data",
+        new=AsyncMock(side_effect=SimDataError("redis write failed")),
+    ):
+        result = await compile_results(tool_context=ctx)
+
+    assert result["status"] == "error"
+    assert result["simulation_id"] == "sim-simdata-err"
+    assert "redis write failed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_compile_results_returns_error_on_longitudinal_store_failure():
+    """compile_results must return explicit error when longitudinal persistence fails."""
+    ctx = _make_tool_context(
+        state={
+            "tick_snapshots": _sample_tick_snapshots(),
+            "runner_count": 3,
+            "finished_runner_ids": ["r-1"],
+            "simulation_id": "sim-long-err",
+        }
+    )
+
+    with patch.object(tools_module, "SimulationRunStore", side_effect=OSError("disk full")):
+        result = await compile_results(tool_context=ctx)
+
+    assert result["status"] == "error"
+    assert result["simulation_id"] == "sim-long-err"
+    assert "Longitudinal tracking failed" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_stop_race_collector_returns_error_on_publish_end_failure():
+    """stop_race_collector must return error when publish_end_simulation raises, while clearing flags."""
+    ctx = _make_tool_context(
+        state={
+            "simulation_ready": True,
+            "simulation_in_progress": True,
+            "simulation_id": "sim-stop-err",
+        }
+    )
+
+    with (
+        patch("agents.simulator.collector.RaceCollector.get", return_value=None),
+        patch(
+            "agents.simulator.broadcast.publish_end_simulation",
+            new_callable=AsyncMock,
+            side_effect=ConnectionError("redis down"),
+        ),
+    ):
+        result = await stop_race_collector(tool_context=ctx)
+
+    assert result["status"] == "error"
+    assert result["simulation_id"] == "sim-stop-err"
+    assert "redis down" in result["message"]
+    assert ctx.state.get("simulation_ready") is False
+    assert ctx.state.get("simulation_in_progress") is False

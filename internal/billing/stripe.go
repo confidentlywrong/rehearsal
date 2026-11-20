@@ -25,6 +25,7 @@
 package billing
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -206,11 +207,17 @@ func (s *StripeProvider) Name() string { return "stripe" }
 // We accept any v1 element that matches HMAC-SHA256(secret, "t.payload").
 // Multiple v1 values appear during secret rotation.
 func (s *StripeProvider) VerifyAndParse(payload []byte, sigHeader string, now time.Time) (*WebhookEvent, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: nil stripe provider", ErrSignatureInvalid)
+	}
+	if s.secret == "" {
+		return nil, fmt.Errorf("%w: empty webhook secret", ErrSignatureInvalid)
+	}
 	ts, sigs, err := parseStripeSigHeader(sigHeader)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrSignatureInvalid, err)
 	}
-	if now.Sub(ts).Abs() > stripeSignatureTolerance {
+	if ts.Before(now.Add(-stripeSignatureTolerance)) || ts.After(now.Add(stripeSignatureTolerance)) {
 		return nil, fmt.Errorf("%w: timestamp outside tolerance window", ErrSignatureInvalid)
 	}
 
@@ -299,7 +306,8 @@ type stripeRawEvent struct {
 type stripeCheckoutSession struct {
 	Customer string `json:"customer"`
 	Metadata struct {
-		UserID string `json:"user_id"`
+		UserID  string `json:"user_id"`
+		PriceID string `json:"price_id"`
 	} `json:"metadata"`
 	// Newer Stripe Checkout sessions embed line_items lazily. Many
 	// integrations populate them via the `expand` parameter at
@@ -315,7 +323,6 @@ type stripeCheckoutSession struct {
 			} `json:"price"`
 		} `json:"data"`
 	} `json:"line_items"`
-	MetadataExtra map[string]string `json:"-"`
 }
 
 // parseStripeEvent decodes a verified payload into a WebhookEvent.
@@ -330,6 +337,13 @@ func parseStripeEvent(payload []byte) (*WebhookEvent, error) {
 		return nil, errors.New("billing: stripe event missing id")
 	}
 	out := &WebhookEvent{ID: raw.ID, Type: EventType(raw.Type)}
+	switch out.Type {
+	case EventCheckoutCompleted, EventSubscriptionUpdated, EventSubscriptionDeleted, EventInvoicePaymentFailed, EventInvoicePaymentSucceeded:
+		trimmedObj := bytes.TrimSpace(raw.Data.Object)
+		if len(trimmedObj) == 0 || bytes.Equal(trimmedObj, []byte("null")) {
+			return nil, errors.New("billing: stripe event missing data.object")
+		}
+	}
 	switch out.Type {
 	case EventCheckoutCompleted:
 		cc, err := parseCheckoutCompleted(raw.Data.Object)
@@ -368,23 +382,12 @@ func parseCheckoutCompleted(obj json.RawMessage) (*CheckoutCompletedEvent, error
 	if err := json.Unmarshal(obj, &sess); err != nil {
 		return nil, fmt.Errorf("billing: decode checkout session: %w", err)
 	}
-	// Pull metadata.price_id as a fallback (line_items isn't always
-	// expanded). We re-decode metadata into a generic map to grab
-	// any extra keys — keeps the struct schema small.
-	var rawObj map[string]json.RawMessage
-	if err := json.Unmarshal(obj, &rawObj); err == nil {
-		if md, ok := rawObj["metadata"]; ok {
-			extra := map[string]string{}
-			_ = json.Unmarshal(md, &extra)
-			sess.MetadataExtra = extra
-		}
-	}
 	priceID := ""
 	if len(sess.LineItems.Data) > 0 {
 		priceID = sess.LineItems.Data[0].Price.ID
 	}
-	if priceID == "" && sess.MetadataExtra != nil {
-		priceID = sess.MetadataExtra["price_id"]
+	if priceID == "" {
+		priceID = sess.Metadata.PriceID
 	}
 	return &CheckoutCompletedEvent{
 		UserID:   sess.Metadata.UserID,
@@ -417,9 +420,8 @@ type stripeSubscription struct {
 // parseSubscriptionChange decodes a subscription event's data.object.
 // PriceID may be empty (e.g. on .deleted Stripe sometimes omits items);
 // the handler treats empty PriceID as "use plan=free" for .deleted and
-// rejects it as 422 for .updated. Customer is REQUIRED — without it
-// we can't resolve which org to update, so this returns an error that
-// surfaces as 422 at the handler.
+// rejects it as 422 for .updated. Customer is validated by the webhook
+// handler (returning 422 when empty).
 func parseSubscriptionChange(obj json.RawMessage) (*SubscriptionChangeEvent, error) {
 	var sub stripeSubscription
 	if err := json.Unmarshal(obj, &sub); err != nil {
@@ -444,9 +446,9 @@ type stripeInvoice struct {
 }
 
 // parseInvoicePaymentFailed decodes the data.object of an
-// invoice.payment_failed event. Customer is REQUIRED for the same
-// reason as subscription events — we have no other way to resolve
-// the org.
+// invoice.payment_failed event. Returns the parsed event with an empty
+// Customer when the field is missing; the webhook handler rejects empty
+// Customer with 422.
 func parseInvoicePaymentFailed(obj json.RawMessage) (*InvoicePaymentFailedEvent, error) {
 	var inv stripeInvoice
 	if err := json.Unmarshal(obj, &inv); err != nil {

@@ -22,15 +22,24 @@ func isWriteMethod(m string) bool {
 	return false
 }
 
-// hasPathPrefix returns true when path starts with any of the
-// supplied prefixes. Empty prefixes are skipped so an accidental
-// "" entry doesn't match every request.
+// hasPathPrefix returns true when path matches any of the supplied
+// path prefixes on a "/" segment boundary. Empty prefixes are skipped
+// so an accidental "" entry doesn't match every request, and "/" only
+// matches the root path "/". For example, "/api/v1/me" matches
+// "/api/v1/me" and "/api/v1/me/logout", NOT "/api/v1/memory".
 func hasPathPrefix(path string, prefixes []string) bool {
 	for _, p := range prefixes {
 		if p == "" {
 			continue
 		}
-		if strings.HasPrefix(path, p) {
+		if p == "/" {
+			if path == "/" {
+				return true
+			}
+			continue
+		}
+		trimmed := strings.TrimSuffix(p, "/")
+		if path == trimmed || strings.HasPrefix(path, trimmed+"/") {
 			return true
 		}
 	}
@@ -41,7 +50,7 @@ func hasPathPrefix(path string, prefixes []string) bool {
 // Used by AccountResolverFromEnv to refuse IDENTITY_PROVIDER=local
 // (the fixture) on Cloud Run / App Engine / Cloud Functions.
 func looksLikeGCP() bool {
-	for _, k := range []string{"K_SERVICE", "GAE_SERVICE", "FUNCTION_TARGET"} {
+	for _, k := range []string{"K_SERVICE", "GAE_SERVICE", "FUNCTION_TARGET", "CLOUD_RUN_JOB"} {
 		if os.Getenv(k) != "" {
 			return true
 		}

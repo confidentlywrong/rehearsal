@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 )
 
 func TestNewLogger_TextDefault(t *testing.T) {
@@ -149,6 +151,16 @@ func TestRequestID_RoundTrip(t *testing.T) {
 	if got := RequestID(ctx2); got != "" {
 		t.Errorf("WithRequestID(\"\") must leave ctx clean, got %q", got)
 	}
+	// Nil ctx must not panic in either RequestID or WithRequestID:
+	//nolint:staticcheck // SA1012 — exercising nil-ctx guard
+	if got := RequestID(nil); got != "" {
+		t.Errorf("RequestID(nil) must return empty string, got %q", got)
+	}
+	//nolint:staticcheck // SA1012 — exercising nil-ctx guard
+	ctxFromNil := WithRequestID(nil, "req-from-nil")
+	if got := RequestID(ctxFromNil); got != "req-from-nil" {
+		t.Errorf("WithRequestID(nil, \"req-from-nil\") -> RequestID = %q, want \"req-from-nil\"", got)
+	}
 }
 
 func TestFromContext_NeverReturnsNil(t *testing.T) {
@@ -177,6 +189,59 @@ func TestFromContext_NoTenantNoAttrs(t *testing.T) {
 		if _, has := got[k]; has {
 			t.Errorf("expected no %q key on plain log, got %v", k, got)
 		}
+	}
+}
+
+func TestNewLogger_GCPPreservesGroupedAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewLogger(FormatGCP, slog.LevelInfo, &buf)
+	l.Info("top", slog.Group("payload",
+		slog.String("msg", "nested-msg"),
+		slog.String("level", "nested-level"),
+		slog.String("time", "nested-time"),
+	))
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+	if got["message"] != "top" || got["severity"] != "INFO" {
+		t.Fatalf("top-level GCP keys missing: %v", got)
+	}
+	payload, ok := got["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected payload group object, got %T", got["payload"])
+	}
+	if payload["msg"] != "nested-msg" || payload["level"] != "nested-level" || payload["time"] != "nested-time" {
+		t.Fatalf("grouped attributes were unexpectedly renamed: %v", payload)
+	}
+}
+
+func TestFromContext_PopulatesUserContextWithoutRawEmail(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	slog.SetDefault(NewLogger(FormatJSON, slog.LevelInfo, &buf))
+
+	ctx := account.WithContext(context.Background(), account.UserContext{
+		UserID:       "u-123",
+		Email:        "secret.user@example.com",
+		IsSuperadmin: true,
+	})
+	FromContext(ctx).Info("authed")
+
+	raw := buf.String()
+	if strings.Contains(raw, "secret.user@example.com") {
+		t.Fatalf("raw email leaked into structured log: %s", raw)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["user_id"] != "u-123" || got["email_hash"] == "" || got["email_hash"] == nil || got["is_superadmin"] != true {
+		t.Fatalf("expected user_id, email_hash, is_superadmin attrs, got %v", got)
+	}
+	if _, hasEmail := got["email"]; hasEmail {
+		t.Fatalf("unexpected raw email key in log: %v", got)
 	}
 }
 

@@ -83,8 +83,12 @@ class TestExtractResourceName:
         assert deploy._extract_resource_name("https://example.com/v1beta1/") is None
 
     def test_trailing_slash(self):
-        url = "https://example.com/v1beta1/projects/1/reasoningEngines/2"
+        url = "https://example.com/v1beta1/projects/1/reasoningEngines/2/"
         assert deploy._extract_resource_name(url) == "projects/1/reasoningEngines/2"
+        assert (
+            deploy._extract_resource_name("https://example.com/v1beta1/projects/1/reasoningEngines/2///")
+            == "projects/1/reasoningEngines/2"
+        )
 
 
 # --- _get_card_url ---
@@ -536,10 +540,16 @@ class TestReadRequirements:
         assert "google-adk>=1.0" in result
         assert "requests" in result
 
-    def test_returns_empty_on_missing_file(self, tmp_path, monkeypatch):
+    def test_raises_on_missing_file(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        result = deploy._read_requirements()
-        assert result == []
+        with pytest.raises(FileNotFoundError):
+            deploy._read_requirements()
+
+    def test_raises_on_corrupt_pyproject(self, tmp_path, monkeypatch):
+        (tmp_path / "pyproject.toml").write_text("not = [valid toml")
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(Exception):
+            deploy._read_requirements()
 
 
 # --- CLI: --only / --print-url ---
@@ -741,3 +751,108 @@ class TestApplyLabelsToEngine:
             "us-central1",
             {"dev-tutorial": "race-condition"},
         )
+
+
+class TestDeployAgentEngineLocationRestore:
+    def test_restores_saved_location_when_init_raises(self, monkeypatch):
+        fake_vertexai = MagicMock()
+        seen_during_init = {}
+
+        def boom(**kwargs):
+            seen_during_init["loc"] = os.environ.get("GOOGLE_CLOUD_LOCATION")
+            raise RuntimeError("simulated vertexai.init failure")
+
+        fake_vertexai.init.side_effect = boom
+        monkeypatch.setitem(sys.modules, "vertexai", fake_vertexai)
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+
+        cfg = {"module": "agents.fake.agent", "attr": "a2a_app", "path": "agents/fake"}
+        with pytest.raises(RuntimeError, match="simulated vertexai.init failure"):
+            deploy.deploy_agent_engine("fake", cfg, tf=_make_tf(region="europe-west4"))
+
+        assert seen_during_init["loc"] == "europe-west4"
+        assert os.environ.get("GOOGLE_CLOUD_LOCATION") == "global"
+
+    def test_removes_location_when_previously_unset_and_init_raises(self, monkeypatch):
+        fake_vertexai = MagicMock()
+        fake_vertexai.init.side_effect = RuntimeError("init boom")
+        monkeypatch.setitem(sys.modules, "vertexai", fake_vertexai)
+        monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+
+        cfg = {"module": "agents.fake.agent", "attr": "a2a_app", "path": "agents/fake"}
+        with pytest.raises(RuntimeError, match="init boom"):
+            deploy.deploy_agent_engine("fake", cfg, tf=_make_tf(region="us-central1"))
+
+        assert "GOOGLE_CLOUD_LOCATION" not in os.environ
+
+
+class TestDeployHardeningR5:
+    def test_corrupt_tf_outputs_file_raises(self, tmp_path, monkeypatch):
+        bad_file = tmp_path / "tf_outputs.json"
+        bad_file.write_text("{not-valid-json")
+        monkeypatch.setattr(deploy, "_TF_OUTPUTS_FILE", str(bad_file))
+        with pytest.raises(RuntimeError, match="Failed to read Terraform outputs"):
+            deploy._read_terraform_outputs()
+
+    def test_empty_project_id_raises(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "vertexai", MagicMock())
+        cfg = {"module": "agents.fake.agent", "attr": "a2a_app", "path": "agents/fake"}
+        with pytest.raises(ValueError, match="project_id is required"):
+            deploy.deploy_agent_engine("fake", cfg, tf=_make_tf(project_id=""))
+
+    def test_verify_failure_raises_runtime_error(self, tmp_path, monkeypatch):
+        fake_vertexai = MagicMock()
+        fake_deployed = MagicMock()
+        fake_deployed.resource_name = "projects/p/locations/us-central1/reasoningEngines/123"
+        fake_vertexai.agent_engines.create.return_value = fake_deployed
+        monkeypatch.setitem(sys.modules, "vertexai", fake_vertexai)
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        fake_mod = MagicMock()
+        fake_mod.a2a_agent = MagicMock()
+
+        with (
+            patch.object(deploy, "_read_requirements", return_value=["google-adk>=1.0"]),
+            patch.object(deploy, "_pin_all_requirements", return_value=["google-adk==1.0.0"]),
+            patch.object(deploy, "_stage_extra_packages", return_value=(str(staging), ["agents"])),
+            patch.object(deploy, "_compute_staging_fingerprint", return_value="abc123"),
+            patch.object(deploy.importlib, "import_module", return_value=fake_mod),
+            patch.object(deploy, "_determine_deploy_mode", return_value=("create", None)),
+            patch.object(deploy, "_apply_labels_to_engine"),
+            patch.object(deploy, "_verify_deployed_agent", return_value=False),
+        ):
+            with pytest.raises(RuntimeError, match="verification failed"):
+                deploy.deploy_agent_engine(
+                    "planner",
+                    {"module": "agents.planner.agent", "attr": "a2a_agent", "path": "agents/planner"},
+                    tf=_make_tf(telemetry_topic="agent-telemetry"),
+                )
+
+    @pytest.mark.parametrize("payload", ["[]", "null"])
+    def test_non_dict_tf_outputs_file_raises(self, tmp_path, monkeypatch, payload):
+        bad_file = tmp_path / "tf_outputs.json"
+        bad_file.write_text(payload)
+        monkeypatch.setattr(deploy, "_TF_OUTPUTS_FILE", str(bad_file))
+        with pytest.raises(RuntimeError, match="expected JSON object"):
+            deploy._read_terraform_outputs()
+
+    def test_stage_extra_packages_cleans_up_tempdir_on_missing_package(self, tmp_path, monkeypatch):
+        existing = tmp_path / "pkg_ok.py"
+        existing.write_text("x = 1\n")
+        created_dirs: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy_mkdtemp(*args, **kwargs):
+            d = Path(real_mkdtemp(*args, dir=str(tmp_path), **kwargs))
+            created_dirs.append(d)
+            return str(d)
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(deploy.tempfile, "mkdtemp", spy_mkdtemp)
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            deploy._stage_extra_packages(["pkg_ok.py", "does_not_exist"])
+
+        assert len(created_dirs) == 1
+        assert not created_dirs[0].exists()
+

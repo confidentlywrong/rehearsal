@@ -120,6 +120,20 @@ resource "google_cloud_run_v2_service_iam_member" "frontend_public" {
   member   = "allUsers"
 }
 
+# Webhook tier: cmd/billing receives Stripe webhook POSTs directly from
+# Stripe's servers (no Google IAM identity; authenticated at the app layer
+# via STRIPE_WEBHOOK_SECRET HMAC verification). Only bound when the billing
+# service is deployed and present in var.service_names.
+resource "google_cloud_run_v2_service_iam_member" "billing_public" {
+  count = contains(keys(var.service_names), "billing") ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = var.service_names["billing"]
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
 # ---------------------------------------------------------------------------
 # Operator tier: admin / dash / tester are NEVER bound to allUsers.
 # Each operator principal (var.operator_principals) is granted

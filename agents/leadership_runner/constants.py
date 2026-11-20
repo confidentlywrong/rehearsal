@@ -24,14 +24,15 @@ more aggressively than physical fatigue.
 """
 
 import hashlib
-import os
+
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model
 
 # --- Model Configuration ---
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
-LEADERSHIP_RUNNER_MODEL = (
-    (os.environ.get("LEADERSHIP_RUNNER_MODEL") or "").strip()
-    or (os.environ.get("RUNNER_MODEL") or "").strip()
-    or DEFAULT_MODEL
+DEFAULT_MODEL = DEFAULT_FLASH_LITE_MODEL
+LEADERSHIP_RUNNER_MODEL = get_model(
+    "LEADERSHIP_RUNNER_MODEL",
+    DEFAULT_MODEL,
+    fallback_env_vars=("RUNNER_MODEL",),
 )
 RUNNER_MODEL = LEADERSHIP_RUNNER_MODEL
 
@@ -147,7 +148,7 @@ PERSONA_PROFILES: dict[str, dict[str, float]] = {
 ALL_PERSONAS: list[str] = sorted(PERSONA_PROFILES.keys())
 
 
-def get_persona_profile(name: str) -> dict[str, float]:
+def get_persona_profile(name: str | None) -> dict[str, float]:
     """Return the parameter profile for a leadership persona.
 
     Falls back to ``"pragmatist"`` if the name is unknown.
@@ -158,4 +159,5 @@ def get_persona_profile(name: str) -> dict[str, float]:
     Returns:
         Dict of simulation parameters for the given persona.
     """
-    return PERSONA_PROFILES.get(name.lower(), PERSONA_PROFILES["pragmatist"])
+    key = name.strip().lower() if isinstance(name, str) else ""
+    return dict(PERSONA_PROFILES.get(key, PERSONA_PROFILES["pragmatist"]))

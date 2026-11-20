@@ -94,11 +94,19 @@ runner_a2a_agent, agent_card = create_a2a_deployment(
     agent_getter=get_agent,
 )
 
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("RUNNER_AUTOPILOT_PORT", "").strip()
+        or "9110"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent  # noqa: E402
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("RUNNER_AUTOPILOT_PORT", "9110")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info(f"Starting runner_autopilot agent server on port {port}")
 

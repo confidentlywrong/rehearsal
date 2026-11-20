@@ -14,18 +14,29 @@
 
 """Decision Classification Engine — tags decisions with leadership principles.
 
-Implements both LLM-based (Gemini Flash) and deterministic (keyword-matching)
-classification.  The LLM classifier is preferred but falls back to the
-heuristic if the LLM call fails.
+Implements deterministic keyword-matching classification (zero LLM cost).
 
 Invoked inside the simulator's tick pipeline BEFORE broadcasting to Echoes,
 so the classification result is included in the broadcast payload.
 """
 
 import logging
+import math
 import re
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
 
 # The 7 Leadership Principles (canonical order)
 PRINCIPLES = [
@@ -123,14 +134,62 @@ _PRINCIPLE_KEYWORDS: dict[int, list[str]] = {
 }
 
 
+# Explicit neglect / override cues per principle for deterministic fallback
+_NEGLECT_KEYWORDS: dict[int, list[str]] = {
+    0: ["short-term only", "no roadmap", "without a plan", "ignore long-term", "ignore strategy"],
+    1: ["refuse to adapt", "no iteration", "freeze scope", "inflexible", "reject experiment"],
+    2: [
+        "without consulting",
+        "no consultation",
+        "top-down mandate",
+        "skip communication",
+        "ignore feedback",
+        "behind closed doors",
+        "unilateral",
+        "without stakeholder",
+    ],
+    3: [
+        "skip review",
+        "skip ethical",
+        "bypass audit",
+        "bypass governance",
+        "ignore ethics",
+        "waive compliance",
+        "cut corners",
+        "without oversight",
+        "skip bias",
+    ],
+    4: ["micromanage", "centralize all", "no training", "strip autonomy", "without empowering"],
+    5: ["no backup", "no contingency", "ignore risk", "single point of failure"],
+    6: ["unlimited spend", "blank check", "ignore budget", "unfunded"],
+}
+
+_NEGATION_PREFIX_RE = re.compile(
+    r"\b(?:without|skip|skipping|bypass|bypassing|ignore|ignoring|no|waive|waiving|cancel|cancelling)\s+(?:\w+\s+){0,2}$"
+)
+
+
+def _has_negated_keyword(text_lower: str, keyword: str) -> bool:
+    """Return True if *keyword* only appears preceded by a negation/bypass verb."""
+    pos = text_lower.find(keyword)
+    if pos == -1:
+        return False
+    found_any = False
+    while pos != -1:
+        found_any = True
+        prefix_window = text_lower[max(0, pos - 40) : pos]
+        if not _NEGATION_PREFIX_RE.search(prefix_window):
+            # Found at least one non-negated occurrence
+            return False
+        pos = text_lower.find(keyword, pos + len(keyword))
+    return found_any
+
+
 def classify_decision_heuristic(
     decision_text: str,
     principles: list[str] | None = None,
 ) -> dict:
-    """Classify a decision using keyword matching (zero LLM cost).
-
-    This is the deterministic fallback used when the LLM classifier
-    is unavailable or fails.
+    """Classify a decision using deterministic keyword matching (zero LLM cost).
 
     Args:
         decision_text: The participant's decision text.
@@ -143,43 +202,61 @@ def classify_decision_heuristic(
     if principles is None:
         principles = PRINCIPLES
 
-    text_lower = decision_text.lower()
+    safe_text = decision_text if isinstance(decision_text, str) else ""
+    text_lower = safe_text.lower()
     scores: dict[int, int] = {}
+    explicitly_neglected: set[int] = set()
+
+    for idx, neg_phrases in _NEGLECT_KEYWORDS.items():
+        if idx < len(principles) and any(phrase in text_lower for phrase in neg_phrases):
+            explicitly_neglected.add(idx)
 
     for idx, keywords in _PRINCIPLE_KEYWORDS.items():
+        if idx >= len(principles):
+            continue
         for keyword in keywords:
             if keyword in text_lower:
-                scores[idx] = scores.get(idx, 0) + 1
+                if _has_negated_keyword(text_lower, keyword):
+                    explicitly_neglected.add(idx)
+                else:
+                    scores[idx] = scores.get(idx, 0) + 1
 
-    # Principles with keyword hits are "applied"
-    applied = []
+    # Remove explicitly neglected principles from positive scores
+    for idx in explicitly_neglected:
+        scores.pop(idx, None)
+
+    max_hits = max(scores.values(), default=0)
+
+    # When a substantive decision strongly commits to primary principle(s)
+    # (max_hits >= 3), a weak 1-keyword mention of another principle represents
+    # superficial/passing mention without commitment -> neglected.
+    min_applied_hits = 2 if max_hits >= 3 else 1
+
+    applied: list[str] = []
+    applied_indices: set[int] = set()
     for idx, count in sorted(scores.items(), key=lambda x: -x[1]):
-        if count > 0 and idx < len(principles):
+        if count >= min_applied_hits and idx < len(principles):
             applied.append(principles[idx])
+            applied_indices.add(idx)
 
-    # Principles with zero hits are candidates for "neglected"
-    # But we only flag neglected if the decision is substantive
-    neglected = []
-    if len(applied) > 0:
-        applied_indices = {i for i, p in enumerate(principles) if p in applied}
+    neglected: list[str] = []
+    # 1. Explicit neglect / bypass cues always take priority
+    for idx in sorted(explicitly_neglected):
+        if idx < len(principles) and idx not in applied_indices:
+            neglected.append(principles[idx])
 
-        # Only flag principles as neglected when the decision text contains
-        # 1-2 keywords from that principle (partial mention without commitment).
-        # This avoids the false-positive where every non-applied principle is
-        # flagged simply because its keyword dictionary is large enough.
-        for idx in range(len(principles)):
-            if idx in applied_indices or idx >= len(principles):
-                continue
-            keywords = _PRINCIPLE_KEYWORDS.get(idx, [])
-            hit_count = sum(1 for kw in keywords if kw in text_lower)
-            # Partial mention (1-2 keywords) without full application = neglect
-            if 1 <= hit_count <= 2:
-                neglected.append(principles[idx])
+    # 2. Partial mention (1 hit) without commitment when primary focus is strong
+    if max_hits >= 3:
+        for idx, count in sorted(scores.items(), key=lambda x: x[1]):
+            if idx not in applied_indices and idx < len(principles) and 1 <= count < min_applied_hits:
+                if principles[idx] not in neglected:
+                    neglected.append(principles[idx])
 
-        # Cap at 2 neglected to reduce noise
-        neglected = neglected[:2]
+    # Cap at 2 neglected to reduce noise
+    neglected = neglected[:2]
 
-    confidence = min(1.0, sum(scores.values()) / 5.0) if scores else 0.0
+    total_signal = sum(scores.values()) + len(explicitly_neglected)
+    confidence = min(1.0, total_signal / 5.0) if total_signal else 0.0
 
     # Simple resource impact suggestion
     resource_impact = {}
@@ -196,7 +273,7 @@ def classify_decision_heuristic(
         "confidence": round(confidence, 3),
         "resource_impact_suggestion": resource_impact,
         "classification_method": "heuristic",
-        "raw_decision": decision_text,
+        "raw_decision": safe_text,
     }
 
 
@@ -216,27 +293,38 @@ def apply_resource_impacts(
     Returns:
         Dict of actual deltas applied.
     """
-    deltas = {}
+    if not isinstance(resource_state, dict):
+        return {}
+    safe_impact = resource_impact if isinstance(resource_impact, dict) else {}
+    deltas: dict[str, float] = {}
 
     for name, pool in resource_state.items():
-        current = pool.get("current", 0)
-        regen = pool.get("regen_per_tick", 0)
+        if not isinstance(pool, dict):
+            continue
+        current = _finite_float(pool.get("current"), 0.0)
+        regen = _finite_float(pool.get("regen_per_tick"), 0.0)
 
         # Apply regeneration
         new_value = current + regen
 
         # Apply decision impact
-        impact = resource_impact.get(name, 0)
+        impact = _finite_float(safe_impact.get(name), 0.0)
         new_value += impact
 
         # Clamp to [0, initial]
-        initial = pool.get("initial", 100)
-        new_value = max(0, min(initial, new_value))
+        initial = max(0.0, _finite_float(pool.get("initial"), 100.0))
+        new_value = max(0.0, min(initial, new_value))
+        if not math.isfinite(new_value):
+            new_value = 0.0
 
-        delta = new_value - current
-        if delta != 0:
-            deltas[name] = round(delta, 1)
-        pool["current"] = round(new_value, 1)
+        raw_delta = new_value - current
+        if math.isfinite(raw_delta):
+            if raw_delta != 0:
+                deltas[name] = round(raw_delta, 1)
+        else:
+            deltas[name] = 0.0
+        rounded_new = round(new_value, 1)
+        pool["current"] = rounded_new if math.isfinite(rounded_new) else 0.0
 
     return deltas
 
@@ -258,23 +346,35 @@ def apply_black_swan_events(
     Returns:
         List of newly triggered events.
     """
-    triggered = []
+    if not isinstance(black_swan_events, list) or not isinstance(resource_state, dict):
+        return []
+    safe_history = triggered_history if isinstance(triggered_history, list) else []
+    triggered: list[dict] = []
 
     for event in black_swan_events:
-        description = event.get("event", "")
+        if not isinstance(event, dict):
+            continue
+        description = str(event.get("event") or "")
 
         # Skip already triggered events
-        if description in triggered_history:
+        if description in safe_history:
             continue
 
-        trigger = event.get("trigger", {})
+        trigger = event.get("trigger") or {}
+        if not isinstance(trigger, dict):
+            continue
         trigger_type = trigger.get("type", "")
 
         should_fire = False
 
         if trigger_type == "tick":
-            if trigger.get("tick") == tick:
-                should_fire = True
+            raw_trigger_tick = trigger.get("tick")
+            if not isinstance(raw_trigger_tick, bool) and isinstance(raw_trigger_tick, (int, float)):
+                try:
+                    trigger_tick_f = float(raw_trigger_tick)
+                    should_fire = math.isfinite(trigger_tick_f) and raw_trigger_tick == tick
+                except (TypeError, ValueError, OverflowError):
+                    should_fire = False
 
         elif trigger_type == "condition":
             condition = trigger.get("when", "")
@@ -282,16 +382,21 @@ def apply_black_swan_events(
 
         if should_fire:
             # Apply resource impacts
-            impacts = event.get("resource_impact", {})
-            for resource_name, delta in impacts.items():
-                pool_key = resource_name.lower()
-                if pool_key in resource_state:
-                    pool = resource_state[pool_key]
-                    current = pool.get("current", 0)
-                    pool["current"] = max(0, round(current + delta, 1))
+            impacts = event.get("resource_impact") or {}
+            if isinstance(impacts, dict):
+                for resource_name, raw_delta in impacts.items():
+                    if not isinstance(resource_name, str):
+                        continue
+                    pool_key = resource_name.lower()
+                    pool = resource_state.get(pool_key)
+                    if isinstance(pool, dict):
+                        current = _finite_float(pool.get("current"), 0.0)
+                        delta = _finite_float(raw_delta, 0.0)
+                        updated = current + delta
+                        pool["current"] = max(0.0, round(updated, 1)) if math.isfinite(updated) else 0.0
 
             triggered.append(event)
-            triggered_history.append(description)
+            safe_history.append(description)
 
             logger.warning(
                 "BLACK SWAN EVENT at tick %d: %s | Resource impact: %s",
@@ -328,7 +433,11 @@ def _eval_condition(condition: str, resource_state: dict) -> bool:
     Returns:
         True if condition is met, False otherwise.
     """
+    if not isinstance(condition, str) or not isinstance(resource_state, dict):
+        return False
     condition = condition.strip()
+    if not condition:
+        return False
 
     # Handle compound conditions — OR has lower precedence than AND.
     if re.search(r"\s+or\s+", condition, flags=re.IGNORECASE):
@@ -357,12 +466,13 @@ def _eval_single_condition(condition: str, resource_state: dict) -> bool:
     operator = match.group(2)
     threshold = float(match.group(3))
 
-    pool = resource_state.get(resource_name, {})
-    if not pool:
+    pool = resource_state.get(resource_name)
+    if not isinstance(pool, dict) or not pool:
         logger.warning(
             "Unknown resource '%s' in condition: %s (known: %s)", resource_name, condition, list(resource_state.keys())
         )
-    current = pool.get("current", 0)
+        return False
+    current = _finite_float(pool.get("current"), 0.0)
 
     ops = {
         "<": current < threshold,

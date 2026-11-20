@@ -21,7 +21,9 @@ Output format is QuestConfig-compatible (see agents/simulator/quest_loader.py)
 so the simulator can consume it directly via inject_quest_into_state().
 """
 
+import copy
 import logging
+import math
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -654,6 +656,39 @@ def _merge_memory_personas_into_echoes(
 # ---------------------------------------------------------------------------
 
 
+def _coerce_stakeholder_count(raw: Any, default: int = 1000) -> int:
+    """Coerce LLM-supplied stakeholder_count safely to a positive integer."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return max(1, raw)
+    if isinstance(raw, float):
+        return max(1, int(raw)) if math.isfinite(raw) else default
+    if isinstance(raw, str):
+        cleaned = raw.strip().replace(",", "")
+        if cleaned:
+            try:
+                fv = float(cleaned)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            if not math.isfinite(fv):
+                return default
+            try:
+                return max(1, int(fv))
+            except (ValueError, OverflowError):
+                return default
+    return default
+
+
+def _coerce_choice_str(raw: Any, default: str) -> str:
+    """Normalize optional string parameter to a lowercase non-empty string."""
+    if isinstance(raw, str):
+        cleaned = raw.strip().lower()
+        if cleaned:
+            return cleaned
+    return default
+
+
 async def design_leadership_scenario(
     scenario_type: str = "transformation",
     budget_allocation: str = "balanced",
@@ -683,13 +718,20 @@ async def design_leadership_scenario(
             conservative). Default: "balanced".
         complexity: Scenario complexity (simple, moderate, complex).
             Default: "moderate".
-        stakeholder_count: Number of stakeholders. Default: 10.
+        stakeholder_count: Number of stakeholders. Default: 1000.
         tool_context: ADK ToolContext (injected automatically).
 
     Returns:
         dict with QuestConfig-compatible format: id, name, resources,
         echoes, black_swan_events, principles, max_ticks, difficulty.
     """
+    scenario_type = _coerce_choice_str(scenario_type, "transformation")
+    budget_allocation = _coerce_choice_str(budget_allocation, "balanced")
+    complexity = _coerce_choice_str(complexity, "moderate")
+    if complexity == "high":
+        complexity = "complex"
+    stakeholder_count = _coerce_stakeholder_count(stakeholder_count, 1000)
+
     # Idempotent: return cached result if already generated
     if tool_context and tool_context.state.get("leadership_scenario"):
         logger.info("design_leadership_scenario: returning cached scenario")
@@ -699,7 +741,8 @@ async def design_leadership_scenario(
             "scenario_id": cached.get("id"),
             "name": cached.get("name"),
             "scenario_type": cached.get("scenario_type"),
-            "stakeholder_count": len(cached.get("echoes", [])),
+            "stakeholder_count": cached.get("stakeholder_count", len(cached.get("echoes", []))),
+            "echo_count": len(cached.get("echoes", [])),
             "message": "Scenario already designed and saved to state. NEXT STEP: Call plan_consensus_pathway() to compute the consensus pathway.",
         }
 
@@ -711,7 +754,7 @@ async def design_leadership_scenario(
     # Load base templates exactly once (to avoid context overflow).
     # Scaling to 10,000+ stakeholders is handled purely mathematically
     # via the simulation_config passed to submit_plan_to_simulator.
-    echoes = [template.copy() for template in templates]
+    echoes = [copy.deepcopy(template) for template in templates]
 
     # ------------------------------------------------------------------
     # Phase 3 memory merge (Q2=Merge).
@@ -727,11 +770,14 @@ async def design_leadership_scenario(
         if persona_payload:
             echoes = _merge_memory_personas_into_echoes(persona_payload, echoes)
 
-    # Build resources (QuestConfig ResourceConfig format)
-    resources = _RESOURCE_MODELS.get(budget_allocation, _RESOURCE_MODELS["balanced"])
+    # Build resources (QuestConfig ResourceConfig format) — deepcopy so
+    # downstream mutations cannot corrupt module-level _RESOURCE_MODELS.
+    resources = copy.deepcopy(_RESOURCE_MODELS.get(budget_allocation, _RESOURCE_MODELS["balanced"]))
 
     # Build black swan events
-    black_swan_events = _BLACK_SWAN_TEMPLATES.get(scenario_type, _BLACK_SWAN_TEMPLATES["transformation"])
+    black_swan_events = copy.deepcopy(
+        _BLACK_SWAN_TEMPLATES.get(scenario_type, _BLACK_SWAN_TEMPLATES["transformation"])
+    )
 
     # Determine ticks and difficulty from complexity
     max_ticks = _COMPLEXITY_TICKS.get(complexity, 30)
@@ -830,9 +876,7 @@ async def report_leadership_scenario(tool_context=None, **kwargs: Any) -> Dict[s
     if not tool_context:
         return {"status": "error", "message": "No tool context available."}
 
-    scenario = tool_context.state.get("leadership_scenario") if tool_context else None
-    if not scenario:
-        scenario = _last_scenario
+    scenario = tool_context.state.get("leadership_scenario")
     if not scenario:
         return {
             "status": "error",
@@ -920,6 +964,13 @@ async def plan_consensus_pathway(
     Returns:
         dict with status and geojson FeatureCollection.
     """
+    scenario_type = _coerce_choice_str(scenario_type, "transformation")
+    budget_allocation = _coerce_choice_str(budget_allocation, "balanced")
+    complexity = _coerce_choice_str(complexity, "moderate")
+    if complexity == "high":
+        complexity = "complex"
+    stakeholder_count = _coerce_stakeholder_count(stakeholder_count, 1000)
+
     # ── Hard idempotency guard (mirrors plan_marathon_route) ──────────
     # If the pathway has already been planned in this session, return
     # "already_planned".  The LLM must use report_leadership_scenario
@@ -936,12 +987,15 @@ async def plan_consensus_pathway(
 
     _dcns_path = _pl.Path(__file__).parent / "dcns_engine.py"
     _spec = _ilu.spec_from_file_location("dcns_engine", _dcns_path)
-    dcns_engine = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
-    _spec.loader.exec_module(dcns_engine)  # type: ignore[union-attr]
+    if _spec is None or _spec.loader is None:
+        raise ImportError(f"Failed to load dcns_engine from {_dcns_path}")
+    dcns_engine = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(dcns_engine)
 
     # Step 1: Ensure scenario is designed (reuses cached if available)
     await design_leadership_scenario(
         scenario_type=scenario_type,
+        stakeholder_count=stakeholder_count,
         budget_allocation=budget_allocation,
         complexity=complexity,
         tool_context=tool_context,
@@ -968,12 +1022,35 @@ async def plan_consensus_pathway(
     if tool_context:
         raw_venue_coords = tool_context.state.get("venue_coords")
         if isinstance(raw_venue_coords, dict) and raw_venue_coords:
-            # Ensure values are tuples
-            venue_coords = {k: tuple(v) if isinstance(v, (list, tuple)) else v for k, v in raw_venue_coords.items()}
-            logger.info(
-                "plan_consensus_pathway: using %d real venue coordinates from Maps",
-                len(venue_coords),
-            )
+            parsed_coords: Dict[str, tuple[float, float]] = {}
+            for k, v in raw_venue_coords.items():
+                try:
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        if isinstance(v[0], bool) or isinstance(v[1], bool):
+                            continue
+                        lon_f, lat_f = float(v[0]), float(v[1])
+                        if math.isfinite(lon_f) and math.isfinite(lat_f):
+                            parsed_coords[str(k)] = (lon_f, lat_f)
+                    elif isinstance(v, dict):
+                        raw_lon = v.get("lon", v.get("lng", v.get("longitude")))
+                        raw_lat = v.get("lat", v.get("latitude"))
+                        if (
+                            raw_lon is not None
+                            and raw_lat is not None
+                            and not isinstance(raw_lon, bool)
+                            and not isinstance(raw_lat, bool)
+                        ):
+                            lon_f, lat_f = float(raw_lon), float(raw_lat)
+                            if math.isfinite(lon_f) and math.isfinite(lat_f):
+                                parsed_coords[str(k)] = (lon_f, lat_f)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            if parsed_coords:
+                venue_coords = parsed_coords
+                logger.info(
+                    "plan_consensus_pathway: using %d real venue coordinates from Maps",
+                    len(venue_coords),
+                )
 
         # Organizational Terrain: read venue types, travel matrix, and weather
         # modifier from session state (populated by the agent in workflow
@@ -988,15 +1065,83 @@ async def plan_consensus_pathway(
 
         raw_travel_matrix = tool_context.state.get("travel_matrix")
         if isinstance(raw_travel_matrix, dict) and raw_travel_matrix:
-            travel_matrix = {k: float(v) for k, v in raw_travel_matrix.items()}
-            logger.info(
-                "plan_consensus_pathway: using %d travel durations from Routes API",
-                len(travel_matrix),
-            )
+            parsed_tm: Dict[str, float] = {}
+            for k, v in raw_travel_matrix.items():
+                if v is None or isinstance(v, bool):
+                    continue
+                try:
+                    if isinstance(v, str):
+                        import re as _re
+
+                        m = _re.search(r"[-+]?\d*\.?\d+", v)
+                        val_f = float(m.group(0)) if m else float("nan")
+                    else:
+                        val_f = float(v)
+                    if math.isfinite(val_f):
+                        parsed_tm[str(k)] = max(0.0, val_f)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            if parsed_tm:
+                travel_matrix = parsed_tm
+                logger.info(
+                    "plan_consensus_pathway: using %d travel durations from Routes API",
+                    len(travel_matrix),
+                )
 
         raw_weather = tool_context.state.get("weather_modifier")
         if isinstance(raw_weather, dict) and raw_weather:
-            weather_modifier = raw_weather
+            sanitized_weather: Dict[str, Any] = {}
+            for factor_key, default_val in (
+                ("distance_factor", 1.0),
+                ("time_factor", 1.0),
+                ("capital_factor", 1.0),
+                ("morale_factor", 1.0),
+            ):
+                if factor_key in raw_weather:
+                    val = raw_weather[factor_key]
+                    if not isinstance(val, bool) and isinstance(val, (int, float)):
+                        try:
+                            fv = float(val)
+                            sanitized_weather[factor_key] = max(0.0, fv) if math.isfinite(fv) else default_val
+                        except OverflowError:
+                            sanitized_weather[factor_key] = default_val
+                    elif isinstance(val, str):
+                        try:
+                            fv = float(val.strip())
+                            sanitized_weather[factor_key] = max(0.0, fv) if math.isfinite(fv) else default_val
+                        except (ValueError, OverflowError):
+                            sanitized_weather[factor_key] = default_val
+                    else:
+                        sanitized_weather[factor_key] = default_val
+            if "resistance_delta" in raw_weather:
+                rval = raw_weather["resistance_delta"]
+                if not isinstance(rval, bool) and isinstance(rval, (int, float)):
+                    try:
+                        fv = float(rval)
+                        sanitized_weather["resistance_delta"] = fv if math.isfinite(fv) else 0.0
+                    except OverflowError:
+                        sanitized_weather["resistance_delta"] = 0.0
+                else:
+                    sanitized_weather["resistance_delta"] = 0.0
+            if "perturbation_range" in raw_weather:
+                pr = raw_weather["perturbation_range"]
+                if (
+                    isinstance(pr, (list, tuple))
+                    and len(pr) == 2
+                    and not isinstance(pr[0], bool)
+                    and not isinstance(pr[1], bool)
+                    and isinstance(pr[0], (int, float))
+                    and isinstance(pr[1], (int, float))
+                ):
+                    try:
+                        lo, hi = float(pr[0]), float(pr[1])
+                        if math.isfinite(lo) and math.isfinite(hi) and 0.0 < lo <= hi:
+                            sanitized_weather["perturbation_range"] = (lo, hi)
+                    except OverflowError:
+                        pass
+            if "condition" in raw_weather:
+                sanitized_weather["condition"] = str(raw_weather["condition"])
+            weather_modifier = sanitized_weather
             logger.info(
                 "plan_consensus_pathway: using weather modifier (%s)",
                 weather_modifier.get("condition", "unknown"),
@@ -1033,7 +1178,7 @@ async def plan_consensus_pathway(
     return {
         "status": "success",
         "persona": "pragmatist",
-        "waypoint_count": len(selected.get("waypoints", [])),
+        "waypoint_count": len(selected.get("waypoints") or selected.get("pathway") or []),
         "consensus_score": round(selected.get("consensus_score", 0), 3),
         "cost": selected.get("cost", {}),
         "message": "Consensus pathway planned and saved to state. NEXT STEP: Call report_leadership_scenario() to publish the scenario.",

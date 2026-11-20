@@ -105,7 +105,13 @@ func usageUserHandler(reader billing.UsageReader, now func() time.Time) gin.Hand
 			return
 		}
 
-		if agents, agErr := reader.GetAgentBreakdown(ctx, userID, yearMonth); agErr == nil {
+		agents, agErr := reader.GetAgentBreakdown(ctx, userID, yearMonth)
+		if agErr != nil {
+			log.Printf("handler error: %v", agErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+		if agents != nil {
 			for i := range agents {
 				if agents[i].AgentType == "" {
 					agents[i].AgentType = "unknown"

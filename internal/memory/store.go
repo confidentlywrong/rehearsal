@@ -6,11 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PgxConn is the minimal pgx-style surface the Store needs. Both
@@ -38,10 +41,20 @@ type Store struct {
 	db PgxConn
 }
 
-// NewStore constructs a Store over db. db may be nil; in that case
-// every method returns an error and the surrounding handler should
-// surface a 503. (We never silently no-op writes.)
+// NewStore constructs a Store over db. db may be nil (including typed-nil
+// *pgx.Conn or *pgxpool.Pool); in that case every method returns an error and
+// the surrounding handler should surface a 503. (We never silently no-op writes.)
 func NewStore(db PgxConn) *Store {
+	switch v := db.(type) {
+	case *pgx.Conn:
+		if v == nil {
+			db = nil
+		}
+	case *pgxpool.Pool:
+		if v == nil {
+			db = nil
+		}
+	}
 	return &Store{db: db}
 }
 
@@ -65,6 +78,7 @@ func (s *Store) CreateAnalysis(ctx context.Context, in CreateAnalysisInput) (Ana
 	in.OperatorID = strings.TrimSpace(in.OperatorID)
 	in.OrgName = strings.TrimSpace(in.OrgName)
 	in.Title = strings.TrimSpace(in.Title)
+	in.Description = strings.TrimSpace(in.Description)
 	if in.OperatorID == "" {
 		return Analysis{}, errors.New("memory: operator_id required")
 	}
@@ -74,8 +88,8 @@ func (s *Store) CreateAnalysis(ctx context.Context, in CreateAnalysisInput) (Ana
 	id := uuid.New()
 	row := s.db.QueryRow(ctx, `
 		INSERT INTO analyses (id, operator_id, org_name, title, description)
-		VALUES ($1, $2, $3, $4, NULLIF($5, ''))
-		RETURNING id, operator_id, org_name, title, COALESCE(description,''),
+		VALUES ($1, $2, NULLIF($3, ''), $4, NULLIF($5, ''))
+		RETURNING id, operator_id, COALESCE(org_name,''), title, COALESCE(description,''),
 		          created_at, deleted_at`,
 		id, in.OperatorID, in.OrgName, in.Title, in.Description)
 	return scanAnalysis(row)
@@ -88,7 +102,7 @@ func (s *Store) GetAnalysis(ctx context.Context, operatorID string, analysisID u
 		return Analysis{}, err
 	}
 	row := s.db.QueryRow(ctx, `
-		SELECT id, operator_id, org_name, title, COALESCE(description,''),
+		SELECT id, operator_id, COALESCE(org_name,''), title, COALESCE(description,''),
 		       created_at, deleted_at
 		  FROM analyses
 		 WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL`,
@@ -101,35 +115,37 @@ func (s *Store) UpdateAnalysis(ctx context.Context, operatorID string, analysisI
 	if err := s.ok(); err != nil {
 		return Analysis{}, err
 	}
-	
+
 	var sets []string
-	var args []any
-	args = append(args, analysisID, operatorID)
-	argId := 3
-	
+	args := []any{analysisID, operatorID}
+
 	if in.Title != nil {
-		sets = append(sets, fmt.Sprintf("title = $%d", argId))
-		args = append(args, *in.Title)
-		argId++
+		title := strings.TrimSpace(*in.Title)
+		if title == "" {
+			return Analysis{}, errors.New("memory: title required")
+		}
+		args = append(args, title)
+		sets = append(sets, fmt.Sprintf("title = $%d", len(args)))
 	}
 	if in.Description != nil {
-		sets = append(sets, fmt.Sprintf("description = $%d", argId))
-		args = append(args, *in.Description)
-		argId++
+		desc := strings.TrimSpace(*in.Description)
+		args = append(args, desc)
+		sets = append(sets, fmt.Sprintf("description = NULLIF($%d, '')", len(args)))
 	}
 	if in.OrgName != nil {
-		sets = append(sets, fmt.Sprintf("org_name = $%d", argId))
-		args = append(args, *in.OrgName)
+		org := strings.TrimSpace(*in.OrgName)
+		args = append(args, org)
+		sets = append(sets, fmt.Sprintf("org_name = NULLIF($%d, '')", len(args)))
 	}
-	
+
 	if len(sets) == 0 {
 		return s.GetAnalysis(ctx, operatorID, analysisID)
 	}
-	
+
 	query := fmt.Sprintf(`
 		UPDATE analyses SET %s
 		WHERE id = $1 AND operator_id = $2 AND deleted_at IS NULL
-		RETURNING id, operator_id, org_name, title, COALESCE(description,''), created_at, deleted_at`, strings.Join(sets, ", "))
+		RETURNING id, operator_id, COALESCE(org_name,''), title, COALESCE(description,''), created_at, deleted_at`, strings.Join(sets, ", "))
 	return scanAnalysis(s.db.QueryRow(ctx, query, args...))
 }
 
@@ -140,7 +156,7 @@ func (s *Store) ListAnalyses(ctx context.Context, operatorID string) ([]Analysis
 		return nil, err
 	}
 	rows, err := s.db.Query(ctx, `
-		SELECT id, operator_id, org_name, title, COALESCE(description,''),
+		SELECT id, operator_id, COALESCE(org_name,''), title, COALESCE(description,''),
 		       created_at, deleted_at
 		  FROM analyses
 		 WHERE operator_id = $1 AND deleted_at IS NULL
@@ -197,7 +213,6 @@ func (s *Store) SoftDeleteAnalysis(ctx context.Context, operatorID string, analy
 	return nil
 }
 
-
 // =====================================================================
 // documents
 // =====================================================================
@@ -221,6 +236,9 @@ func (s *Store) AddDocument(ctx context.Context, operatorID string, analysisID u
 	in.StorageURI = strings.TrimSpace(in.StorageURI)
 	if in.Kind == "" || in.Filename == "" || in.SHA256 == "" || in.StorageURI == "" {
 		return Document{}, errors.New("memory: kind, filename, sha256, storage_uri all required")
+	}
+	if in.ByteSize < 0 {
+		return Document{}, errors.New("memory: byte_size must be non-negative")
 	}
 	id := uuid.New()
 	row := s.db.QueryRow(ctx, `
@@ -293,6 +311,9 @@ func (s *Store) GetDocument(ctx context.Context, operatorID string, analysisID, 
 // document does not exist, does not belong to the analysis, or the
 // analysis does not belong to the operator.
 func (s *Store) DeleteDocument(ctx context.Context, operatorID string, analysisID, documentID uuid.UUID) error {
+	if err := s.ok(); err != nil {
+		return err
+	}
 	tag, err := s.db.Exec(ctx, `
 		DELETE FROM analysis_documents
 		 WHERE id = $1
@@ -348,14 +369,67 @@ func scanDocument(r scannable) (Document, error) {
 	return d, nil
 }
 
-
 // =====================================================================
 // document chunks
 // =====================================================================
 
+const maxChunkInsertBatch = 500
+
+type chunkExecer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func insertChunkBatches(ctx context.Context, execer chunkExecer, chunks []StoreChunkInput) error {
+	for start := 0; start < len(chunks); start += maxChunkInsertBatch {
+		end := start + maxChunkInsertBatch
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[start:end]
+		var b strings.Builder
+		b.WriteString(`INSERT INTO document_chunks (chunk_id, document_id, analysis_id, chunk_index, chunk_text, embedding) VALUES `)
+		args := make([]any, 0, len(batch)*6)
+		for i, c := range batch {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			base := i * 6
+			fmt.Fprintf(&b, "($%d, $%d, $%d, $%d, $%d, $%d::vector)",
+				base+1, base+2, base+3, base+4, base+5, base+6)
+			args = append(args, uuid.New(), c.DocumentID, c.AnalysisID, c.ChunkIndex, c.ChunkText, pgvectorString(c.Embedding))
+		}
+		if _, err := execer.Exec(ctx, b.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStoreChunks(chunks []StoreChunkInput) error {
+	for i, c := range chunks {
+		if c.DocumentID == uuid.Nil {
+			return fmt.Errorf("memory: chunk[%d]: document_id required", i)
+		}
+		if c.AnalysisID == uuid.Nil {
+			return fmt.Errorf("memory: chunk[%d]: analysis_id required", i)
+		}
+		if c.ChunkIndex < 0 {
+			return fmt.Errorf("memory: chunk[%d]: chunk_index must be non-negative", i)
+		}
+		if len(c.Embedding) == 0 {
+			return fmt.Errorf("memory: chunk[%d]: embedding is empty", i)
+		}
+		if !hasValidEmbeddingNorm(c.Embedding, len(c.Embedding)) {
+			return fmt.Errorf("memory: chunk[%d]: embedding must be finite and non-zero", i)
+		}
+	}
+	return nil
+}
+
 // StoreChunks batch-inserts document chunks with their embeddings.
-// Uses a single multi-row INSERT for efficiency. No tenancy check
-// here — the caller (handler) already verified ownership via
+// Splits large inputs into batches of 500 rows (3,000 bind params) so
+// Postgres's 65,535 bind-parameter ceiling cannot be exceeded. No tenancy
+// check here — the caller (handler) already verified ownership via
 // requireOwnedAnalysis.
 func (s *Store) StoreChunks(ctx context.Context, chunks []StoreChunkInput) error {
 	if err := s.ok(); err != nil {
@@ -364,24 +438,10 @@ func (s *Store) StoreChunks(ctx context.Context, chunks []StoreChunkInput) error
 	if len(chunks) == 0 {
 		return nil
 	}
-
-	// Build a multi-row INSERT.  Each row has 5 placeholders:
-	// (id, document_id, analysis_id, chunk_index, chunk_text, embedding).
-	var b strings.Builder
-	b.WriteString(`INSERT INTO document_chunks (chunk_id, document_id, analysis_id, chunk_index, chunk_text, embedding) VALUES `)
-	args := make([]any, 0, len(chunks)*6)
-	for i, c := range chunks {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		base := i * 6
-		fmt.Fprintf(&b, "($%d, $%d, $%d, $%d, $%d, $%d::vector)",
-			base+1, base+2, base+3, base+4, base+5, base+6)
-		id := uuid.New()
-		args = append(args, id, c.DocumentID, c.AnalysisID, c.ChunkIndex, c.ChunkText, pgvectorString(c.Embedding))
+	if err := validateStoreChunks(chunks); err != nil {
+		return err
 	}
-	_, err := s.db.Exec(ctx, b.String(), args...)
-	if err != nil {
+	if err := insertChunkBatches(ctx, s.db, chunks); err != nil {
 		return fmt.Errorf("memory: store chunks: %w", err)
 	}
 	return nil
@@ -405,43 +465,46 @@ func (s *Store) ReplaceChunksForDocument(ctx context.Context, docID uuid.UUID, c
 	if err := s.ok(); err != nil {
 		return err
 	}
-	
+	if docID == uuid.Nil {
+		return errors.New("memory: document_id required")
+	}
+	if err := validateStoreChunks(chunks); err != nil {
+		return err
+	}
+
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("memory: begin tx: %w", err)
 	}
+	committed := false
 	defer func() {
-		_ = tx.Rollback(ctx)
+		if committed {
+			return
+		}
+		rbCtx := ctx
+		if rbCtx == nil || rbCtx.Err() != nil {
+			var cancel context.CancelFunc
+			rbCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+		}
+		_ = tx.Rollback(rbCtx)
 	}()
-	
+
 	_, err = tx.Exec(ctx, `DELETE FROM document_chunks WHERE document_id = $1`, docID)
 	if err != nil {
 		return fmt.Errorf("memory: delete chunks tx: %w", err)
 	}
-	
+
 	if len(chunks) > 0 {
-		var b strings.Builder
-		b.WriteString(`INSERT INTO document_chunks (chunk_id, document_id, analysis_id, chunk_index, chunk_text, embedding) VALUES `)
-		args := make([]any, 0, len(chunks)*6)
-		for i, c := range chunks {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			base := i * 6
-			fmt.Fprintf(&b, "($%d, $%d, $%d, $%d, $%d, $%d::vector)",
-				base+1, base+2, base+3, base+4, base+5, base+6)
-			id := uuid.New()
-			args = append(args, id, c.DocumentID, c.AnalysisID, c.ChunkIndex, c.ChunkText, pgvectorString(c.Embedding))
-		}
-		_, err = tx.Exec(ctx, b.String(), args...)
-		if err != nil {
+		if err := insertChunkBatches(ctx, tx, chunks); err != nil {
 			return fmt.Errorf("memory: insert chunks tx: %w", err)
 		}
 	}
-	
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("memory: commit tx: %w", err)
 	}
+	committed = true
 	return nil
 }
 
@@ -451,6 +514,18 @@ func (s *Store) ReplaceChunksForDocument(ctx context.Context, docID uuid.UUID, c
 func (s *Store) RetrieveChunks(ctx context.Context, analysisID uuid.UUID, queryEmbedding []float32, limit int) ([]ChunkResult, error) {
 	if err := s.ok(); err != nil {
 		return nil, err
+	}
+	if analysisID == uuid.Nil {
+		return nil, errors.New("memory: analysis_id required")
+	}
+	if len(queryEmbedding) == 0 {
+		return nil, errors.New("memory: query embedding is empty")
+	}
+	if len(queryEmbedding) != TargetVectorDimension {
+		return nil, fmt.Errorf("memory: query embedding dimension %d != %d", len(queryEmbedding), TargetVectorDimension)
+	}
+	if !hasValidEmbeddingNorm(queryEmbedding, len(queryEmbedding)) {
+		return nil, errors.New("memory: query embedding must be finite and non-zero")
 	}
 	if limit <= 0 {
 		limit = 5
@@ -464,6 +539,7 @@ func (s *Store) RetrieveChunks(ctx context.Context, analysisID uuid.UUID, queryE
 		       1 - (embedding <=> $1::vector) AS score, created_at
 		  FROM document_chunks
 		 WHERE analysis_id = $2
+		   AND embedding IS NOT NULL
 		 ORDER BY embedding <=> $1::vector
 		 LIMIT $3`,
 		embStr, analysisID, limit)
@@ -487,12 +563,17 @@ func (s *Store) RetrieveChunks(ctx context.Context, analysisID uuid.UUID, queryE
 
 // pgvectorString serialises a float32 slice into the pgvector text
 // format "[0.1,0.2,0.3]" for use with $N::vector casts.
+// Non-finite floats (NaN, ±Inf) are sanitized to 0 so PostgreSQL ::vector casts never error.
 func pgvectorString(v []float32) string {
 	var b strings.Builder
 	b.WriteByte('[')
 	for i, f := range v {
 		if i > 0 {
 			b.WriteByte(',')
+		}
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			b.WriteByte('0')
+			continue
 		}
 		fmt.Fprintf(&b, "%g", f)
 	}

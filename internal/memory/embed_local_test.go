@@ -17,10 +17,14 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/localai"
@@ -175,5 +179,315 @@ func TestLocalGemmaEmbedderAndDynamicEmbedder(t *testing.T) {
 		t.Fatalf("expected truncated unit vector [0.6, 0.8], got %v", trunc)
 	}
 }
+
+func TestLocalGemmaEmbedder_404ModelNotFoundDoesNotFallbackToLegacy(t *testing.T) {
+	legacyHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/embeddings" {
+			legacyHit = true
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"model 'embeddinggemma:latest' not found"}`))
+	}))
+	defer srv.Close()
+
+	emb := NewLocalGemmaEmbedder(func() (string, string) {
+		return srv.URL, "embeddinggemma:latest"
+	})
+	if _, err := emb.EmbedText(context.Background(), "hello"); err == nil {
+		t.Fatal("expected error on 404 model not found")
+	}
+	if legacyHit {
+		t.Fatal("must NOT fall back to /api/embeddings when Ollama returns 404 model not found")
+	}
+
+	// Stripped-to-empty explicit model ("ollama/") must error explicitly instead of silent DefaultEmbedModel fallback.
+	badModelEmb := NewLocalGemmaEmbedder(func() (string, string) {
+		return srv.URL, "ollama/"
+	})
+	if _, err := badModelEmb.EmbedText(context.Background(), "hello"); err == nil {
+		t.Fatal("expected error when explicit model strips to empty")
+	}
+
+	// Nil receiver must error cleanly.
+	var nilEmb *LocalGemmaEmbedder
+	if _, err := nilEmb.EmbedText(context.Background(), "hello"); err == nil {
+		t.Fatal("expected error from nil *LocalGemmaEmbedder")
+	}
+}
+
+func TestDynamicEmbedder_NilAIManagerAndNilVertexReturnsError(t *testing.T) {
+	dyn := NewDynamicEmbedder(nil, nil)
+	if _, err := dyn.EmbedText(context.Background(), "hello"); err == nil {
+		t.Fatal("expected explicit error when both aiManager and vertex are nil")
+	}
+	if _, err := dyn.EmbedBatch(context.Background(), []string{"hello"}); err == nil {
+		t.Fatal("expected explicit error from EmbedBatch when both aiManager and vertex are nil")
+	}
+	var nilDyn *DynamicEmbedder
+	if _, err := nilDyn.EmbedText(context.Background(), "hello"); err == nil {
+		t.Fatal("expected error from nil *DynamicEmbedder.EmbedText")
+	}
+	if _, err := nilDyn.EmbedBatch(context.Background(), []string{"hello"}); err == nil {
+		t.Fatal("expected error from nil *DynamicEmbedder.EmbedBatch")
+	}
+}
+
+func assertUnitNormalizedVector(t *testing.T, got []float32, nonZeroCount int, expectedVal float64) {
+	t.Helper()
+	if len(got) != TargetVectorDimension {
+		t.Fatalf("expected length %d, got %d", TargetVectorDimension, len(got))
+	}
+	var sumSq float64
+	for i := 0; i < TargetVectorDimension; i++ {
+		v := float64(got[i])
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Fatalf("non-finite component at index %d: %v", i, got[i])
+		}
+		if i < nonZeroCount {
+			if math.Abs(v-expectedVal) > 1e-5 {
+				t.Fatalf("got[%d] = %v, want ~%v", i, v, expectedVal)
+			}
+		} else if got[i] != 0 {
+			t.Fatalf("expected zero padding at index %d, got %v", i, got[i])
+		}
+		sumSq += v * v
+	}
+	norm := math.Sqrt(sumSq)
+	if math.Abs(norm-1.0) > 1e-5 {
+		t.Fatalf("expected unit L2 norm ~1.0, got %v", norm)
+	}
+}
+
+func TestNormalizeAndPadVector_Float32NormOverflow(t *testing.T) {
+	// 1. Two-element vector [MaxFloat32, MaxFloat32] whose L2 norm > math.MaxFloat32.
+	twoMax := []float32{math.MaxFloat32, math.MaxFloat32}
+	if !hasValidEmbeddingNorm(twoMax, TargetVectorDimension) {
+		t.Fatal("expected hasValidEmbeddingNorm to accept [MaxFloat32, MaxFloat32]")
+	}
+	gotTwo := NormalizeAndPadVector(twoMax, TargetVectorDimension)
+	assertUnitNormalizedVector(t, gotTwo, 2, 1.0/math.Sqrt(2))
+
+	// 2. 768-d vector filled with 1.3e37 (L2 norm ~3.603e38 > math.MaxFloat32 ~3.403e38).
+	vec768 := make([]float32, 768)
+	for i := range vec768 {
+		vec768[i] = 1.3e37
+	}
+	if !hasValidEmbeddingNorm(vec768, TargetVectorDimension) {
+		t.Fatal("expected hasValidEmbeddingNorm to accept 768-d 1.3e37 vector")
+	}
+	got768 := NormalizeAndPadVector(vec768, TargetVectorDimension)
+	assertUnitNormalizedVector(t, got768, 768, 1.0/math.Sqrt(768))
+
+	// 3. Verify hasValidEmbeddingNorm and NormalizeAndPadVector agree on rejection edge cases.
+	rejectCases := []struct {
+		name      string
+		vec       []float32
+		targetDim int
+	}{
+		{"sub-threshold norm", []float32{1e-13, 0}, 4},
+		{"NaN component", []float32{float32(math.NaN()), 1}, 4},
+		{"Inf component", []float32{float32(math.Inf(1)), 1}, 4},
+		{"zero prefix before truncation", []float32{0, 0, 1}, 2},
+	}
+	for _, tc := range rejectCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if hasValidEmbeddingNorm(tc.vec, tc.targetDim) {
+				t.Fatalf("expected hasValidEmbeddingNorm=false for %s", tc.name)
+			}
+			out := NormalizeAndPadVector(tc.vec, tc.targetDim)
+			if len(out) != tc.targetDim {
+				t.Fatalf("expected len=%d, got %d", tc.targetDim, len(out))
+			}
+			for i, v := range out {
+				if v != 0 {
+					t.Fatalf("expected all-zero output for rejected %s, got out[%d]=%v", tc.name, i, v)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalGemmaEmbedder_Float32NormOverflow(t *testing.T) {
+	const rawVal float32 = 3e38
+	expected := 1.0 / math.Sqrt(2)
+
+	t.Run("modern /api/embed", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/embed" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ollamaEmbedResponse{
+				Embeddings: [][]float32{{rawVal, rawVal, 0, 0}},
+			})
+		}))
+		defer srv.Close()
+
+		emb := NewLocalGemmaEmbedder(func() (string, string) {
+			return srv.URL, "embeddinggemma:latest"
+		})
+		got, err := emb.EmbedText(context.Background(), "overflow probe")
+		if err != nil {
+			t.Fatalf("EmbedText failed: %v", err)
+		}
+		assertUnitNormalizedVector(t, got, 2, expected)
+	})
+
+	t.Run("legacy /api/embeddings", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/embed" {
+				http.NotFound(w, r)
+				return
+			}
+			if r.URL.Path != "/api/embeddings" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(ollamaLegacyEmbedResponse{
+				Embedding: []float32{rawVal, rawVal, 0, 0},
+			})
+		}))
+		defer srv.Close()
+
+		emb := NewLocalGemmaEmbedder(func() (string, string) {
+			return srv.URL, "embeddinggemma:latest"
+		})
+		got, err := emb.EmbedText(context.Background(), "legacy overflow probe")
+		if err != nil {
+			t.Fatalf("EmbedText legacy failed: %v", err)
+		}
+		assertUnitNormalizedVector(t, got, 2, expected)
+	})
+}
+
+func TestDynamicEmbedder_CorruptAISettingsFailsClosedWithoutFallback(t *testing.T) {
+	var primaryHits atomic.Int32
+	primaryOllama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
+		if r.URL.Path != "/api/embed" {
+			http.NotFound(w, r)
+			return
+		}
+		var req ollamaEmbedRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		out := make([][]float32, len(req.Input))
+		for i := range req.Input {
+			vec := make([]float32, 768)
+			vec[0] = 3.0
+			vec[1] = 4.0
+			out[i] = vec
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ollamaEmbedResponse{Embeddings: out})
+	}))
+	defer primaryOllama.Close()
+
+	var fallbackHits atomic.Int32
+	fallbackOllama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		http.Error(w, "fallback ollama must not be called", http.StatusInternalServerError)
+	}))
+	defer fallbackOllama.Close()
+
+	var vertexHits atomic.Int32
+	vertex := &VertexEmbedder{
+		projectID: "test-project",
+		region:    "us-central1",
+		client: &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				vertexHits.Add(1)
+				return nil, errors.New("vertex must not be called on corrupt ai_settings.json")
+			}),
+		},
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "ai_settings.json")
+	mgr := localai.NewManager(cfgPath)
+	if _, err := mgr.SaveConfig(localai.Config{
+		Provider:   localai.ProviderLocalGemma,
+		Endpoint:   primaryOllama.URL,
+		TextModel:  "gemma2:9b",
+		EmbedModel: "embeddinggemma:latest",
+	}); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	// Sanity check: healthy local_gemma config succeeds via primaryOllama.
+	dyn := NewDynamicEmbedder(mgr, vertex)
+	if _, err := dyn.EmbedText(context.Background(), "healthy check"); err != nil {
+		t.Fatalf("expected healthy local_gemma EmbedText to succeed, got %v", err)
+	}
+	if primaryHits.Load() != 1 {
+		t.Fatalf("expected 1 hit to primaryOllama before corruption, got %d", primaryHits.Load())
+	}
+	primaryHits.Store(0)
+
+	// Corrupt ai_settings.json on disk.
+	if err := os.WriteFile(cfgPath, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatalf("write corrupt config: %v", err)
+	}
+
+	t.Run("AI_PROVIDER_unset_nil_vertex", func(t *testing.T) {
+		t.Setenv("AI_PROVIDER", "")
+		d := NewDynamicEmbedder(mgr, nil)
+		if _, err := d.EmbedText(context.Background(), "query"); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedText, got %v", err)
+		}
+		if _, err := d.EmbedBatch(context.Background(), []string{"chunk1", "chunk2"}); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedBatch, got %v", err)
+		}
+	})
+
+	t.Run("AI_PROVIDER_unset_nonnil_vertex", func(t *testing.T) {
+		t.Setenv("AI_PROVIDER", "")
+		d := NewDynamicEmbedder(mgr, vertex)
+		if _, err := d.EmbedText(context.Background(), "query"); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedText, got %v", err)
+		}
+		if _, err := d.EmbedBatch(context.Background(), []string{"chunk1"}); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedBatch, got %v", err)
+		}
+	})
+
+	t.Run("AI_PROVIDER_local_gemma_with_fallback_env", func(t *testing.T) {
+		t.Setenv("AI_PROVIDER", localai.ProviderLocalGemma)
+		t.Setenv("OLLAMA_API_BASE", fallbackOllama.URL)
+		d := NewDynamicEmbedder(mgr, vertex)
+		if _, err := d.EmbedText(context.Background(), "query"); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedText, got %v", err)
+		}
+		if _, err := d.EmbedBatch(context.Background(), []string{"chunk1"}); err == nil || !strings.Contains(err.Error(), "parse settings") {
+			t.Fatalf("expected parse settings error from EmbedBatch, got %v", err)
+		}
+	})
+
+	t.Run("unreadable_settings_path", func(t *testing.T) {
+		dirMgr := localai.NewManager(t.TempDir())
+		d := NewDynamicEmbedder(dirMgr, vertex)
+		if _, err := d.EmbedText(context.Background(), "query"); err == nil || !strings.Contains(err.Error(), "read settings") {
+			t.Fatalf("expected read settings error from EmbedText, got %v", err)
+		}
+		if _, err := d.EmbedBatch(context.Background(), []string{}); err == nil || !strings.Contains(err.Error(), "read settings") {
+			t.Fatalf("expected read settings error from EmbedBatch, got %v", err)
+		}
+	})
+
+	if got := primaryHits.Load(); got != 0 {
+		t.Fatalf("expected 0 hits to primaryOllama after corruption, got %d", got)
+	}
+	if got := fallbackHits.Load(); got != 0 {
+		t.Fatalf("expected 0 hits to fallbackOllama after corruption, got %d", got)
+	}
+	if got := vertexHits.Load(); got != 0 {
+		t.Fatalf("expected 0 hits to Vertex after corruption, got %d", got)
+	}
+}
+
 
 

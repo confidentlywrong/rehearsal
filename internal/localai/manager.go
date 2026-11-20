@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -122,6 +123,7 @@ type EngineStatus struct {
 	Endpoint               string            `json:"endpoint"`
 	TextModel              string            `json:"text_model"`
 	EmbedModel             string            `json:"embed_model"`
+	CanConfigure           bool              `json:"can_configure"`
 	CloudProjectConfigured bool              `json:"cloud_project_configured"`
 	Connected              bool              `json:"connected"`
 	Protocol               string            `json:"protocol,omitempty"`
@@ -176,13 +178,19 @@ var baseModelTiers = []ModelTier{
 // Manager coordinates AI settings persistence, hardware detection, model discovery,
 // daemon auto-start, and background model pulls.
 type Manager struct {
-	mu           sync.RWMutex
-	settingsPath string
-	manifestRoot string
-	pullMu       sync.RWMutex
-	pullState    PullProgress
-	startMu      sync.Mutex
-	httpClient   *http.Client
+	mu              sync.RWMutex
+	settingsPath    string
+	manifestRoot    string
+	pullMu          sync.RWMutex
+	pullState       PullProgress
+	startMu         sync.Mutex
+	httpClient      *http.Client
+	shutdownMu      sync.Mutex
+	shutdownCtx     context.Context
+	shutdownCancel  context.CancelFunc
+	resolveBinaryFn func() string
+	autoStartPort   string
+	daemonPollWait  time.Duration
 }
 
 // NewManager creates a Local AI Manager backed by the given settings JSON file path.
@@ -204,13 +212,83 @@ func NewManager(settingsPath string) *Manager {
 	if modelsDir != "" {
 		manifestRoot = filepath.Join(modelsDir, "manifests", "registry.ollama.ai", "library")
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	return &Manager{
-		settingsPath: settingsPath,
-		manifestRoot: manifestRoot,
+		settingsPath:   settingsPath,
+		manifestRoot:   manifestRoot,
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
 	}
+}
+
+// Close cancels any in-flight background model pull associated with this Manager.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.shutdownMu.Lock()
+	cancel := m.shutdownCancel
+	m.shutdownMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
+}
+
+// Shutdown cancels any in-flight background model pull associated with this Manager.
+func (m *Manager) Shutdown() {
+	_ = m.Close()
+}
+
+func (m *Manager) getHTTPClient() *http.Client {
+	if m == nil || m.httpClient == nil {
+		return &http.Client{Timeout: 5 * time.Second}
+	}
+	return m.httpClient
+}
+
+func (m *Manager) backgroundContext() context.Context {
+	if m == nil {
+		return context.Background()
+	}
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	if m.shutdownCtx == nil {
+		m.shutdownCtx, m.shutdownCancel = context.WithCancel(context.Background())
+	}
+	return m.shutdownCtx
+}
+
+func (m *Manager) resolveOllamaBinary() string {
+	if m != nil && m.resolveBinaryFn != nil {
+		return m.resolveBinaryFn()
+	}
+	return ResolveOllamaBinary()
+}
+
+func (m *Manager) targetAutoStartPort() string {
+	if m != nil && m.autoStartPort != "" {
+		return m.autoStartPort
+	}
+	return "11434"
+}
+
+func (m *Manager) isAutoStartEndpoint(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	return u.Port() == m.targetAutoStartPort()
+}
+
+func (m *Manager) pollInterval() time.Duration {
+	if m != nil && m.daemonPollWait > 0 {
+		return m.daemonPollWait
+	}
+	return 300 * time.Millisecond
 }
 
 // SetManifestRootForTest overrides the Ollama manifest directory for unit tests.
@@ -339,33 +417,105 @@ func ValidateProvider(p string) (string, error) {
 	}
 }
 
-// defaultConfigFromEnv builds the initial Config using environment variables or defaults.
+func defaultConfigFromEnvValidated() (Config, error) {
+	rawProvider := os.Getenv("AI_PROVIDER")
+	provider, err := ValidateProvider(rawProvider)
+	if err != nil {
+		return Config{}, fmt.Errorf("localai: invalid AI_PROVIDER: %w", err)
+	}
+
+	rawEndpoint := strings.TrimSpace(os.Getenv("OLLAMA_API_BASE"))
+	endpointSource := "OLLAMA_API_BASE"
+	if rawEndpoint == "" {
+		rawEndpoint = strings.TrimSpace(os.Getenv("OLLAMA_ENDPOINT"))
+		endpointSource = "OLLAMA_ENDPOINT"
+	}
+	endpoint := DefaultEndpoint
+	if rawEndpoint != "" {
+		validated, verr := ValidateLocalEndpoint(rawEndpoint)
+		if verr != nil {
+			return Config{}, fmt.Errorf("localai: invalid %s: %w", endpointSource, verr)
+		}
+		endpoint = validated
+	}
+
+	rawTextModel := strings.TrimSpace(os.Getenv("GEMMA_TEXT_MODEL"))
+	textModel := DefaultTextModel
+	if rawTextModel != "" {
+		validated, verr := ValidateModelName(rawTextModel)
+		if verr != nil || !isValidConfiguredTextModel(validated) {
+			if verr != nil {
+				return Config{}, fmt.Errorf("localai: invalid GEMMA_TEXT_MODEL: %w", verr)
+			}
+			return Config{}, fmt.Errorf("localai: invalid GEMMA_TEXT_MODEL %q (must be a text model, not an embedding model or bundle target)", rawTextModel)
+		}
+		textModel = validated
+	}
+
+	rawEmbedModel := strings.TrimSpace(os.Getenv("GEMMA_EMBED_MODEL"))
+	embedModel := DefaultEmbedModel
+	if rawEmbedModel != "" {
+		validated, verr := ValidateModelName(rawEmbedModel)
+		if verr != nil || !isValidConfiguredEmbedModel(validated) {
+			if verr != nil {
+				return Config{}, fmt.Errorf("localai: invalid GEMMA_EMBED_MODEL: %w", verr)
+			}
+			return Config{}, fmt.Errorf("localai: invalid GEMMA_EMBED_MODEL %q", rawEmbedModel)
+		}
+		embedModel = validated
+	}
+
+	return Config{
+		Provider:   provider,
+		Endpoint:   endpoint,
+		TextModel:  textModel,
+		EmbedModel: embedModel,
+	}, nil
+}
+
+// defaultConfigFromEnv builds the initial Config using environment variables or defaults,
+// logging explicit warnings whenever a configured environment variable is invalid.
 func defaultConfigFromEnv() Config {
-	provider := strings.ToLower(strings.TrimSpace(os.Getenv("AI_PROVIDER")))
-	if provider != ProviderLocalGemma && provider != ProviderCloudGemini {
+	rawProvider := os.Getenv("AI_PROVIDER")
+	provider, err := ValidateProvider(rawProvider)
+	if err != nil {
+		log.Printf("localai: WARNING invalid AI_PROVIDER %q (%v); falling back to %s", rawProvider, err, ProviderCloudGemini)
 		provider = ProviderCloudGemini
 	}
+
 	endpoint := strings.TrimSpace(os.Getenv("OLLAMA_API_BASE"))
+	endpointSource := "OLLAMA_API_BASE"
 	if endpoint == "" {
 		endpoint = strings.TrimSpace(os.Getenv("OLLAMA_ENDPOINT"))
+		endpointSource = "OLLAMA_ENDPOINT"
 	}
-	if validated, err := ValidateLocalEndpoint(endpoint); err == nil {
+	if validated, verr := ValidateLocalEndpoint(endpoint); verr == nil {
 		endpoint = validated
 	} else {
+		log.Printf("localai: WARNING invalid %s %q (%v); falling back to %s", endpointSource, endpoint, verr, DefaultEndpoint)
 		endpoint = DefaultEndpoint
 	}
-	textModel := strings.TrimSpace(os.Getenv("GEMMA_TEXT_MODEL"))
-	if validated, err := ValidateModelName(textModel); err == nil && isValidConfiguredTextModel(validated) {
-		textModel = validated
-	} else {
-		textModel = DefaultTextModel
+
+	rawTextModel := strings.TrimSpace(os.Getenv("GEMMA_TEXT_MODEL"))
+	textModel := DefaultTextModel
+	if rawTextModel != "" {
+		if validated, verr := ValidateModelName(rawTextModel); verr == nil && isValidConfiguredTextModel(validated) {
+			textModel = validated
+		} else {
+			log.Printf("localai: WARNING invalid GEMMA_TEXT_MODEL %q (err=%v); falling back to %s", rawTextModel, verr, DefaultTextModel)
+		}
 	}
-	embedModel := strings.TrimSpace(os.Getenv("GEMMA_EMBED_MODEL"))
-	if validated, err := ValidateModelName(embedModel); err == nil && isValidConfiguredEmbedModel(validated) {
-		embedModel = validated
-	} else {
-		embedModel = DefaultEmbedModel
+
+	rawEmbedModel := strings.TrimSpace(os.Getenv("GEMMA_EMBED_MODEL"))
+	embedModel := DefaultEmbedModel
+	if rawEmbedModel != "" {
+		if validated, verr := ValidateModelName(rawEmbedModel); verr == nil && isValidConfiguredEmbedModel(validated) {
+			embedModel = validated
+		} else {
+			log.Printf("localai: WARNING invalid GEMMA_EMBED_MODEL %q (err=%v); falling back to %s", rawEmbedModel, verr, DefaultEmbedModel)
+		}
 	}
+
 	return Config{
 		Provider:   provider,
 		Endpoint:   endpoint,
@@ -374,40 +524,83 @@ func defaultConfigFromEnv() Config {
 	}
 }
 
-// GetConfig returns the current AI configuration, reading from disk if present
-// or falling back to environment defaults.
-func (m *Manager) GetConfig() Config {
+func validateLoadedConfig(cfg Config) (Config, error) {
+	provider, err := ValidateProvider(cfg.Provider)
+	if err != nil {
+		return Config{}, fmt.Errorf("localai: invalid provider in config: %w", err)
+	}
+	endpoint := DefaultEndpoint
+	if strings.TrimSpace(cfg.Endpoint) != "" {
+		ep, verr := ValidateLocalEndpoint(cfg.Endpoint)
+		if verr != nil {
+			return Config{}, fmt.Errorf("localai: invalid endpoint in config: %w", verr)
+		}
+		endpoint = ep
+	}
+	textModel := DefaultTextModel
+	if strings.TrimSpace(cfg.TextModel) != "" {
+		tm, verr := ValidateModelName(cfg.TextModel)
+		if verr != nil {
+			return Config{}, fmt.Errorf("localai: invalid text_model in config: %w", verr)
+		}
+		if !isValidConfiguredTextModel(tm) {
+			return Config{}, fmt.Errorf("localai: invalid text_model %q in config", cfg.TextModel)
+		}
+		textModel = tm
+	}
+	embedModel := DefaultEmbedModel
+	if strings.TrimSpace(cfg.EmbedModel) != "" {
+		em, verr := ValidateModelName(cfg.EmbedModel)
+		if verr != nil {
+			return Config{}, fmt.Errorf("localai: invalid embed_model in config: %w", verr)
+		}
+		if !isValidConfiguredEmbedModel(em) {
+			return Config{}, fmt.Errorf("localai: invalid embed_model %q in config", cfg.EmbedModel)
+		}
+		embedModel = em
+	}
+	return Config{
+		Provider:   provider,
+		Endpoint:   endpoint,
+		TextModel:  textModel,
+		EmbedModel: embedModel,
+		UpdatedAt:  cfg.UpdatedAt,
+	}, nil
+}
+
+// LoadConfig reads and validates the AI configuration from disk (when present)
+// or environment variables, returning explicit errors on read, JSON, or validation failures.
+func (m *Manager) LoadConfig() (Config, error) {
+	if m == nil {
+		return defaultConfigFromEnvValidated()
+	}
 	m.mu.RLock()
 	path := m.settingsPath
 	m.mu.RUnlock()
 
 	data, err := os.ReadFile(path)
-	if err == nil && len(data) > 0 {
-		var cfg Config
-		if jerr := json.Unmarshal(data, &cfg); jerr == nil {
-			if p, err := ValidateProvider(cfg.Provider); err == nil {
-				cfg.Provider = p
-			} else {
-				cfg.Provider = ProviderCloudGemini
-			}
-			if ep, err := ValidateLocalEndpoint(cfg.Endpoint); err == nil {
-				cfg.Endpoint = ep
-			} else {
-				cfg.Endpoint = DefaultEndpoint
-			}
-			if tm, err := ValidateModelName(cfg.TextModel); err == nil && isValidConfiguredTextModel(tm) {
-				cfg.TextModel = tm
-			} else {
-				cfg.TextModel = DefaultTextModel
-			}
-			if em, err := ValidateModelName(cfg.EmbedModel); err == nil && isValidConfiguredEmbedModel(em) {
-				cfg.EmbedModel = em
-			} else {
-				cfg.EmbedModel = DefaultEmbedModel
-			}
-			return cfg
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return defaultConfigFromEnvValidated()
 		}
+		return Config{}, fmt.Errorf("localai: read settings %s: %w", path, err)
 	}
+
+	var cfg Config
+	if jerr := json.Unmarshal(data, &cfg); jerr != nil {
+		return Config{}, fmt.Errorf("localai: parse settings %s: %w", path, jerr)
+	}
+	return validateLoadedConfig(cfg)
+}
+
+// GetConfig returns the current AI configuration, reading from disk if present
+// or falling back to environment defaults (logging explicit warnings on error).
+func (m *Manager) GetConfig() Config {
+	cfg, err := m.LoadConfig()
+	if err == nil {
+		return cfg
+	}
+	log.Printf("localai: WARNING %v; using fallback defaults", err)
 	return defaultConfigFromEnv()
 }
 
@@ -460,7 +653,10 @@ func (m *Manager) SaveConfig(in Config) (Config, error) {
 	defer m.mu.Unlock()
 
 	dir := filepath.Dir(m.settingsPath)
-	if dir != "" && dir != "." {
+	if dir == "" {
+		dir = "."
+	}
+	if dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Config{}, fmt.Errorf("localai: mkdir %s: %w", dir, err)
 		}
@@ -469,14 +665,32 @@ func (m *Manager) SaveConfig(in Config) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("localai: marshal config: %w", err)
 	}
-	tmpPath := m.settingsPath + ".tmp"
-	if err := os.WriteFile(tmpPath, payload, 0o644); err != nil {
+	tmpFile, err := os.CreateTemp(dir, ".ai_settings.*.tmp")
+	if err != nil {
+		return Config{}, fmt.Errorf("localai: create temp config: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmpFile.Write(payload); err != nil {
+		_ = tmpFile.Close()
 		return Config{}, fmt.Errorf("localai: write temp config: %w", err)
 	}
+	if err := tmpFile.Chmod(0o644); err != nil {
+		_ = tmpFile.Close()
+		return Config{}, fmt.Errorf("localai: chmod temp config: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return Config{}, fmt.Errorf("localai: close temp config: %w", err)
+	}
 	if err := os.Rename(tmpPath, m.settingsPath); err != nil {
-		_ = os.Remove(tmpPath)
 		return Config{}, fmt.Errorf("localai: rename config: %w", err)
 	}
+	cleanupTmp = false
 	return cfg, nil
 }
 
@@ -512,6 +726,8 @@ func detectTotalRAMGB() int {
 			if bytesVal, perr := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64); perr == nil && bytesVal > 0 {
 				return int(math.Round(float64(bytesVal) / (1024 * 1024 * 1024)))
 			}
+		} else {
+			log.Printf("localai: WARNING sysctl hw.memsize failed (%v); assuming 16 GB fallback", err)
 		}
 	} else if runtime.GOOS == "linux" {
 		data, err := os.ReadFile("/proc/meminfo")
@@ -526,7 +742,11 @@ func detectTotalRAMGB() int {
 					}
 				}
 			}
+		} else {
+			log.Printf("localai: WARNING reading /proc/meminfo failed (%v); assuming 16 GB fallback", err)
 		}
+	} else {
+		log.Printf("localai: WARNING RAM detection unsupported on %s/%s; assuming 16 GB fallback", runtime.GOOS, runtime.GOARCH)
 	}
 	return 16
 }
@@ -551,6 +771,9 @@ func detectChipName() string {
 // on disk so already-installed models (e.g. gemma2:9b, embeddinggemma:latest) are recognized
 // even when the Ollama daemon is currently stopped.
 func (m *Manager) DiscoverLocalManifestModels() []string {
+	if m == nil {
+		return nil
+	}
 	m.mu.RLock()
 	root := m.manifestRoot
 	m.mu.RUnlock()
@@ -697,14 +920,27 @@ func splitModelTag(model string) (string, string) {
 	return parts[0], parts[1]
 }
 
+const maxProbeResponseBytes = 4 << 20
+
+// ResolveIPv4EndpointValidated validates the local endpoint and rewrites "localhost" to
+// "127.0.0.1" for outgoing HTTP calls, returning an explicit error on invalid endpoints.
+func ResolveIPv4EndpointValidated(endpoint string) (string, error) {
+	clean, err := ValidateLocalEndpoint(endpoint)
+	if err != nil {
+		return "", err
+	}
+	return strings.Replace(clean, "://localhost", "://127.0.0.1", 1), nil
+}
+
 // ResolveIPv4Endpoint validates the local endpoint and rewrites "localhost" to "127.0.0.1"
 // for outgoing HTTP calls to avoid macOS IPv6 ::1 connection-refused delays when Ollama binds 127.0.0.1.
 func ResolveIPv4Endpoint(endpoint string) string {
-	clean, err := ValidateLocalEndpoint(endpoint)
+	resolved, err := ResolveIPv4EndpointValidated(endpoint)
 	if err != nil {
-		clean = DefaultEndpoint
+		log.Printf("localai: WARNING invalid endpoint %q (%v); falling back to %s", endpoint, err, DefaultEndpoint)
+		return strings.Replace(DefaultEndpoint, "://localhost", "://127.0.0.1", 1)
 	}
-	return strings.Replace(clean, "://localhost", "://127.0.0.1", 1)
+	return resolved
 }
 
 func resolveIPv4Endpoint(endpoint string) string {
@@ -719,24 +955,43 @@ func (m *Manager) ProbeEndpoint(ctx context.Context, endpoint string) ProbeResul
 	if err != nil {
 		return ProbeResult{OK: false, Models: manifestModels, Error: err.Error()}
 	}
-	fetchBase := resolveIPv4Endpoint(cleanEndpoint)
+	fetchBase, err := ResolveIPv4EndpointValidated(cleanEndpoint)
+	if err != nil {
+		return ProbeResult{OK: false, Models: manifestModels, Error: err.Error()}
+	}
 
 	tagsCtx, cancelTags := context.WithTimeout(ctx, 1800*time.Millisecond)
 	defer cancelTags()
 
+	client := m.getHTTPClient()
+
+	var tagsErrDetail string
 	start := time.Now()
 	req, err := http.NewRequestWithContext(tagsCtx, http.MethodGet, fetchBase+"/api/tags", nil)
-	if err == nil {
-		if resp, doErr := m.httpClient.Do(req); doErr == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+	if err != nil {
+		tagsErrDetail = err.Error()
+	} else {
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			tagsErrDetail = doErr.Error()
+		} else {
+			if resp.StatusCode != http.StatusOK {
+				errSnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				tagsErrDetail = fmt.Sprintf("HTTP %d", resp.StatusCode)
+				if s := strings.TrimSpace(string(errSnippet)); s != "" {
+					tagsErrDetail = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, s)
+				}
+			} else {
 				var payload struct {
 					Models []struct {
 						Name  string `json:"name"`
 						Model string `json:"model"`
 					} `json:"models"`
 				}
-				if decErr := json.NewDecoder(resp.Body).Decode(&payload); decErr == nil {
+				if decErr := json.NewDecoder(io.LimitReader(resp.Body, maxProbeResponseBytes)).Decode(&payload); decErr != nil {
+					tagsErrDetail = fmt.Sprintf("decode error: %v", decErr)
+				} else {
+					_ = resp.Body.Close()
 					var live []string
 					for _, item := range payload.Models {
 						name := strings.TrimSpace(item.Name)
@@ -755,26 +1010,41 @@ func (m *Manager) ProbeEndpoint(ctx context.Context, endpoint string) ProbeResul
 					}
 				}
 			}
+			_ = resp.Body.Close()
 		}
 	}
 
 	// Fallback probe: llama-server OpenAI-compatible /v1/models with its own timeout budget
+	var v1ErrDetail string
 	if ctx.Err() == nil {
 		v1Ctx, cancelV1 := context.WithTimeout(ctx, 1800*time.Millisecond)
 		defer cancelV1()
 
 		startV1 := time.Now()
 		reqV1, err := http.NewRequestWithContext(v1Ctx, http.MethodGet, fetchBase+"/v1/models", nil)
-		if err == nil {
-			if respV1, doErr := m.httpClient.Do(reqV1); doErr == nil {
-				defer respV1.Body.Close()
-				if respV1.StatusCode == http.StatusOK {
+		if err != nil {
+			v1ErrDetail = err.Error()
+		} else {
+			respV1, doErr := client.Do(reqV1)
+			if doErr != nil {
+				v1ErrDetail = doErr.Error()
+			} else {
+				if respV1.StatusCode != http.StatusOK {
+					errSnippet, _ := io.ReadAll(io.LimitReader(respV1.Body, 512))
+					v1ErrDetail = fmt.Sprintf("HTTP %d", respV1.StatusCode)
+					if s := strings.TrimSpace(string(errSnippet)); s != "" {
+						v1ErrDetail = fmt.Sprintf("HTTP %d: %s", respV1.StatusCode, s)
+					}
+				} else {
 					var payload struct {
 						Data []struct {
 							ID string `json:"id"`
 						} `json:"data"`
 					}
-					if decErr := json.NewDecoder(respV1.Body).Decode(&payload); decErr == nil {
+					if decErr := json.NewDecoder(io.LimitReader(respV1.Body, maxProbeResponseBytes)).Decode(&payload); decErr != nil {
+						v1ErrDetail = fmt.Sprintf("decode error: %v", decErr)
+					} else {
+						_ = respV1.Body.Close()
 						var live []string
 						for _, item := range payload.Data {
 							id := strings.TrimSpace(item.ID)
@@ -790,14 +1060,17 @@ func (m *Manager) ProbeEndpoint(ctx context.Context, endpoint string) ProbeResul
 						}
 					}
 				}
+				_ = respV1.Body.Close()
 			}
 		}
+	} else {
+		v1ErrDetail = ctx.Err().Error()
 	}
 
 	return ProbeResult{
 		OK:     false,
 		Models: manifestModels,
-		Error:  fmt.Sprintf("Local AI engine at %s is not reachable", cleanEndpoint),
+		Error:  fmt.Sprintf("Local AI engine at %s is not reachable (/api/tags: %s; /v1/models: %s)", cleanEndpoint, tagsErrDetail, v1ErrDetail),
 	}
 }
 
@@ -825,8 +1098,31 @@ func isDefaultLocalPort(endpoint string) bool {
 	if err != nil {
 		return false
 	}
-	port := u.Port()
-	return port == "" || port == "11434"
+	return u.Port() == "11434"
+}
+
+func buildDaemonEnv(base []string, ollamaHost string) []string {
+	env := make([]string, 0, len(base)+1)
+	for _, entry := range base {
+		if strings.HasPrefix(entry, "OLLAMA_HOST=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, "OLLAMA_HOST="+ollamaHost)
+}
+
+func killDaemonProcess(cmd *exec.Cmd, waitCh <-chan error) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	drainTimer := time.NewTimer(500 * time.Millisecond)
+	defer drainTimer.Stop()
+	select {
+	case <-waitCh:
+	case <-drainTimer.C:
+	}
 }
 
 // EnsureDaemonRunning checks if the local Ollama endpoint is reachable; if not,
@@ -841,10 +1137,11 @@ func (m *Manager) EnsureDaemonRunning(ctx context.Context, endpoint string) (Pro
 	if initial.OK {
 		return initial, false, nil
 	}
-	if !isDefaultLocalPort(cleanEndpoint) {
-		return initial, false, fmt.Errorf("endpoint %s is not running (auto-start only targets port 11434)", cleanEndpoint)
+	targetPort := m.targetAutoStartPort()
+	if !m.isAutoStartEndpoint(cleanEndpoint) {
+		return initial, false, fmt.Errorf("endpoint %s is not running (auto-start only targets port %s)", cleanEndpoint, targetPort)
 	}
-	binPath := ResolveOllamaBinary()
+	binPath := m.resolveOllamaBinary()
 	if binPath == "" {
 		return initial, false, errors.New("Ollama binary not found on this machine. Install Ollama from https://ollama.com/download")
 	}
@@ -858,34 +1155,65 @@ func (m *Manager) EnsureDaemonRunning(ctx context.Context, endpoint string) (Pro
 	}
 
 	cmd := exec.Command(binPath, "serve")
-	cmd.Env = append(os.Environ(), "OLLAMA_HOST=127.0.0.1:11434")
+	cmd.Env = buildDaemonEnv(os.Environ(), "127.0.0.1:"+targetPort)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		return initial, false, fmt.Errorf("failed to start %s serve: %w", binPath, err)
 	}
+	waitCh := make(chan error, 1)
 	go func() {
-		_ = cmd.Wait()
+		waitCh <- cmd.Wait()
 	}()
 
+	interval := m.pollInterval()
 	// Poll up to 25 * 300ms (7.5 seconds) for Ollama to accept HTTP connections.
 	for i := 0; i < 25; i++ {
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
+			killDaemonProcess(cmd, waitCh)
 			return initial, false, ctx.Err()
-		case <-time.After(300 * time.Millisecond):
+		case waitErr := <-waitCh:
+			timer.Stop()
+			if waitErr != nil {
+				return initial, false, fmt.Errorf("local Ollama daemon exited prematurely: %w", waitErr)
+			}
+			return initial, false, errors.New("local Ollama daemon exited prematurely with status 0")
+		case <-timer.C:
 		}
 		probe := m.ProbeEndpoint(ctx, cleanEndpoint)
 		if probe.OK {
 			return probe, true, nil
 		}
 	}
-	return m.ProbeEndpoint(ctx, cleanEndpoint), false, errors.New("timed out waiting for local Ollama daemon to start on port 11434")
+	killDaemonProcess(cmd, waitCh)
+	return m.ProbeEndpoint(ctx, cleanEndpoint), false, fmt.Errorf("timed out waiting for local Ollama daemon to start on port %s", targetPort)
 }
 
 // GetStatus compiles the complete EngineStatus for the Settings UI using the saved endpoint.
 func (m *Manager) GetStatus(ctx context.Context) EngineStatus {
 	return m.GetStatusForEndpoint(ctx, "")
+}
+
+// GetStatusForEndpointValidated validates config and endpointOverride, returning an explicit error
+// if configuration loading or endpoint validation fails before probing.
+func (m *Manager) GetStatusForEndpointValidated(ctx context.Context, endpointOverride string) (EngineStatus, error) {
+	cfg, err := m.LoadConfig()
+	if err != nil {
+		return EngineStatus{}, err
+	}
+	targetEndpoint := cfg.Endpoint
+	if strings.TrimSpace(endpointOverride) != "" {
+		valid, verr := ValidateLocalEndpoint(endpointOverride)
+		if verr != nil {
+			return EngineStatus{}, verr
+		}
+		targetEndpoint = valid
+	}
+	probe := m.ProbeEndpoint(ctx, targetEndpoint)
+	return m.buildStatus(cfg, targetEndpoint, probe), nil
 }
 
 // GetStatusForEndpoint compiles the complete EngineStatus probing endpointOverride when non-empty.
@@ -895,22 +1223,50 @@ func (m *Manager) GetStatusForEndpoint(ctx context.Context, endpointOverride str
 	if strings.TrimSpace(endpointOverride) != "" {
 		if valid, err := ValidateLocalEndpoint(endpointOverride); err == nil {
 			targetEndpoint = valid
+		} else {
+			log.Printf("localai: WARNING ignoring invalid endpoint override %q: %v", endpointOverride, err)
 		}
 	}
 	probe := m.ProbeEndpoint(ctx, targetEndpoint)
-	return m.GetStatusWithProbe(targetEndpoint, probe)
+	return m.buildStatus(cfg, targetEndpoint, probe)
+}
+
+// GetStatusWithProbeValidated validates config and endpointOverride, returning an explicit error
+// if configuration loading or endpoint validation fails, reusing an already-executed ProbeResult.
+func (m *Manager) GetStatusWithProbeValidated(endpointOverride string, probe ProbeResult) (EngineStatus, error) {
+	cfg, err := m.LoadConfig()
+	if err != nil {
+		return EngineStatus{}, err
+	}
+	targetEndpoint := cfg.Endpoint
+	if strings.TrimSpace(endpointOverride) != "" {
+		valid, verr := ValidateLocalEndpoint(endpointOverride)
+		if verr != nil {
+			return EngineStatus{}, verr
+		}
+		targetEndpoint = valid
+	}
+	return m.buildStatus(cfg, targetEndpoint, probe), nil
 }
 
 // GetStatusWithProbe compiles the complete EngineStatus reusing an already-executed ProbeResult.
 func (m *Manager) GetStatusWithProbe(endpointOverride string, probe ProbeResult) EngineStatus {
 	cfg := m.GetConfig()
+	targetEndpoint := cfg.Endpoint
 	if strings.TrimSpace(endpointOverride) != "" {
 		if valid, err := ValidateLocalEndpoint(endpointOverride); err == nil {
-			cfg.Endpoint = valid
+			targetEndpoint = valid
+		} else {
+			log.Printf("localai: WARNING ignoring invalid endpoint override %q: %v", endpointOverride, err)
 		}
 	}
+	return m.buildStatus(cfg, targetEndpoint, probe)
+}
+
+func (m *Manager) buildStatus(cfg Config, endpoint string, probe ProbeResult) EngineStatus {
+	cfg.Endpoint = endpoint
 	hw := GetHardwareProfile()
-	binPath := ResolveOllamaBinary()
+	binPath := m.resolveOllamaBinary()
 
 	tiers := make([]ModelTier, len(baseModelTiers))
 	for i, t := range baseModelTiers {
@@ -942,6 +1298,7 @@ func (m *Manager) GetStatusWithProbe(endpointOverride string, probe ProbeResult)
 		Endpoint:               cfg.Endpoint,
 		TextModel:              cfg.TextModel,
 		EmbedModel:             cfg.EmbedModel,
+		CanConfigure:           true,
 		CloudProjectConfigured: cloudConfigured,
 		Connected:              probe.OK,
 		Protocol:               probe.Protocol,
@@ -980,7 +1337,13 @@ func (m *Manager) GetPullProgress() PullProgress {
 // synchronously; for large multi-GB downloads, it continues streaming in the background
 // while updating PullProgress so the 90-second BFF proxy never times out.
 func (m *Manager) PullModel(ctx context.Context, endpoint, requestedModel string) (PullProgress, error) {
-	cfg := m.GetConfig()
+	if err := ctx.Err(); err != nil {
+		return PullProgress{}, err
+	}
+	cfg, err := m.LoadConfig()
+	if err != nil {
+		return PullProgress{}, err
+	}
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = cfg.Endpoint
 	}
@@ -996,13 +1359,17 @@ func (m *Manager) PullModel(ctx context.Context, endpoint, requestedModel string
 		textTarget := cfg.TextModel
 		if strings.HasPrefix(strings.ToLower(trimmedReq), "bundle:") {
 			customText := strings.TrimSpace(trimmedReq[len("bundle:"):])
-			if customText != "" {
-				validCustom, verr := ValidateModelName(customText)
-				if verr != nil {
-					return PullProgress{}, verr
-				}
-				textTarget = validCustom
+			if customText == "" {
+				return PullProgress{}, fmt.Errorf("invalid bundle text model target %q", trimmedReq)
 			}
+			validCustom, verr := ValidateModelName(customText)
+			if verr != nil {
+				return PullProgress{}, verr
+			}
+			if !isValidConfiguredTextModel(validCustom) {
+				return PullProgress{}, fmt.Errorf("invalid bundle text model target %q", trimmedReq)
+			}
+			textTarget = validCustom
 		}
 		if textTarget == "" {
 			textTarget = hw.RecommendedModel
@@ -1026,10 +1393,12 @@ func (m *Manager) PullModel(ctx context.Context, endpoint, requestedModel string
 
 	// Ensure daemon is running if targeting default port and binary is present.
 	probe := m.ProbeEndpoint(ctx, cleanEndpoint)
-	if !probe.OK && isDefaultLocalPort(cleanEndpoint) && ResolveOllamaBinary() != "" {
-		if startedProbe, _, startErr := m.EnsureDaemonRunning(ctx, cleanEndpoint); startErr == nil {
-			probe = startedProbe
+	if !probe.OK && m.isAutoStartEndpoint(cleanEndpoint) && m.resolveOllamaBinary() != "" {
+		startedProbe, _, startErr := m.EnsureDaemonRunning(ctx, cleanEndpoint)
+		if startErr != nil {
+			return PullProgress{}, startErr
 		}
+		probe = startedProbe
 	}
 
 	// Filter to only missing models so "bundle" skips models that are already installed
@@ -1087,14 +1456,18 @@ func (m *Manager) PullModel(ctx context.Context, endpoint, requestedModel string
 	// Wait up to 2.5 seconds: fast tests or cached layer pulls finish synchronously,
 	// while multi-GB downloads return the active PullProgress immediately so the
 	// frontend can poll GET /api/v1/settings/ai without hitting the 90s BFF timeout.
+	waitTimer := time.NewTimer(2500 * time.Millisecond)
+	defer waitTimer.Stop()
 	select {
+	case <-ctx.Done():
+		return m.GetPullProgress(), ctx.Err()
 	case <-doneCh:
 		final := m.GetPullProgress()
 		if final.Error != "" {
 			return final, errors.New(final.Error)
 		}
 		return final, nil
-	case <-time.After(2500 * time.Millisecond):
+	case <-waitTimer.C:
 		return m.GetPullProgress(), nil
 	}
 }
@@ -1105,9 +1478,17 @@ func (m *Manager) setPullProgress(p PullProgress) {
 	m.pullState = p
 }
 
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 func (m *Manager) runPullSequence(endpoint string, targets []string) {
 	fetchBase := resolveIPv4Endpoint(endpoint)
 	client := &http.Client{Timeout: 30 * time.Minute}
+	pullCtx := m.backgroundContext()
 
 	for idx, modelName := range targets {
 		m.setPullProgress(PullProgress{
@@ -1119,11 +1500,21 @@ func (m *Manager) runPullSequence(endpoint string, targets []string) {
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 
-		reqBody, _ := json.Marshal(map[string]any{
+		reqBody, err := json.Marshal(map[string]any{
 			"name":   modelName,
 			"stream": true,
 		})
-		req, err := http.NewRequest(http.MethodPost, fetchBase+"/api/pull", bytes.NewReader(reqBody))
+		if err != nil {
+			m.setPullProgress(PullProgress{
+				Active:    false,
+				Model:     modelName,
+				Status:    "error",
+				Error:     fmt.Sprintf("failed to encode pull request: %v", err),
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		req, err := http.NewRequestWithContext(pullCtx, http.MethodPost, fetchBase+"/api/pull", bytes.NewReader(reqBody))
 		if err != nil {
 			m.setPullProgress(PullProgress{
 				Active:    false,
@@ -1150,7 +1541,7 @@ func (m *Manager) runPullSequence(endpoint string, targets []string) {
 
 		if resp.StatusCode != http.StatusOK {
 			errBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			m.setPullProgress(PullProgress{
 				Active:    false,
 				Model:     modelName,
@@ -1175,41 +1566,43 @@ func (m *Manager) runPullSequence(endpoint string, targets []string) {
 				Total     int64  `json:"total"`
 				Error     string `json:"error"`
 			}
-			if jerr := json.Unmarshal([]byte(line), &frame); jerr == nil {
-				framesSeen++
-				if frame.Error != "" {
-					resp.Body.Close()
-					m.setPullProgress(PullProgress{
-						Active:    false,
-						Model:     modelName,
-						Status:    "error",
-						Error:     frame.Error,
-						UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-					})
-					return
-				}
-				pct := 0.0
-				if frame.Total > 0 {
-					pct = math.Min(99.9, math.Round((float64(frame.Completed)/float64(frame.Total))*1000)/10)
-				}
-				statusText := frame.Status
-				if statusText == "" {
-					statusText = "downloading"
-				}
-				m.setPullProgress(PullProgress{
-					Active:         true,
-					Model:          modelName,
-					Status:         statusText,
-					Percent:        pct,
-					CompletedBytes: frame.Completed,
-					TotalBytes:     frame.Total,
-					Done:           false,
-					UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
-				})
+			if jerr := json.Unmarshal([]byte(line), &frame); jerr != nil {
+				log.Printf("localai: WARNING malformed NDJSON frame during pull of %s: %v (line=%q)", modelName, jerr, truncateForLog(line, 200))
+				continue
 			}
+			framesSeen++
+			if frame.Error != "" {
+				_ = resp.Body.Close()
+				m.setPullProgress(PullProgress{
+					Active:    false,
+					Model:     modelName,
+					Status:    "error",
+					Error:     frame.Error,
+					UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+				})
+				return
+			}
+			pct := 0.0
+			if frame.Total > 0 {
+				pct = math.Min(99.9, math.Round((float64(frame.Completed)/float64(frame.Total))*1000)/10)
+			}
+			statusText := frame.Status
+			if statusText == "" {
+				statusText = "downloading"
+			}
+			m.setPullProgress(PullProgress{
+				Active:         true,
+				Model:          modelName,
+				Status:         statusText,
+				Percent:        pct,
+				CompletedBytes: frame.Completed,
+				TotalBytes:     frame.Total,
+				Done:           false,
+				UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
+			})
 		}
 		scanErr := scanner.Err()
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if scanErr != nil {
 			m.setPullProgress(PullProgress{
 				Active:    false,

@@ -1,7 +1,20 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changed for The Rehearsal: notify AgentRuntimeControlsService when recording dump availability changes.
  */
 
 import { Injectable, NgZone, inject } from '@angular/core';
@@ -20,6 +33,7 @@ export interface AgentWindowEventsScreenBridge {
   selectedId: number | null;
   applyCameraIntroComplete(): void;
   onSyncPayload(d: SyncPayload): void;
+  notifyRuntimeControlsUpdate?(): void;
 }
 
 @Injectable()
@@ -44,6 +58,7 @@ export class AgentWindowEventsService {
     const count = (e as CustomEvent<{ count?: number }>).detail?.count ?? 0;
     this.ngZone.run(() => {
       this.screen.agentGatewayMsgDumpCanDownload = count > 0;
+      this.screen.notifyRuntimeControlsUpdate?.();
       this.markScreen();
     });
   };

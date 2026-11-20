@@ -36,15 +36,30 @@
 
 BEGIN;
 
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS document_chunks (
     chunk_id    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID        NOT NULL REFERENCES analysis_documents(id) ON DELETE CASCADE,
-    analysis_id UUID        NOT NULL,
+    analysis_id UUID        NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
     chunk_index INT         NOT NULL,
     chunk_text  TEXT        NOT NULL,
     embedding   VECTOR(3072),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'document_chunks_analysis_id_fkey'
+           AND conrelid = 'document_chunks'::regclass
+    ) THEN
+        ALTER TABLE document_chunks
+            ADD CONSTRAINT document_chunks_analysis_id_fkey
+            FOREIGN KEY (analysis_id) REFERENCES analyses(id) ON DELETE CASCADE;
+    END IF;
+END $$;
 
 -- Vector similarity index intentionally omitted — see header comment.
 

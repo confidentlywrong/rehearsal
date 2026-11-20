@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: unify gateway HTTP base URL normalization and validate session creation payloads.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,34 +36,50 @@ export interface AgentCatalog {
   [key: string]: AgentCard;
 }
 
+export function resolveGatewayHttpBase(gatewayUrl: string): string {
+  const trimmed = gatewayUrl.trim();
+  if (!trimmed) {
+    throw new Error("Gateway URL is required");
+  }
+  if (trimmed.startsWith("//") || trimmed.startsWith("/\\")) {
+    throw new Error("Invalid relative gateway URL");
+  }
+  let baseUrl = trimmed;
+  if (trimmed.startsWith("/")) {
+    baseUrl = window.location.origin + trimmed;
+  }
+  return baseUrl
+    .replace(/^ws(s?):\/\//i, (_m, s) => (s ? "https://" : "http://"))
+    .replace(/\/ws\/?(?:\?.*)?$/i, "")
+    .replace(/\/+$/, "");
+}
+
 export async function fetchAgentTypes(
   gatewayUrl: string,
 ): Promise<AgentCatalog> {
-  // Robustly resolve base URL
-  let baseUrl = gatewayUrl;
-  if (gatewayUrl.startsWith("/")) {
-    baseUrl = window.location.origin + gatewayUrl;
-  }
-
-  // Convert ws:// or wss:// to http:// or https:// for the API
-  baseUrl = baseUrl
-    .replace("ws://", "http://")
-    .replace("wss://", "https://")
-    .replace(/\/ws$/, "");
+  const baseUrl = resolveGatewayHttpBase(gatewayUrl);
 
   const response = await fetch(`${baseUrl}/api/v1/agent-types`);
   if (!response.ok) {
     throw new Error(`Failed to fetch agent types: ${response.statusText}`);
   }
-  return response.json();
+  const data = await response.json();
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error("Invalid agent types response payload");
+  }
+  return data as AgentCatalog;
 }
 
 export async function createAgentSession(
   agentUrl: string,
   userId: string = "tester-ui",
 ): Promise<string> {
+  const baseUrl = agentUrl.trim().replace(/\/+$/, "");
+  if (!baseUrl) {
+    throw new Error("Agent URL is required");
+  }
   // ADK create_session call
-  const response = await fetch(`${agentUrl}/create_session`, {
+  const response = await fetch(`${baseUrl}/create_session`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -76,7 +94,15 @@ export async function createAgentSession(
   }
 
   const data = await response.json();
-  return data.id || data.session_id;
+  const sessionId =
+    data && typeof data === "object"
+      ? (data as Record<string, unknown>).id ??
+        (data as Record<string, unknown>).session_id
+      : undefined;
+  if (typeof sessionId !== "string" || !sessionId.trim()) {
+    throw new Error("Failed to create agent session: missing session id");
+  }
+  return sessionId;
 }
 
 export async function createOrchestratedSession(
@@ -84,17 +110,11 @@ export async function createOrchestratedSession(
   agentType: string,
   userId: string = "tester-ui",
 ): Promise<string> {
-  // Robustly resolve base URL
-  let baseUrl = gatewayUrl;
-  if (gatewayUrl.startsWith("/")) {
-    baseUrl = window.location.origin + gatewayUrl;
+  const trimmedType = agentType.trim();
+  if (!trimmedType) {
+    throw new Error("Agent type is required");
   }
-
-  // Convert ws:// or wss:// to http:// or https:// for the API
-  baseUrl = baseUrl
-    .replace("ws://", "http://")
-    .replace("wss://", "https://")
-    .replace(/\/ws$/, "");
+  const baseUrl = resolveGatewayHttpBase(gatewayUrl);
 
   const response = await fetch(`${baseUrl}/api/v1/sessions`, {
     method: "POST",
@@ -102,7 +122,7 @@ export async function createOrchestratedSession(
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      agentType,
+      agentType: trimmedType,
       userId,
     }),
   });
@@ -112,5 +132,12 @@ export async function createOrchestratedSession(
   }
 
   const data = await response.json();
-  return data.sessionId;
+  const sessionId =
+    data && typeof data === "object"
+      ? (data as Record<string, unknown>).sessionId
+      : undefined;
+  if (typeof sessionId !== "string" || !sessionId.trim()) {
+    throw new Error("Failed to trigger orchestration: missing sessionId");
+  }
+  return sessionId;
 }

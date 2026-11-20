@@ -1,4 +1,6 @@
 // Copyright 2026 Google LLC
+// Modifications copyright 2026 Christian Haeussinger
+// Changed for The Rehearsal: sync ResourcePool, OrganizationalState, and SynchronicityAlert messages with gen_proto/gateway/gateway.proto.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -72,5 +74,32 @@ message A2UIAction {
   string session_id = 1;     // Target agent session UUID
   string action_name = 2;    // Action identifier (e.g. "run_simulation")
   bytes context = 3;         // Optional JSON context for future extensibility
+}
+
+// ResourcePool represents a single resource (LAU, BT, TBU, OWB) for a simulation run.
+message ResourcePool {
+  float current = 1;
+  float initial = 2;
+  float regen_per_tick = 3;
+  float critical_threshold = 4;
+}
+
+// OrganizationalState represents the global state of the enterprise during the simulation.
+message OrganizationalState {
+  map<string, ResourcePool> resources = 1; // LAU, BT, TBU, OWB
+  repeated string active_alerts = 2;
+  repeated string contradiction_log = 3;
+  float completion_percentage = 4;
+}
+
+// SynchronicityAlert represents a detected organizational conflict or event.
+message SynchronicityAlert {
+  string alert_id = 1;
+  string severity = 2; // "warning", "critical"
+  string alert_type = 3; // "contention", "threshold", "cascade", "agenda"
+  string description = 4;
+  repeated string conflicting_initiatives = 5;
+  repeated string recommended_guardrails = 6;
+  repeated string affected_resources = 7;
 }
 

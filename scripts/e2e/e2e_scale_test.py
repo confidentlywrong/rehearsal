@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: update default gateway port to 9101 and await cancelled observer task cleanly.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,7 +56,7 @@ from gen_proto.gateway import gateway_pb2
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8101")
+GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:9101")
 GATEWAY_WS_URL = os.getenv(
     "GATEWAY_WS_URL",
     GATEWAY_HTTP_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws",
@@ -117,10 +119,11 @@ async def spawn_sessions_batched(total: int) -> list[str]:
                     json=body,
                     timeout=aiohttp.ClientTimeout(total=SPAWN_TIMEOUT),
                 ) as resp:
-                    data = await resp.json()
                     if resp.status >= 400:
-                        print(f"  [FAIL] Batch {batch_num}: HTTP {resp.status}: {data}")
+                        err_text = await resp.text()
+                        print(f"  [FAIL] Batch {batch_num}: HTTP {resp.status}: {err_text[:300]}")
                         return all_session_ids
+                    data = await resp.json()
 
                     sessions = data.get("sessions", [])
                     batch_ids = [s["sessionId"] for s in sessions]
@@ -289,13 +292,19 @@ async def run_simulation(sim_id: int, count: int) -> dict:
         return await send_broadcast(session_ids)
 
     observer_task = asyncio.create_task(collect_responses(count, session_set, COLLECTION_TIMEOUT))
-    broadcast_ok = await delayed_broadcast()
+    try:
+        broadcast_ok = await delayed_broadcast()
 
-    if not broadcast_ok:
-        observer_task.cancel()
-        return {"sim_id": sim_id, "success": False, "spawned": count}
+        if not broadcast_ok:
+            observer_task.cancel()
+            await asyncio.gather(observer_task, return_exceptions=True)
+            return {"sim_id": sim_id, "success": False, "spawned": count}
 
-    results = await observer_task
+        results = await observer_task
+    finally:
+        if not observer_task.done():
+            observer_task.cancel()
+            await asyncio.gather(observer_task, return_exceptions=True)
 
     responded = results["responded_sessions"]
     elapsed = results["elapsed"]
@@ -330,11 +339,9 @@ async def run_test(count: int, parallel: int) -> bool:
         result = await run_simulation(1, count)
         all_results.append(result)
     else:
-        # Run simulations sequentially (each is already async internally).
-        # True parallel would need separate gateway connections.
-        for i in range(1, parallel + 1):
-            result = await run_simulation(i, count)
-            all_results.append(result)
+        all_results = list(
+            await asyncio.gather(*(run_simulation(i, count) for i in range(1, parallel + 1)))
+        )
 
     # Report
     print("\n" + "=" * 60)
@@ -385,7 +392,7 @@ def main():
         "--parallel",
         type=int,
         default=1,
-        help="Number of sequential simulations to run (default: 1)",
+        help="Number of concurrent simulations to run (default: 1)",
     )
     parser.add_argument(
         "--timeout",

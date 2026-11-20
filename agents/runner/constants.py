@@ -21,11 +21,12 @@ runner, runner_autopilot, and process_tick tool (per-tick physics).
 """
 
 import hashlib
-import os
+
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model
 
 # --- Model Configuration ---
-DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
-RUNNER_MODEL = os.environ.get("RUNNER_MODEL", DEFAULT_MODEL)
+DEFAULT_MODEL = DEFAULT_FLASH_LITE_MODEL
+RUNNER_MODEL = get_model("RUNNER_MODEL", DEFAULT_MODEL)
 
 # --- Velocity / Distance ---
 SPEED_SCALE = 6.2137  # velocity=1.0 maps to 6.2137 mph

@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PgxConn is the minimal pgx-style interface the Store needs. Both
@@ -77,13 +78,30 @@ type Store struct {
 }
 
 // NewStore wraps a pgx connection. db must point at a database
-// where migrations/0001_users.sql has been applied.
-func NewStore(db PgxConn) *Store { return &Store{db: db} }
+// where migrations/0001_users.sql has been applied. Typed-nil
+// *pgx.Conn or *pgxpool.Pool values are normalized to nil so Store
+// methods fail cleanly with "billing: DB not connected".
+func NewStore(db PgxConn) *Store {
+	switch v := db.(type) {
+	case *pgx.Conn:
+		if v == nil {
+			db = nil
+		}
+	case *pgxpool.Pool:
+		if v == nil {
+			db = nil
+		}
+	}
+	return &Store{db: db}
+}
 
 // InsertEvent appends one row to usage_ledger. Returns the
 // freshly-assigned id. NULL token fields are written as typed pgx
 // NULL — we never coerce to zero.
 func (s *Store) InsertEvent(ctx context.Context, e Event) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("billing: DB not connected")
+	}
 	if e.UserID == "" {
 		return 0, errors.New("billing: InsertEvent requires user_id")
 	}
@@ -117,8 +135,14 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) (int64, error) {
 // caller's clock — keeps the rollup deterministic when the
 // consumer reprocesses a backlog.
 func (s *Store) UpsertMonthlyRollup(ctx context.Context, userID string, ts time.Time, addTokens int64, addCost int64) error {
+	if s == nil || s.db == nil {
+		return errors.New("billing: DB not connected")
+	}
 	if userID == "" {
 		return errors.New("billing: UpsertMonthlyRollup requires user_id")
+	}
+	if ts.IsZero() {
+		return errors.New("billing: UpsertMonthlyRollup requires non-zero timestamp")
 	}
 	ym := ts.UTC().Format("2006-01")
 	_, err := s.db.Exec(ctx, `
@@ -180,22 +204,28 @@ var ErrNoRollup = errors.New("billing: no rollup row")
 // Rows with NULL agent_type are bucketed under "" — the handler
 // rewrites that to "unknown" before serialisation.
 func (s *Store) GetAgentBreakdown(ctx context.Context, userID, yearMonth string) ([]AgentBreakdown, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("billing: DB not connected")
+	}
 	if userID == "" {
 		return nil, errors.New("billing: GetAgentBreakdown requires user_id")
 	}
-	if !ValidYearMonth(yearMonth) {
-		return nil, ErrInvalidYearMonth
+	monthStart, err := ParseYearMonth(yearMonth)
+	if err != nil {
+		return nil, err
 	}
+	monthEnd := monthStart.AddDate(0, 1, 0)
 	rows, err := s.db.Query(ctx, `
 		SELECT COALESCE(agent_type, '') AS agent_type,
 		       COALESCE(SUM(total_tokens), 0) AS tokens,
 		       COUNT(*) AS events
 		FROM usage_ledger
 		WHERE user_id = $1
-		  AND to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM') = $2
+		  AND ts >= $2
+		  AND ts < $3
 		GROUP BY 1
 		ORDER BY tokens DESC, agent_type ASC
-	`, userID, yearMonth)
+	`, userID, monthStart, monthEnd)
 	if err != nil {
 		return nil, fmt.Errorf("billing: query breakdown: %w", err)
 	}
@@ -219,12 +249,30 @@ func CurrentYearMonth() string {
 	return time.Now().UTC().Format("2006-01")
 }
 
+// ParseYearMonth parses a strict ASCII YYYY-MM string into the UTC
+// start timestamp of that month (YYYY-MM-01T00:00:00Z).
+func ParseYearMonth(s string) (time.Time, error) {
+	if len(s) != 7 || s[4] != '-' {
+		return time.Time{}, ErrInvalidYearMonth
+	}
+	for i := 0; i < len(s); i++ {
+		if i == 4 {
+			continue
+		}
+		if s[i] < '0' || s[i] > '9' {
+			return time.Time{}, ErrInvalidYearMonth
+		}
+	}
+	t, err := time.Parse("2006-01", s)
+	if err != nil {
+		return time.Time{}, ErrInvalidYearMonth
+	}
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC), nil
+}
+
 // ValidYearMonth reports whether s is a syntactically valid YYYY-MM
 // string.
 func ValidYearMonth(s string) bool {
-	if len(s) != 7 || s[4] != '-' {
-		return false
-	}
-	_, err := time.Parse("2006-01", s)
+	_, err := ParseYearMonth(s)
 	return err == nil
 }

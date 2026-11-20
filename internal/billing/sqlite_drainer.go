@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	// Pure-Go SQLite driver. Registered as "sqlite". No CGO required.
@@ -44,6 +45,7 @@ import (
 // doesn't waste IO, fast enough that the /usage tile refreshes
 // near-real-time while a sim is running.
 type SQLiteDrainer struct {
+	mu        sync.Mutex
 	dbPath    string
 	forwarder EventForwarder
 	batchSize int
@@ -86,6 +88,11 @@ func WithInterval(d time.Duration) SQLiteDrainerOption {
 	}
 }
 
+const (
+	defaultSQLiteBatchSize     = 100
+	defaultSQLiteDrainInterval = 2 * time.Second
+)
+
 // NewSQLiteDrainer constructs a drainer pointing at dbPath. dbPath
 // MUST be the same file the Python `SqliteSink` writes (typically
 // `data/metering.db`, or whatever METERING_SQLITE_PATH overrides it
@@ -100,8 +107,8 @@ func NewSQLiteDrainer(dbPath string, forwarder EventForwarder, opts ...SQLiteDra
 	d := &SQLiteDrainer{
 		dbPath:    dbPath,
 		forwarder: forwarder,
-		batchSize: 100,
-		interval:  2 * time.Second,
+		batchSize: defaultSQLiteBatchSize,
+		interval:  defaultSQLiteDrainInterval,
 		sqlOpen:   sql.Open,
 	}
 	for _, opt := range opts {
@@ -119,10 +126,21 @@ func NewSQLiteDrainer(dbPath string, forwarder EventForwarder, opts ...SQLiteDra
 // can call Run, observe the first pass via a wait/cancel, and exit
 // without waiting a full tick.
 func (d *SQLiteDrainer) Run(ctx context.Context) {
+	if d == nil || ctx == nil {
+		return
+	}
+	if d.forwarder == nil || d.sqlOpen == nil {
+		log.Printf("BILLING_SQLITE_DRAIN: drainer not initialized")
+		return
+	}
+	interval := d.interval
+	if interval <= 0 {
+		interval = defaultSQLiteDrainInterval
+	}
 	if err := d.tick(ctx); err != nil {
 		log.Printf("BILLING_SQLITE_DRAIN: %v", err)
 	}
-	ticker := time.NewTicker(d.interval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -161,14 +179,33 @@ func (d *SQLiteDrainer) tick(ctx context.Context) error {
 // open/close overhead is irrelevant compared to keeping a fd open
 // across the SQLite writer's checkpoints.
 func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
+	if d == nil {
+		return 0, errors.New("sqlite drainer: receiver is nil")
+	}
 	if d.forwarder == nil {
 		return 0, errors.New("sqlite drainer: forwarder is nil")
 	}
+	if d.sqlOpen == nil {
+		return 0, errors.New("sqlite drainer: sqlOpen is nil")
+	}
+	batchSize := d.batchSize
+	if batchSize <= 0 {
+		batchSize = defaultSQLiteBatchSize
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	db, err := d.sqlOpen("sqlite", d.dbPath)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite drainer: open: %w", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
+	// Wait up to 5s on transient writer locks from the Python SqliteSink
+	// before surfacing SQLITE_BUSY.
+	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
+		return 0, fmt.Errorf("sqlite drainer: pragma busy_timeout: %w", err)
+	}
 
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, user_id, sim_id, agent_type, model,
@@ -178,21 +215,21 @@ func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
 		WHERE drained = 0
 		ORDER BY id
 		LIMIT ?
-	`, d.batchSize)
+	`, batchSize)
 	if err != nil {
+		// cost_micros may be absent on a pre-P2 SQLite file that
+		// missed the additive migration (e.g. the gateway started
+		// before the Python sink could run its ALTER). Check missing
+		// column BEFORE missing table so legacy schemas fall back cleanly.
+		if isMissingColumnError(err, "cost_micros") {
+			return d.drainBatchLegacy(ctx, db, batchSize)
+		}
 		// Table missing is normal on the very first poll before the
 		// Python side has emitted anything — surface as a no-op so the
 		// log isn't flooded with one error per tick during quiet
 		// periods.
 		if isMissingTableError(err) {
 			return 0, nil
-		}
-		// cost_micros may be absent on a pre-P2 SQLite file that
-		// missed the additive migration (e.g. the gateway started
-		// before the Python sink could run its ALTER). Fall back to
-		// the legacy 9-column SELECT so cost-less batches still drain.
-		if isMissingColumnError(err, "cost_micros") {
-			return d.drainBatchLegacy(ctx, db)
 		}
 		return 0, fmt.Errorf("sqlite drainer: select: %w", err)
 	}
@@ -202,7 +239,7 @@ func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
 	for rows.Next() {
 		var (
 			id           int64
-			userID       string
+			userID       sql.NullString
 			simID        sql.NullString
 			agentType    sql.NullString
 			model        sql.NullString
@@ -217,7 +254,7 @@ func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
 			&promptTokens, &completion, &totalTokens,
 			&costMicros, &timestampISO,
 		); err != nil {
-			return len(batch), fmt.Errorf("sqlite drainer: scan: %w", err)
+			return 0, fmt.Errorf("sqlite drainer: scan: %w", err)
 		}
 		ts, err := parseMeteringTimestamp(timestampISO)
 		if err != nil {
@@ -231,7 +268,7 @@ func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
 		batch = append(batch, drainedRow{
 			id: id,
 			event: Event{
-				UserID:           userID,
+				UserID:           userID.String,
 				SimID:            nullToPtr(simID),
 				AgentType:        nullToPtr(agentType),
 				Model:            nullToPtr(model),
@@ -257,7 +294,7 @@ func (d *SQLiteDrainer) drainBatch(ctx context.Context) (int, error) {
 // the legacy table is gone and this branch goes cold.
 //
 // Caller is responsible for having opened db.
-func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB) (int, error) {
+func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB, batchSize int) (int, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, user_id, sim_id, agent_type, model,
 		       prompt_tokens, completion_tokens, total_tokens,
@@ -266,7 +303,7 @@ func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB) (int, 
 		WHERE drained = 0
 		ORDER BY id
 		LIMIT ?
-	`, d.batchSize)
+	`, batchSize)
 	if err != nil {
 		if isMissingTableError(err) {
 			return 0, nil
@@ -279,7 +316,7 @@ func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB) (int, 
 	for rows.Next() {
 		var (
 			id           int64
-			userID       string
+			userID       sql.NullString
 			simID        sql.NullString
 			agentType    sql.NullString
 			model        sql.NullString
@@ -292,7 +329,7 @@ func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB) (int, 
 			&id, &userID, &simID, &agentType, &model,
 			&promptTokens, &completion, &totalTokens, &timestampISO,
 		); err != nil {
-			return len(batch), fmt.Errorf("sqlite drainer: legacy scan: %w", err)
+			return 0, fmt.Errorf("sqlite drainer: legacy scan: %w", err)
 		}
 		ts, err := parseMeteringTimestamp(timestampISO)
 		if err != nil {
@@ -302,7 +339,7 @@ func (d *SQLiteDrainer) drainBatchLegacy(ctx context.Context, db *sql.DB) (int, 
 		batch = append(batch, drainedRow{
 			id: id,
 			event: Event{
-				UserID:           userID,
+				UserID:           userID.String,
 				SimID:            nullToPtr(simID),
 				AgentType:        nullToPtr(agentType),
 				Model:            nullToPtr(model),
@@ -339,16 +376,22 @@ func (d *SQLiteDrainer) forwardBatch(ctx context.Context, db *sql.DB, batch []dr
 	// idempotence at the SQLite side; Postgres-side dupes are
 	// absorbed by the at-least-once contract documented on
 	// SQLiteDrainer.
-	forwarded := make([]int64, 0, len(batch))
+	drainedIDs := make([]int64, 0, len(batch))
+	forwardedCount := 0
+	var firstErr error
 	for _, r := range batch {
 		if _, err := d.forwarder.InsertEvent(ctx, r.event); err != nil {
-			// FK violation (org doesn't exist in organizations) →
-			// log and skip. Bootstrap guarantees system+legacy exist;
-			// any other org is created by POST /admin/orgs before
-			// users log in, so a real-deployment FK miss means
-			// misconfiguration and should be loud.
+			if isPermanentInsertError(err) {
+				// Permanent failure (e.g. Postgres 23503 FK violation for an
+				// unknown/erased user or empty user_id): mark drained=1 so
+				// poisoned rows cannot wedge ORDER BY id ASC LIMIT batchSize.
+				log.Printf("BILLING_SQLITE_DRAIN: dropping permanent-error event id=%d user=%q: %v", r.id, r.event.UserID, err)
+				drainedIDs = append(drainedIDs, r.id)
+				continue
+			}
 			log.Printf("BILLING_SQLITE_DRAIN: insert event id=%d: %v", r.id, err)
-			continue
+			firstErr = fmt.Errorf("sqlite drainer: insert event id=%d: %w", r.id, err)
+			break
 		}
 		// Update rollup. Tokens may be NULL → contribute 0; we still
 		// advance updated_at so the dashboard sees the heartbeat.
@@ -361,24 +404,23 @@ func (d *SQLiteDrainer) forwardBatch(ctx context.Context, db *sql.DB, batch []dr
 			addCost = *r.event.CostMicros
 		}
 		if err := d.forwarder.UpsertMonthlyRollup(ctx, r.event.UserID, r.event.Timestamp, addTokens, addCost); err != nil {
-			log.Printf("BILLING_SQLITE_DRAIN: upsert rollup user=%s: %v", r.event.UserID, err)
-			// Don't bail — the ledger row is already in Postgres, so
-			// the next rollup recompute (a future Phase 7 reconcile
-			// job) can repair the drift. We still mark drained=1 so
-			// we don't re-forward the ledger row.
+			// Do NOT mark drained=1 when rollup fails: keep row undrained so
+			// the next drain pass retries and converges usage_rollup_monthly.
+			log.Printf("BILLING_SQLITE_DRAIN: upsert rollup id=%d user=%s: %v", r.id, r.event.UserID, err)
+			firstErr = fmt.Errorf("sqlite drainer: upsert rollup id=%d user=%s: %w", r.id, r.event.UserID, err)
+			break
 		}
-		forwarded = append(forwarded, r.id)
+		drainedIDs = append(drainedIDs, r.id)
+		forwardedCount++
 	}
 
-	if len(forwarded) > 0 {
-		if err := markDrained(ctx, db, forwarded); err != nil {
-			// Worst case here is at-least-once redelivery on the next
-			// tick — Postgres will get duplicates. Log loud and move
-			// on.
-			log.Printf("BILLING_SQLITE_DRAIN: mark drained (%d rows): %v", len(forwarded), err)
+	if len(drainedIDs) > 0 {
+		if markErr := markDrained(ctx, db, drainedIDs); markErr != nil {
+			log.Printf("BILLING_SQLITE_DRAIN: mark drained (%d rows): %v", len(drainedIDs), markErr)
+			return forwardedCount, errors.Join(firstErr, fmt.Errorf("sqlite drainer: mark drained: %w", markErr))
 		}
 	}
-	return len(forwarded), nil
+	return forwardedCount, firstErr
 }
 
 // markDrained flips drained=1 for the given ledger ids. Splits into
@@ -442,13 +484,7 @@ func isMissingTableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	for _, marker := range []string{"no such table", "SQLITE_ERROR"} {
-		if containsCaseInsensitive(msg, marker) {
-			return true
-		}
-	}
-	return false
+	return containsCaseInsensitive(err.Error(), "no such table")
 }
 
 // isMissingColumnError recognises the SQLite "no such column" error

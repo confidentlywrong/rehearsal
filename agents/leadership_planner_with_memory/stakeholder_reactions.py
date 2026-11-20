@@ -49,11 +49,16 @@ deferred until this slice is validated end-to-end.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_optional_rationale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,15 +172,9 @@ async def emit_stakeholder_reactions(
         On failure: ``{"status": "error", "field": "...", "message": "..."}``.
     """
     # 1. Parse the JSON envelope (lenient: also accept a dict directly).
-    if isinstance(reactions_json, dict):
-        data = reactions_json
-    else:
-        try:
-            data = json.loads(reactions_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(reactions_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Validate top-level shape.
     reactions_raw = data.get("reactions")
@@ -209,9 +208,8 @@ async def emit_stakeholder_reactions(
     seen_sids: set[str] = set()
     for i, raw in enumerate(reactions_raw):
         normalized, err = _validate_reaction(i, raw, known_ids)
-        if err:
-            return _err(err, field="reactions")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid reaction", field="reactions")
         sid = normalized["stakeholder_id"]
         if sid in seen_sids:
             return _err(
@@ -223,14 +221,18 @@ async def emit_stakeholder_reactions(
         reactions.append(normalized)
 
     # 5. Optional rationale.
-    rationale = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale, str) and rationale.strip():
-        rationale_clean = rationale.strip()[:500]
+    rationale_clean, rationale_err = validate_optional_rationale(data.get("rationale"), max_chars=500)
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
     payload: dict[str, Any] = {"reactions": reactions}
     if rationale_clean:
         payload["rationale"] = rationale_clean
+
+    clean_payload, json_err = sanitize_json_value(payload, path=STATE_KEY)
+    if json_err or not isinstance(clean_payload, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    payload = clean_payload
 
     # 6. Stash for downstream report tools (optional consumers).
     try:

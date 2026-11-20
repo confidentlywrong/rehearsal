@@ -119,20 +119,20 @@ file injects `window.ENV` with URLs for the gateway, agents, and other
 services, so the SPA knows where to find everything without build-time
 configuration.
 
-The SPA calls the **gateway** directly (via `window.ENV.GATEWAY_URL`) for
-write operations like environment reset. The admin server itself is read-only.
+The admin BFF exposes `POST /api/admin/environment/reset` (superadmin-gated)
+and forwards it with service auth to the gateway's `/api/v1/environment/reset`.
 
 ## Configuration
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `ADMIN_PORT` | `8000` | HTTP listen port |
+| `PORT` / `ADMIN_PORT` | `9121` | HTTP listen port |
 | `REDIS_ADDR` | -- | Redis address for health checks |
 | `PUBSUB_EMULATOR_HOST` | -- | Pub/Sub emulator (triggers insecure gRPC) |
 | `PUBSUB_PROJECT_ID` / `PROJECT_ID` | -- | GCP project for Pub/Sub topic |
 | `PUBSUB_TOPIC_ID` | -- | Topic name to check/create |
 | `DATABASE_URL` | -- | AlloyDB/PostgreSQL connection string |
-| `GATEWAY_INTERNAL_URL` / `GATEWAY_URL` | `http://127.0.0.1:8101` | Gateway for agent discovery |
+| `GATEWAY_INTERNAL_URL` / `GATEWAY_URL` | `http://127.0.0.1:9101` | Gateway for agent discovery |
 | `CORS_ALLOWED_ORIGINS` | `*` | Allowed CORS origins |
 
 Service URL variables injected into `config.js`: `GATEWAY_URL`,

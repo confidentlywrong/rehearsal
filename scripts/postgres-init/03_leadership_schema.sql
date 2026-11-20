@@ -57,4 +57,26 @@ ALTER TABLE leadership_scenarios ADD COLUMN IF NOT EXISTS owner_id VARCHAR(64);
 CREATE INDEX IF NOT EXISTS idx_leadership_scenarios_owner_created
     ON leadership_scenarios (owner_id, created_at DESC);
 
+-- ============================================================
+-- 3. LEADERSHIP STAKEHOLDER ARTIFACTS TABLE
+--    Required before 04_leadership_demo_fixtures.sql inserts demo rows.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS leadership_stakeholder_artifacts (
+    scenario_id           VARCHAR(64)  PRIMARY KEY
+        REFERENCES leadership_scenarios(scenario_id) ON DELETE CASCADE,
+    stakeholder_graph     JSONB,
+    stakeholder_personas  JSONB,
+    stakeholder_reactions JSONB,
+    simulation_timeline   JSONB,
+    simulation_report     JSONB,
+    stakeholder_interview JSONB,
+    owner_id              VARCHAR(64),
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_leadership_artifacts_owner_updated
+    ON leadership_stakeholder_artifacts (owner_id, updated_at DESC);
+
 

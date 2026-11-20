@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,6 +49,10 @@ async def prepare_simulation(
     logger.warning("Simulating processing delay...")
 
     await asyncio.sleep(3)
+
+    if tool_context is not None and getattr(tool_context, "state", None) is not None:
+        tool_context.state["simulation_ready"] = False
+        tool_context.state["simulation_in_progress"] = False
 
     logger.error("Internal error in simulation engine.")
     raise RuntimeError(

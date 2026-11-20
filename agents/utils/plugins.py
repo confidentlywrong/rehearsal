@@ -17,11 +17,14 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
 from collections import OrderedDict
+from collections.abc import Mapping
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional
 
 from google.cloud import pubsub_v1
 
@@ -37,6 +40,10 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
+# Hard upper cap on tool-requested gateway emission delays so an extreme
+# finite float (e.g. 1e300) cannot stall _emit_narrative / background tasks.
+_MAX_GATEWAY_DELAY_SECONDS = 30.0
+
 # Allowlist of tool args safe to include in tool_start lifecycle events.
 # Maps tool_name -> list of arg keys to cherry-pick for display.
 _TOOL_DISPLAY_HINTS: Dict[str, List[str]] = {
@@ -50,7 +57,9 @@ _TOOL_DISPLAY_HINTS: Dict[str, List[str]] = {
 
 def _safe_json_sanitize(obj: Any, seen: set | None = None) -> Any:
     """Recursively convert non-serializable components of an object to strings."""
-    if isinstance(obj, (str, int, float, bool, type(None))):
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool, type(None))):
         return obj
 
     if seen is None:
@@ -79,6 +88,7 @@ def _safe_json_sanitize(obj: Any, seen: set | None = None) -> Any:
 
 def _safe_json_dumps(obj: Any, **kwargs) -> str:
     """Safely dump objects to JSON, sanitizing non-serializable types first."""
+    kwargs.setdefault("allow_nan", False)
     return json.dumps(_safe_json_sanitize(obj), **kwargs)
 
 
@@ -145,6 +155,47 @@ def _agent_name(invocation_context: Any) -> str:
     """
     agent = getattr(invocation_context, "agent", None)
     return getattr(agent, "name", None) or "unknown-agent"
+
+
+_ANONYMOUS_USER_IDS = frozenset({"simulation", "simulation_user", "anonymous", "default", "user"})
+
+
+def _resolve_plugin_user_id(context: Any, payload: Dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of an authenticated non-anonymous user_id for telemetry."""
+    candidates: list[Any] = []
+    if context is not None:
+        try:
+            ctx_state = getattr(context, "state", None)
+            if ctx_state is None:
+                session_obj = getattr(context, "session", None)
+                if session_obj is not None:
+                    ctx_state = getattr(session_obj, "state", None)
+            if ctx_state is not None and hasattr(ctx_state, "get"):
+                for key in ("user_id", "acting_user_id", "userId"):
+                    candidates.append(ctx_state.get(key))
+                tenant = ctx_state.get("tenant")
+                if isinstance(tenant, Mapping):
+                    candidates.append(tenant.get("user_id"))
+        except Exception:
+            pass
+        inv_ctx = getattr(context, "_invocation_context", None)
+        if inv_ctx is not None:
+            candidates.append(getattr(inv_ctx, "user_id", None))
+        candidates.append(getattr(context, "user_id", None))
+        session_obj = getattr(context, "session", None)
+        if session_obj is not None:
+            candidates.append(getattr(session_obj, "user_id", None))
+    if isinstance(payload, Mapping):
+        candidates.append(payload.get("user_id"))
+
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            continue
+        return cleaned
+    return None
 
 
 class BaseDashLogPlugin(BasePlugin):
@@ -380,14 +431,25 @@ class BaseDashLogPlugin(BasePlugin):
         elif not session_id:
             session_id = "unknown-session"
 
+        plugin_user_id = _resolve_plugin_user_id(context, payload)
+
         # On Agent Engine, VertexAiSessionService generates internal session
         # IDs that differ from the gateway's spawn session UUIDs.  Map back
         # to the original context_id so the frontend's session-based
         # rendering filters match the spawned agent.
+        original_id: str | None = None
         if session_id and session_id != "unknown-session":
             from agents.utils.simulation_registry import get_context_id
 
-            original_id = await get_context_id(str(session_id))
+            try:
+                original_id = (
+                    await get_context_id(str(session_id), user_id=plugin_user_id)
+                    if plugin_user_id is not None
+                    else await get_context_id(str(session_id))
+                )
+            except ValueError as exc:
+                logger.debug("DASHLOG: skipped context_id lookup (%s)", exc)
+                original_id = None
             if original_id:
                 session_id = original_id
 
@@ -427,7 +489,7 @@ class BaseDashLogPlugin(BasePlugin):
             if ctx_state is not None:
                 simulation_id = ctx_state.get("simulation_id")
         except Exception:
-            pass
+            logger.debug("DASHLOG: failed to read simulation_id from context state", exc_info=True)
 
         # Fallback: check process-local simulation registry.
         # The dispatcher writes session→simulation at spawn time; this
@@ -436,7 +498,30 @@ class BaseDashLogPlugin(BasePlugin):
         if simulation_id is None:
             from agents.utils.simulation_registry import lookup
 
-            simulation_id = await lookup(str(session_id) if session_id else "")
+            try:
+                lookup_sid = str(session_id) if session_id else ""
+                simulation_id = (
+                    await lookup(lookup_sid, user_id=plugin_user_id)
+                    if plugin_user_id is not None
+                    else await lookup(lookup_sid)
+                )
+            except ValueError as exc:
+                logger.debug("DASHLOG: skipped simulation_id lookup (%s)", exc)
+                simulation_id = None
+
+        # AgentTool child sessions inside simulator's pipeline (pre_race, tick,
+        # post_race) run under ephemeral ADK session IDs that are not registered
+        # in simulation_registry or Gateway's session store. Map them back to
+        # simulation_id so Gateway Hub recognizes simulator ownership.
+        if (
+            original_id is None
+            and isinstance(simulation_id, str)
+            and simulation_id.strip()
+            and str(safe_payload.get("agent") or "").strip().lower()
+            in {"simulator", "pre_race", "tick", "post_race"}
+        ):
+            session_id = simulation_id.strip()
+            safe_payload["session_id"] = session_id
 
         event_type = payload.get("type")
 
@@ -456,40 +541,43 @@ class BaseDashLogPlugin(BasePlugin):
                 safe_payload.get("agent"),
             )
 
-        if self._fire_and_forget:
-            # L13: Track fire-and-forget tasks with error logging so
-            # exceptions are not silently swallowed.
-            def _log_task_error(t: asyncio.Task) -> None:
-                if t.cancelled():
-                    return
-                exc = t.exception()
-                if exc:
-                    logger.error("DASHLOG_FIRE_AND_FORGET: background task failed: %s", exc)
+        from agents.utils.simulation_registry import user_scope
 
-            for coro in [
-                self._do_publish(context, safe_payload),
-                *(
-                    [self._emit_narrative(session_id, safe_payload, simulation_id=simulation_id)]
-                    if event_type in ("model_end", "tool_end", "model_error", "tool_error")
-                    else []
-                ),
-                *(
-                    [self._emit_lifecycle_event(session_id, safe_payload, simulation_id=simulation_id)]
-                    if event_type in ("model_start", "tool_start", "run_start", "run_end")
-                    else []
-                ),
-            ]:
-                task = asyncio.create_task(coro)
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                task.add_done_callback(_log_task_error)
-        else:
-            # Blocking: await each stage for planner/simulator correctness
-            await self._do_publish(context, safe_payload)
-            if event_type in ("model_end", "tool_end", "model_error", "tool_error"):
-                await self._emit_narrative(session_id, safe_payload, simulation_id=simulation_id)
-            if event_type in ("model_start", "tool_start", "run_start", "run_end"):
-                await self._emit_lifecycle_event(session_id, safe_payload, simulation_id=simulation_id)
+        with user_scope(plugin_user_id) if plugin_user_id is not None else nullcontext():
+            if self._fire_and_forget:
+                # L13: Track fire-and-forget tasks with error logging so
+                # exceptions are not silently swallowed.
+                def _log_task_error(t: asyncio.Task) -> None:
+                    if t.cancelled():
+                        return
+                    exc = t.exception()
+                    if exc:
+                        logger.error("DASHLOG_FIRE_AND_FORGET: background task failed: %s", exc)
+
+                for coro in [
+                    self._do_publish(context, safe_payload),
+                    *(
+                        [self._emit_narrative(session_id, safe_payload, simulation_id=simulation_id)]
+                        if event_type in ("model_end", "tool_end", "model_error", "tool_error")
+                        else []
+                    ),
+                    *(
+                        [self._emit_lifecycle_event(session_id, safe_payload, simulation_id=simulation_id)]
+                        if event_type in ("model_start", "tool_start", "run_start", "run_end")
+                        else []
+                    ),
+                ]:
+                    task = asyncio.create_task(coro)
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    task.add_done_callback(_log_task_error)
+            else:
+                # Blocking: await each stage for planner/simulator correctness
+                await self._do_publish(context, safe_payload)
+                if event_type in ("model_end", "tool_end", "model_error", "tool_error"):
+                    await self._emit_narrative(session_id, safe_payload, simulation_id=simulation_id)
+                if event_type in ("model_start", "tool_start", "run_start", "run_end"):
+                    await self._emit_lifecycle_event(session_id, safe_payload, simulation_id=simulation_id)
 
     async def _emit_narrative(
         self,
@@ -520,14 +608,17 @@ class BaseDashLogPlugin(BasePlugin):
                 # legacy/test payload that still ships only the rich
                 # summary field.
                 response = payload["response"]
-                if "text" in response:
-                    raw_text = str(response["text"])
-                elif "content" in response:
-                    raw_text = str(response["content"])
+                if isinstance(response, dict):
+                    if "text" in response and response["text"] is not None:
+                        raw_text = str(response["text"])
+                    elif "content" in response and response["content"] is not None:
+                        raw_text = str(response["content"])
+                elif response is not None:
+                    raw_text = str(response)
             elif "result" in payload:
                 res = payload["result"]
                 if isinstance(res, dict):
-                    raw_text = json.dumps(res)
+                    raw_text = _safe_json_dumps(res)
                     is_json_result = True
                 else:
                     raw_text = str(res)
@@ -549,7 +640,7 @@ class BaseDashLogPlugin(BasePlugin):
 
                     if isinstance(a2ui_value, (dict, list)):
                         # Tool returned a2ui as a parsed object (e.g. validate_and_emit_a2ui)
-                        a2ui_blocks.append(json.dumps(a2ui_value))
+                        a2ui_blocks.append(_safe_json_dumps(a2ui_value))
                     else:
                         # Tool returned a2ui as a string -- apply cleanup
                         a2ui_content = str(a2ui_value).strip()
@@ -603,7 +694,20 @@ class BaseDashLogPlugin(BasePlugin):
                         # defer the frontend-visible event.
                         gw_delay = 0.0
                         if isinstance(parsed, dict):
-                            gw_delay = parsed.pop("gateway_delay_seconds", 0.0)
+                            raw_delay = parsed.pop("gateway_delay_seconds", 0.0)
+                            if isinstance(raw_delay, (int, float)) and not isinstance(raw_delay, bool):
+                                try:
+                                    delay_f = float(raw_delay)
+                                except OverflowError:
+                                    delay_f = 0.0
+                                if math.isfinite(delay_f) and delay_f > 0:
+                                    gw_delay = min(delay_f, _MAX_GATEWAY_DELAY_SECONDS)
+                                    if gw_delay < delay_f:
+                                        logger.warning(
+                                            "BaseDashLogPlugin: clamping gateway_delay_seconds=%.3f to %.3fs",
+                                            delay_f,
+                                            _MAX_GATEWAY_DELAY_SECONDS,
+                                        )
                         if gw_delay > 0:
                             await asyncio.sleep(gw_delay)
 
@@ -710,8 +814,9 @@ class BaseDashLogPlugin(BasePlugin):
             # Cherry-pick allowlisted args for display (secure-by-default).
             tool_name = data["tool"]
             hint_keys = _TOOL_DISPLAY_HINTS.get(tool_name)
-            if hint_keys and "args" in payload:
-                hints = {k: str(v) for k, v in payload["args"].items() if k in hint_keys and v is not None}
+            raw_args = payload.get("args")
+            if hint_keys and isinstance(raw_args, dict):
+                hints = {k: str(v) for k, v in raw_args.items() if k in hint_keys and v is not None}
                 if hints:
                     data["tool_hints"] = hints
 
@@ -751,8 +856,24 @@ class RedisDashLogPlugin(BaseDashLogPlugin):
         # attempt live HTTP calls with mock credentials (see 2026-07-02
         # test-isolation audit). By the time this plugin is constructed
         # in a real deployment, ``.env`` has already been loaded upstream.
-        self.project_id = os.getenv("PUBSUB_PROJECT_ID", "test-project")
-        self.topic_id = self._topic_id_override or os.getenv("PUBSUB_TOPIC_ID", "agent-telemetry")
+        self.project_id = (
+            (os.getenv("PUBSUB_PROJECT_ID") or "").strip()
+            or (os.getenv("GOOGLE_CLOUD_PROJECT") or "").strip()
+            or (os.getenv("PROJECT_ID") or "").strip()
+        )
+        self.topic_id = (
+            (self._topic_id_override or "").strip()
+            or (os.getenv("PUBSUB_TOPIC_ID") or "").strip()
+            or "agent-telemetry"
+        )
+        if not self.project_id:
+            logger.warning(
+                "REDIS_DASH_INIT: No PUBSUB_PROJECT_ID/GOOGLE_CLOUD_PROJECT/PROJECT_ID configured; "
+                "Pub/Sub telemetry disabled"
+            )
+            self.topic_path = ""
+            self.publisher = None
+            return
         self.topic_path = f"projects/{self.project_id}/topics/{self.topic_id}"
 
         batch_settings = pubsub_v1.types.BatchSettings(max_messages=10, max_bytes=1024, max_latency=1.0)

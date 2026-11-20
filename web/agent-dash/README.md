@@ -6,7 +6,7 @@ and error across all agents in the simulation.
 
 ## What it shows
 
-Four panels on a dark-themed dashboard:
+Four panels on an Obsidian Light dashboard:
 
 **Simulation metrics** (sidebar): total sessions, total turns, average run
 latency, event count, error count, dropped log count.
@@ -31,7 +31,7 @@ flowchart LR
     agents["ADK agents<br/>(planner, simulator,<br/>runners, etc.)"]
     plugin["RedisDashLogPlugin<br/>(ADK lifecycle hooks)"]
     pubsub[("Pub/Sub<br/>agent-telemetry")]
-    server["agent_dash.py<br/>:8301"]
+    server["agent_dash.py<br/>:9111"]
     browser(["Browser"])
 
     agents --> plugin
@@ -75,10 +75,10 @@ color, applied as a left border on every log entry for visual grouping.
 
 **Click-to-filter**: click any session ID, agent name, or event type to filter
 the feed. Three independent filter dimensions can be combined. Active filters
-appear as removable pill badges.
+appear as removable filter chips.
 
-**Lifecycle badges**: start events get a green START badge, end events get a
-red END badge, errors get a red background tint.
+**Lifecycle badges**: start events get a green-dot START badge, end events get a
+red-dot END badge, errors get a red border.
 
 ## Chronological ordering
 
@@ -90,7 +90,7 @@ ordering.
 ## Performance
 
 - `requestAnimationFrame` batching for log entry insertion
-- 1000-entry feed cap with 200-entry eviction batches
+- 500-entry feed cap with 100-entry eviction batches
 - Deduplication via composite key (`session_id:type:seq:timestamp`), capped
   at 5000 entries
 - Chart animation disabled for high-throughput scenarios
@@ -105,7 +105,7 @@ and cleans it up on shutdown.
 ## Running locally
 
 The dashboard starts automatically via Honcho (`dash` process in the
-Procfile). It runs on port 8301.
+Procfile). It runs on port 9111.
 
 ```bash
 # Standalone
@@ -119,7 +119,7 @@ honcho start dash
 
 ```
 web/agent-dash/
-└── index.html    # Entire SPA (1190 lines, zero-build)
+└── index.html    # Entire SPA (single-file, zero-build)
 ```
 
 The backend server lives at `scripts/core/agent_dash.py`.

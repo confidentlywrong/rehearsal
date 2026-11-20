@@ -77,7 +77,9 @@ Session-state contract:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import os
 from typing import Any
 
@@ -85,16 +87,30 @@ import httpx
 from google.adk.tools.tool_context import ToolContext
 
 from agents.utils import user_auth_context
+from agents.utils.gateway import get_gateway_url
 
 logger = logging.getLogger(__name__)
 
-# Reusable HTTP client for RAG gateway queries (avoids per-call TCP overhead).
+# Reusable HTTP client for RAG gateway queries (avoids per-call TCP overhead),
+# scoped to the running asyncio event loop so multi-loop callers never hit
+# RuntimeError("Event loop is closed").
 _rag_http_client: httpx.AsyncClient | None = None
+_rag_http_client_loop: asyncio.AbstractEventLoop | None = None
+
 
 def _get_rag_client() -> httpx.AsyncClient:
-    global _rag_http_client
-    if _rag_http_client is None or _rag_http_client.is_closed:
+    global _rag_http_client, _rag_http_client_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if (
+        _rag_http_client is None
+        or _rag_http_client.is_closed
+        or (_rag_http_client_loop is not None and current_loop is not None and _rag_http_client_loop is not current_loop)
+    ):
         _rag_http_client = httpx.AsyncClient(timeout=30.0)
+        _rag_http_client_loop = current_loop
     return _rag_http_client
 
 
@@ -134,18 +150,12 @@ _AUTO_DISCOVER_MESSAGES: dict[str, str] = {
 def _gateway_url() -> str:
     """Resolve the gateway base URL.
 
-    Priority mirrors the env-var resolution used by other retrieval
-    surfaces so all callers share the same env-var story:
-    ``MEMORY_GATEWAY_URL`` → ``GATEWAY_ADDR`` → ``http://127.0.0.1:9101``.
+    Delegates to :func:`agents.utils.gateway.get_gateway_url` with
+    ``include_memory_env=True`` so precedence is:
+    ``MEMORY_GATEWAY_URL`` → ``GATEWAY_INTERNAL_URL`` → ``GATEWAY_URL``
+    → ``GATEWAY_ADDR`` → ``http://127.0.0.1:9101``.
     """
-    url = os.environ.get("MEMORY_GATEWAY_URL", "").strip()
-    if url:
-        return url.rstrip("/")
-    addr = os.environ.get("GATEWAY_ADDR", "").strip()
-    if addr:
-        scheme = "http://" if "://" not in addr else ""
-        return f"{scheme}{addr}".rstrip("/")
-    return "http://127.0.0.1:9101"
+    return get_gateway_url(include_memory_env=True)
 
 
 def _bearer_token(tool_context: ToolContext | None = None) -> str | None:
@@ -180,7 +190,19 @@ def _bearer_token(tool_context: ToolContext | None = None) -> str | None:
                 return per_user
     # 2. Env-var fallback.
     tok = os.environ.get("MEMORY_GATEWAY_TOKEN", "").strip()
-    return tok or None
+    if not tok or not user_auth_context._is_valid_bearer_token(tok):
+        return None
+    return tok
+
+
+def _is_safe_path_id(value: str) -> bool:
+    """Reject URL path traversal/injection characters in analysis IDs."""
+    return (
+        bool(value)
+        and value not in (".", "..")
+        and ".." not in value
+        and not any(ch in "/\\?#%" or ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in value)
+    )
 
 
 def _resolve_analysis_id(
@@ -193,13 +215,17 @@ def _resolve_analysis_id(
     through to :func:`_auto_discover_analysis_id`.
     """
     if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
+        cand = explicit.strip()
+        if _is_safe_path_id(cand):
+            return cand
     try:
         state_val = tool_context.state.get(MEMORY_ANALYSIS_ID_KEY)
     except (AttributeError, TypeError):
         return None
     if isinstance(state_val, str) and state_val.strip():
-        return state_val.strip()
+        cand = state_val.strip()
+        if _is_safe_path_id(cand):
+            return cand
     return None
 
 
@@ -241,7 +267,7 @@ async def _auto_discover_analysis_id(
     url = f"{_gateway_url()}/api/v1/memory/analyses"
     try:
         resp = await client.get(url, headers=_build_headers(tool_context), timeout=10.0)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, RuntimeError) as exc:
         logger.warning("auto-discover: transport error listing analyses: %s", exc)
         return None, "gateway_error"
 
@@ -280,9 +306,12 @@ async def _auto_discover_analysis_id(
     if not isinstance(picked, dict):
         return None, "gateway_error"
     aid = picked.get("id")
-    if not isinstance(aid, str) or not aid.strip():
+    if not isinstance(aid, str):
         return None, "gateway_error"
     aid_clean = aid.strip()
+    if not aid_clean or not _is_safe_path_id(aid_clean):
+        logger.warning("auto-discover: unsafe or empty analysis id %r", aid)
+        return None, "gateway_error"
 
     # Cache the pick back so subsequent retrieves in the same
     # session skip this hop.
@@ -346,8 +375,19 @@ async def retrieve_document_passages(
             | "no_documents" | "gateway_error", "message": "...",
             "passages": []}`` — never raises.
     """
-    clamped_limit = max(1, min(int(limit or _PASSAGE_DEFAULT_LIMIT), _PASSAGE_HARD_LIMIT))
-    query_text = (query or "").strip()
+    if limit is None or isinstance(limit, bool):
+        raw_limit = _PASSAGE_DEFAULT_LIMIT
+    elif isinstance(limit, int):
+        raw_limit = limit
+    elif isinstance(limit, float):
+        raw_limit = int(limit) if math.isfinite(limit) else _PASSAGE_DEFAULT_LIMIT
+    else:
+        try:
+            raw_limit = int(limit)
+        except (ValueError, TypeError, OverflowError):
+            raw_limit = _PASSAGE_DEFAULT_LIMIT
+    clamped_limit = max(1, min(raw_limit or _PASSAGE_DEFAULT_LIMIT, _PASSAGE_HARD_LIMIT))
+    query_text = (query if isinstance(query, str) else str(query or "")).strip()
     if not query_text:
         return {
             "status": "no_query",
@@ -365,22 +405,21 @@ async def retrieve_document_passages(
             aid, err_status = await _auto_discover_analysis_id(
                 client, tool_context
             )
-            if err_status is not None:
+            if err_status is not None or not aid:
                 return {
-                    "status": err_status,
+                    "status": err_status or "no_analysis_bound",
                     "message": _AUTO_DISCOVER_MESSAGES.get(
-                        err_status,
+                        err_status or "no_analysis_bound",
                         "Could not resolve analysis for document retrieval.",
                     ),
                     "passages": [],
                 }
-        assert aid is not None
 
         # 2. Call the retrieve-passages endpoint.
         url = f"{_gateway_url()}/api/v1/memory/analyses/{aid}/retrieve-passages"
         body = {"query": query_text, "limit": clamped_limit}
         resp = await client.post(url, json=body, headers=headers, timeout=15.0)
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, RuntimeError) as exc:
         logger.warning("retrieve_document_passages: transport error: %s", exc)
         return {
             "status": "gateway_error",
@@ -439,22 +478,54 @@ async def retrieve_document_passages(
         passages = []
 
     # Populate memory_citations_available for emit tools to validate against.
-    citation_source_ids = list({p["source_id"] for p in passages if p.get("source_id")})
-    tool_context.state["memory_citations_available"] = citation_source_ids
+    citation_source_ids = list(
+        {
+            p["source_id"].strip()
+            for p in passages
+            if isinstance(p, dict)
+            and isinstance(p.get("source_id"), str)
+            and p["source_id"].strip()
+        }
+    )
+    try:
+        tool_context.state["memory_citations_available"] = citation_source_ids
+    except (AttributeError, TypeError):
+        pass
 
     # Normalise each passage to a consistent shape.
     cleaned: list[dict[str, Any]] = []
     for p in passages:
         if not isinstance(p, dict):
             continue
-        text = (p.get("text") or "").strip()
+        raw_text = p.get("text")
+        text = (raw_text if isinstance(raw_text, str) else str(raw_text or "")).strip()
         if not text:
             continue
+        raw_score = p.get("score")
+        if isinstance(raw_score, bool):
+            score = 0.0
+        else:
+            try:
+                score = float(raw_score if raw_score is not None else 0.0)
+            except (ValueError, TypeError, OverflowError):
+                score = 0.0
+            if not math.isfinite(score):
+                score = 0.0
+        raw_idx = p.get("chunk_index")
+        if isinstance(raw_idx, bool):
+            chunk_idx = 0
+        elif isinstance(raw_idx, float):
+            chunk_idx = int(raw_idx) if math.isfinite(raw_idx) else 0
+        else:
+            try:
+                chunk_idx = int(raw_idx if raw_idx is not None else 0)
+            except (ValueError, TypeError, OverflowError):
+                chunk_idx = 0
         cleaned.append({
             "text": text,
-            "score": float(p.get("score") or 0.0),
-            "document_id": p.get("document_id", ""),
-            "chunk_index": int(p.get("chunk_index") or 0),
+            "score": score,
+            "document_id": str(p.get("document_id") or ""),
+            "chunk_index": chunk_idx,
         })
 
     logger.info(

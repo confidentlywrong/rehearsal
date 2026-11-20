@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -89,8 +91,13 @@ def initialize_runner(state: StateLike, session_id: str, runner_count: int = 1) 
 
     # Wave start: assign corral by ability (faster runners start first)
     ability_pct = (target_finish - MIN_FINISH_MIN) / (MAX_FINISH_MIN - MIN_FINISH_MIN)
-    runner_index = int(ability_pct * max(runner_count - 1, 0))
-    wave_number, start_delay_minutes = compute_wave(runner_index, runner_count)
+    safe_runner_count = (
+        runner_count
+        if isinstance(runner_count, int) and not isinstance(runner_count, bool) and runner_count > 0
+        else 1
+    )
+    runner_index = int(ability_pct * max(safe_runner_count - 1, 0))
+    wave_number, start_delay_minutes = compute_wave(runner_index, safe_runner_count)
 
     # Starting hydration: ability-correlated, with noise, clamped to [88, 100].
     # Trained marathoners typically arrive at 97-99% of euhydration; recreational

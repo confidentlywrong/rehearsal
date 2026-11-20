@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+from agents.utils.models import DEFAULT_EVALUATOR_MODEL, get_model
 
 # Model configuration
 # Note: Use gemini-3.1-pro-preview for best results in evaluation tasks
-MODEL = os.getenv("EVALUATOR_MODEL", "gemini-3.1-pro-preview")
+MODEL = get_model("EVALUATOR_MODEL", DEFAULT_EVALUATOR_MODEL)
 
 # Criterion weights must sum to 1.0 (equal weighting)
 CRITERION_WEIGHTS = {

@@ -154,3 +154,45 @@ def test_default_pool_size_is_50():
 
     # Cleanup
     rp._shared_clients.clear()
+
+
+def test_invalid_redis_max_connections_raises_value_error():
+    """Invalid or non-positive REDIS_MAX_CONNECTIONS raises ValueError instead of silent fallback."""
+    import pytest
+
+    pool_mod._shared_clients.clear()
+    try:
+        with patch.dict("os.environ", {"REDIS_ADDR": "127.0.0.1:6379", "REDIS_MAX_CONNECTIONS": "abc"}):
+            with pytest.raises(ValueError, match="REDIS_MAX_CONNECTIONS"):
+                pool_mod.get_shared_redis_client()
+        with patch.dict("os.environ", {"REDIS_ADDR": "127.0.0.1:6379", "REDIS_MAX_CONNECTIONS": "0"}):
+            with pytest.raises(ValueError, match="REDIS_MAX_CONNECTIONS"):
+                pool_mod.get_shared_redis_client()
+    finally:
+        pool_mod._shared_clients.clear()
+
+
+def test_aclose_closes_current_loop_and_prunes_closed_loops():
+    """aclose() closes the current loop client and removes closed-loop entries."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    pool_mod._shared_clients.clear()
+    closed_loop = asyncio.new_event_loop()
+    closed_loop.close()
+    pool_mod._shared_clients[closed_loop] = MagicMock()
+
+    async def _run():
+        mock_client = MagicMock()
+        mock_client.aclose = AsyncMock()
+        cur_loop = asyncio.get_running_loop()
+        pool_mod._shared_clients[cur_loop] = mock_client
+        await pool_mod.aclose()
+        mock_client.aclose.assert_awaited_once()
+        assert cur_loop not in pool_mod._shared_clients
+        assert closed_loop not in pool_mod._shared_clients
+
+    try:
+        asyncio.run(_run())
+    finally:
+        pool_mod._shared_clients.clear()

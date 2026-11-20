@@ -1,4 +1,6 @@
 -- Copyright 2026 Google LLC
+-- Modifications copyright 2026 Christian Haeussinger
+-- Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -42,4 +44,4 @@ Sec. 2. If any owner or owners of any camel or camels, dromedary or dromedaries 
 (2) Any public street or sidewalk within specific downtown districts.
 (B) It is a misdemeanor to sit, lie, sleep, camp, or otherwise obstruct the sidewalk during designated cleaning times. Appropriate signs or markings must be placed to alert the public to these cleaning times.')
 
-ON CONFLICT DO NOTHING;
+ON CONFLICT (source_file, chunk_id) DO NOTHING;

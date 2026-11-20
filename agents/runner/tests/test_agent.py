@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,7 +100,7 @@ def test_a2a_agent_exists():
 
 def test_default_model_is_gemini():
     """Default model must remain the Gemini variant for cloud deployments."""
-    assert DEFAULT_MODEL == "gemini-3.1-flash-lite-preview"
+    assert DEFAULT_MODEL == "gemini-3.5-flash-lite"
 
 
 def test_runner_model_defaults_to_gemini():

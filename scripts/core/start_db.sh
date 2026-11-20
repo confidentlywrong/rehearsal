@@ -65,7 +65,7 @@ if [ "${USE_ALLOYDB:-false}" = "true" ]; then
     exec "${PROXY_BIN}" \
         "${ALLOYDB_INSTANCE_URI}" \
         --public-ip \
-        --port="${ALLOYDB_PORT:-8104}"
+        --port="${ALLOYDB_PORT:-9113}"
 else
     echo "==> USE_ALLOYDB=false (default): Starting local PostgreSQL container <=="
 
@@ -80,8 +80,16 @@ else
     # preflight_infra() in sim.py already starts all containers
     # (docker compose up -d). We just follow the logs to keep the
     # Honcho process alive and forward signals for a clean shutdown.
+    COMPOSE_FILE="docker-compose.yml"
+    SLOT_FILE="${ROOT_DIR}/.port-slot"
+    if [ -f "${SLOT_FILE}" ]; then
+        SLOT_VAL="$(tr -d '[:space:]' < "${SLOT_FILE}")"
+        if [ -n "${SLOT_VAL}" ] && [ "${SLOT_VAL}" -gt 0 ] 2>/dev/null && [ -f "${ROOT_DIR}/docker-compose.override.yml" ]; then
+            COMPOSE_FILE="docker-compose.override.yml"
+        fi
+    fi
     while true; do
-        docker compose logs -f postgres || true
+        docker compose -f "${ROOT_DIR}/${COMPOSE_FILE}" logs -f postgres || true
         sleep 2
     done
 fi

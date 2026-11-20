@@ -24,8 +24,11 @@ leadership-domain naming (scenarios instead of routes, persona instead of city).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import logging
+import math
 import os
+from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
 
@@ -33,6 +36,8 @@ from agents.leadership_planner_with_memory.memory.schemas import PlannedScenario
 from agents.leadership_planner_with_memory.memory.store_alloydb import (
     AlloyDBScenarioStore,
 )
+from agents.utils import simulation_registry
+from agents.utils import tenant_keys
 
 
 logger = logging.getLogger(__name__)
@@ -76,42 +81,99 @@ def _scenario_to_dict(scenario: PlannedScenario) -> dict:
 #   - "user":      ADK's hardcoded fallback when no user_id is provided
 #   - "local-dev": local development convenience value
 #   - "":          empty string from missing/blank header
-_ANONYMOUS_USER_IDS = frozenset({"anonymous", "default", "user", "local-dev", ""})
+_ANONYMOUS_USER_IDS = frozenset(
+    {"anonymous", "default", "user", "local-dev", "simulation", "simulation_user", ""}
+)
 
 
 def _resolve_owner_id(tool_context: ToolContext | None) -> str | None:
     """Return the per-user owner_id for the current tool invocation.
 
-    Per-user isolation is opt-in via the ``LEADERSHIP_PER_USER_ISOLATION``
-    env var. This mirrors the Go gateway's ``SAAS_MODE`` switch — when the
-    flag is off (the default for ``make start``), every store call uses
-    ``owner_id=None`` and `make start` behaves byte-identically. When on,
-    the resolved ``user_id`` from the ADK session is used as the owner.
+    Per-user isolation is enabled whenever ``SAAS_MODE=on`` OR
+    ``LEADERSHIP_PER_USER_ISOLATION=on``. When both flags are off, every
+    store call uses ``owner_id=None`` (legacy single-tenant path).
 
-    Returns ``None`` (legacy single-tenant fall-through) when any of the
-    following hold:
+    Resolution order when isolation is enabled:
+      1. ``tool_context.session.user_id``
+      2. ``tool_context.state`` (``user_id``, ``acting_user_id``, ``userId``,
+         ``tenant.user_id``)
+      3. ``simulation_registry.get_current_user_id()``
 
-    * ``LEADERSHIP_PER_USER_ISOLATION`` is unset / not "on".
-    * ``tool_context`` is ``None`` (some tools accept it as optional).
-    * ``tool_context.session`` is missing.
-    * ``session.user_id`` is empty or matches a known anonymous fixture
-      value (``"anonymous"``, ``"default"``, ``"local-dev"``).
-      This prevents a generic ADK demo user from accidentally locking
-      data behind a shared owner key.
+    When ``SAAS_MODE=on`` and no valid non-anonymous ``user_id`` can be
+    resolved (or component validation fails), raises ``PermissionError`` /
+    ``ValueError`` instead of returning ``None`` (fail closed). When
+    ``SAAS_MODE=off`` and only ``LEADERSHIP_PER_USER_ISOLATION=on``,
+    returns ``None`` for missing/anonymous sessions to preserve legacy
+    compatibility.
     """
-    if os.environ.get("LEADERSHIP_PER_USER_ISOLATION", "").lower() != "on":
+    saas_on = tenant_keys._saas_mode_enabled()
+    flag_on = os.environ.get("LEADERSHIP_PER_USER_ISOLATION", "").strip().lower() == "on"
+    if not saas_on and not flag_on:
         return None
+
+    candidates: list[object] = []
+    if tool_context is not None:
+        session = getattr(tool_context, "session", None)
+        if session is not None:
+            candidates.append(getattr(session, "user_id", None))
+        state = _get_state(tool_context)
+        if state is not None:
+            for key in ("user_id", "acting_user_id", "userId"):
+                candidates.append(state.get(key))
+            tenant = state.get("tenant")
+            if isinstance(tenant, Mapping):
+                candidates.append(tenant.get("user_id"))
+    candidates.append(simulation_registry.get_current_user_id())
+
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            continue
+        if saas_on:
+            tenant_keys._validate_component(cleaned, "user_id")
+        return cleaned
+
+    if saas_on:
+        raise PermissionError("Authenticated user_id is required for memory access when SAAS_MODE=on")
+    return None
+
+
+def _get_state(tool_context: ToolContext | None) -> Any | None:
+    """Safely extract a dict-like session state object from *tool_context*."""
     if tool_context is None:
         return None
-    session = getattr(tool_context, "session", None)
-    if session is None:
+    state = getattr(tool_context, "state", None)
+    if state is None or not hasattr(state, "get"):
         return None
-    uid = getattr(session, "user_id", None)
-    if not isinstance(uid, str):
+    return state
+
+
+def _parse_valid_score(raw: object) -> int | None:
+    """Parse a numeric score into a finite int, rejecting bool/None/NaN/Inf/overflow."""
+    if raw is None or isinstance(raw, bool):
         return None
-    if uid.strip().lower() in _ANONYMOUS_USER_IDS:
+    if isinstance(raw, int):
+        return raw
+    try:
+        fv = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
         return None
-    return uid
+    if not math.isfinite(fv):
+        return None
+    return int(round(fv))
+
+
+def _parse_finite_float_score(raw: object) -> float | None:
+    """Coerce an int/float score into a finite float, rejecting bool/overflow."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        fv = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return fv if math.isfinite(fv) else None
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +181,7 @@ def _resolve_owner_id(tool_context: ToolContext | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def store_scenario(tool_context: ToolContext) -> dict:
+async def store_scenario(tool_context: ToolContext | None) -> dict:
     """Persist the currently-active leadership scenario from session state.
 
     Reads the scenario from session state (set by design_leadership_scenario)
@@ -133,7 +195,13 @@ async def store_scenario(tool_context: ToolContext) -> dict:
     Returns:
         dict with scenario_id and status.
     """
-    scenario_state = tool_context.state.get("leadership_scenario")
+    state = _get_state(tool_context)
+    if state is None:
+        return {
+            "status": "error",
+            "message": "No leadership scenario found (session state unavailable). Run 'design_leadership_scenario' first.",
+        }
+    scenario_state = state.get("leadership_scenario")
     if not isinstance(scenario_state, dict) or not scenario_state:
         return {
             "status": "error",
@@ -144,13 +212,11 @@ async def store_scenario(tool_context: ToolContext) -> dict:
     # unscored scenario is refused so the Organizer card never renders
     # "—" for the overall score (see prompts.py STORED card template).
     # The caller MUST run `evaluate_leadership_plan` before `store_scenario`.
-    eval_result = tool_context.state.get("leadership_evaluation")
+    eval_result = state.get("leadership_evaluation")
     eval_result_dict: dict | None = eval_result if isinstance(eval_result, dict) and eval_result else None
     eval_score: float | None = None
     if eval_result_dict is not None:
-        score = eval_result_dict.get("overall_score")
-        if isinstance(score, (int, float)):
-            eval_score = float(score)
+        eval_score = _parse_finite_float_score(eval_result_dict.get("overall_score"))
     if eval_score is None or eval_score <= 0:
         logger.warning(
             "store_scenario: refusing to store unscored scenario (no numeric "
@@ -167,12 +233,15 @@ async def store_scenario(tool_context: ToolContext) -> dict:
 
     # Shallow-copy before merging so we don't mutate session state in place.
     scenario = dict(scenario_state)
-    pathway = tool_context.state.get("consensus_pathway_active")
+    pathway = state.get("consensus_pathway_active")
     if pathway:
         scenario["_consensus_pathway_active"] = pathway
 
-    persona = tool_context.state.get("selected_persona", "pragmatist")
-    owner_id = _resolve_owner_id(tool_context)
+    persona = state.get("selected_persona", "pragmatist")
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
 
     scenario_id = await _store.store_scenario(
         scenario_data=scenario,
@@ -182,7 +251,8 @@ async def store_scenario(tool_context: ToolContext) -> dict:
         owner_id=owner_id,
     )
 
-    tool_context.state["active_scenario_id"] = scenario_id
+    if hasattr(state, "__setitem__"):
+        state["active_scenario_id"] = scenario_id
     logger.info("store_scenario: stored scenario %s (persona=%s)", scenario_id, persona)
 
     # ── Auto-persist stakeholder artifacts (safety net for Step 13) ─────
@@ -197,22 +267,27 @@ async def store_scenario(tool_context: ToolContext) -> dict:
     # the flush fails, so a persistence hiccup never blocks the primary
     # store_scenario return path.
     autoflushed_keys: list[str] = []
+    autoflush_error: str | None = None
     try:
         artifacts_bundle: dict = {}
         for key in _ARTIFACT_STATE_KEYS:
             if key == "stakeholder_interview":
                 # Check plural key first (accumulated list), then singular.
-                interviews = tool_context.state.get("stakeholder_interviews")
+                interviews = state.get("stakeholder_interviews")
                 if interviews is not None:
-                    artifacts_bundle["stakeholder_interview"] = interviews
+                    artifacts_bundle["stakeholder_interview"] = (
+                        interviews if isinstance(interviews, list) else [interviews]
+                    )
                     autoflushed_keys.append("stakeholder_interview")
                 else:
-                    value = tool_context.state.get("stakeholder_interview")
+                    value = state.get("stakeholder_interview")
                     if value is not None:
-                        artifacts_bundle["stakeholder_interview"] = [value]
+                        artifacts_bundle["stakeholder_interview"] = (
+                            value if isinstance(value, list) else [value]
+                        )
                         autoflushed_keys.append("stakeholder_interview")
                 continue
-            value = tool_context.state.get(key)
+            value = state.get(key)
             if value is not None:
                 artifacts_bundle[key] = value
                 autoflushed_keys.append(key)
@@ -230,6 +305,10 @@ async def store_scenario(tool_context: ToolContext) -> dict:
                     scenario_id,
                     owner_id,
                 )
+                autoflush_error = (
+                    f"Artifact auto-flush did not persist for scenario {scenario_id} "
+                    "(row not found or owner mismatch)."
+                )
                 autoflushed_keys = []
             else:
                 logger.info(
@@ -239,25 +318,29 @@ async def store_scenario(tool_context: ToolContext) -> dict:
                     scenario_id,
                     ",".join(autoflushed_keys),
                 )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "store_scenario: artifact auto-flush failed for scenario %s "
             "(non-fatal — the explicit store_stakeholder_artifacts step "
             "can still recover it)",
             scenario_id,
         )
+        autoflush_error = f"Artifact auto-flush failed: {exc}"
         autoflushed_keys = []
 
-    return {
+    result: dict = {
         "status": "success",
         "scenario_id": scenario_id,
         "artifacts_autoflushed": autoflushed_keys,
     }
+    if autoflush_error is not None:
+        result["artifacts_autoflush_error"] = autoflush_error
+    return result
 
 
 async def record_scenario_outcome(
     scenario_id: str,
-    tool_context: ToolContext,
+    tool_context: ToolContext | None,
 ) -> dict:
     """Attach simulation results to a stored leadership scenario.
 
@@ -268,7 +351,16 @@ async def record_scenario_outcome(
     Returns:
         dict with status.
     """
-    parsed_result = tool_context.state.get("simulation_result")
+    state = _get_state(tool_context)
+    if state is None:
+        return {
+            "status": "error",
+            "message": (
+                "No simulation_result in session state (session state unavailable). "
+                "Call submit_plan_to_simulator(action='execute') first."
+            ),
+        }
+    parsed_result = state.get("simulation_result")
     if not isinstance(parsed_result, dict):
         return {
             "status": "error",
@@ -277,10 +369,15 @@ async def record_scenario_outcome(
             ),
         }
 
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
     sim_id = await _store.record_simulation(
         scenario_id=scenario_id,
         simulation_result=parsed_result,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
 
     if sim_id is None:
@@ -291,19 +388,17 @@ async def record_scenario_outcome(
     # evaluation now using whatever the current session state holds.
     # update_evaluation() uses COALESCE semantics — it never overwrites
     # an existing non-null score, preserving the audit trail.
-    eval_result = tool_context.state.get("leadership_evaluation")
+    eval_result = state.get("leadership_evaluation")
     eval_result_dict: dict | None = eval_result if isinstance(eval_result, dict) and eval_result else None
     eval_score: float | None = None
     if eval_result_dict is not None:
-        score = eval_result_dict.get("overall_score")
-        if isinstance(score, (int, float)):
-            eval_score = float(score)
+        eval_score = _parse_finite_float_score(eval_result_dict.get("overall_score"))
     if eval_score is not None or eval_result_dict is not None:
         updated = await _store.update_evaluation(
             scenario_id=scenario_id,
             evaluation_score=eval_score,
             evaluation_result=eval_result_dict,
-            owner_id=_resolve_owner_id(tool_context),
+            owner_id=owner_id,
         )
         if updated:
             logger.info(
@@ -331,7 +426,7 @@ _ARTIFACT_STATE_KEYS: tuple[str, ...] = (
 )
 
 
-async def store_stakeholder_artifacts(tool_context: ToolContext) -> dict:
+async def store_stakeholder_artifacts(tool_context: ToolContext | None) -> dict:
     """Persist the stakeholder-artifact bundle for the active scenario.
 
     Collects whichever of the six artifact state keys --
@@ -355,7 +450,17 @@ async def store_stakeholder_artifacts(tool_context: ToolContext) -> dict:
         ``artifact_keys_stored`` (the subset of the six state keys that
         were present and persisted on this call).
     """
-    scenario_id = tool_context.state.get("active_scenario_id")
+    state = _get_state(tool_context)
+    if state is None:
+        return {
+            "status": "error",
+            "message": (
+                "No active_scenario_id in session state (session state unavailable). "
+                "Call `store_scenario` first to persist the scenario before "
+                "flushing its stakeholder artifacts."
+            ),
+        }
+    scenario_id = state.get("active_scenario_id")
     if not scenario_id:
         return {
             "status": "error",
@@ -373,18 +478,22 @@ async def store_stakeholder_artifacts(tool_context: ToolContext) -> dict:
             # Collect all interviews (list) or fall back to scalar.
             # Use singular key "stakeholder_interview" to match
             # _ARTIFACT_KEYS in store_alloydb.py / store.py.
-            interviews = tool_context.state.get("stakeholder_interviews")
+            interviews = state.get("stakeholder_interviews")
             if interviews is not None:
-                artifacts["stakeholder_interview"] = interviews
+                artifacts["stakeholder_interview"] = (
+                    interviews if isinstance(interviews, list) else [interviews]
+                )
                 keys_stored.append("stakeholder_interview")
             else:
-                value = tool_context.state.get("stakeholder_interview")
+                value = state.get("stakeholder_interview")
                 if value is not None:
-                    artifacts["stakeholder_interview"] = [value]
+                    artifacts["stakeholder_interview"] = (
+                        value if isinstance(value, list) else [value]
+                    )
                     keys_stored.append("stakeholder_interview")
             continue
 
-        value = tool_context.state.get(key)
+        value = state.get(key)
         if value is None:
             continue
         artifacts[key] = value
@@ -401,10 +510,15 @@ async def store_stakeholder_artifacts(tool_context: ToolContext) -> dict:
             ),
         }
 
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
     ok = await _store.store_artifacts(
         scenario_id=scenario_id,
         artifacts=artifacts,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
     if not ok:
         return {
@@ -431,7 +545,7 @@ async def store_stakeholder_artifacts(tool_context: ToolContext) -> dict:
 
 async def recall_stakeholder_artifacts(
     scenario_id: str,
-    tool_context: ToolContext,
+    tool_context: ToolContext | None,
 ) -> dict:
     """Rehydrate the stakeholder-artifact bundle for ``scenario_id``.
 
@@ -452,9 +566,14 @@ async def recall_stakeholder_artifacts(
         dict that was loaded), and ``rehydrated_keys`` (the subset
         written back into session state).
     """
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc), "scenario_id": scenario_id}
+
     artifacts = await _store.get_artifacts(
         scenario_id=scenario_id,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
     if not artifacts:
         return {
@@ -466,17 +585,21 @@ async def recall_stakeholder_artifacts(
         }
 
     rehydrated: list[str] = []
-    for key in _ARTIFACT_STATE_KEYS:
-        value = artifacts.get(key)
-        if value is None:
-            continue
-        tool_context.state[key] = value
-        rehydrated.append(key)
+    state = _get_state(tool_context)
+    if state is not None and hasattr(state, "__setitem__"):
+        for key in _ARTIFACT_STATE_KEYS:
+            value = artifacts.get(key)
+            if value is None:
+                continue
+            state[key] = value
+            if key == "stakeholder_interview" and isinstance(value, list):
+                state["stakeholder_interviews"] = list(value)
+            rehydrated.append(key)
 
-    # Also mark the recalled scenario as active so subsequent tools that
-    # rely on `active_scenario_id` (e.g. record_scenario_outcome,
-    # store_stakeholder_artifacts) target the right row.
-    tool_context.state["active_scenario_id"] = scenario_id
+        # Also mark the recalled scenario as active so subsequent tools that
+        # rely on `active_scenario_id` (e.g. record_scenario_outcome,
+        # store_stakeholder_artifacts) target the right row.
+        state["active_scenario_id"] = scenario_id
 
     logger.info(
         "recall_stakeholder_artifacts: rehydrated %d keys for scenario %s (%s)",
@@ -490,6 +613,34 @@ async def recall_stakeholder_artifacts(
         "artifacts": artifacts,
         "rehydrated_keys": rehydrated,
     }
+
+
+def _clamp_limit(raw: object, default: int = 10, max_limit: int = 500) -> int:
+    """Coerce and clamp an LLM-supplied count/limit parameter to [1, max_limit]."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return default
+        val = int(round(raw))
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return default
+        try:
+            fv = float(s)
+        except (ValueError, OverflowError):
+            return default
+        if not math.isfinite(fv):
+            return default
+        val = int(round(fv))
+    else:
+        return default
+    if val < 1:
+        return default
+    return min(val, max_limit)
 
 
 async def recall_scenarios(
@@ -507,10 +658,16 @@ async def recall_scenarios(
     Returns:
         dict with scenarios list.
     """
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc), "count": 0, "scenarios": []}
+
+    safe_count = _clamp_limit(count, default=10, max_limit=500)
     scenarios = await _store.recall_scenarios(
-        count=count,
+        count=safe_count,
         sort_by=sort_by,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
     return {
         "status": "success",
@@ -538,31 +695,37 @@ async def get_scenario(
         ``{"status": "success", "scenario": {...}}`` or
         ``{"status": "error", "message": "..."}``.
     """
-    scenario = await _store.get_scenario(scenario_id, owner_id=_resolve_owner_id(tool_context))
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    scenario = await _store.get_scenario(scenario_id, owner_id=owner_id)
     if scenario is None:
         return {"status": "error", "message": f"Scenario {scenario_id} not found."}
 
     result = {"status": "success", "scenario": _scenario_to_dict(scenario)}
 
-    if activate_scenario and tool_context:
-        tool_context.state["leadership_scenario"] = scenario.scenario_data
-        tool_context.state["active_scenario_id"] = scenario.scenario_id
-        tool_context.state["selected_persona"] = scenario.persona or "pragmatist"
+    state = _get_state(tool_context)
+    if activate_scenario and state is not None and hasattr(state, "__setitem__"):
+        state["leadership_scenario"] = scenario.scenario_data
+        state["active_scenario_id"] = scenario.scenario_id
+        state["selected_persona"] = scenario.persona or "pragmatist"
         # Restore consensus pathway if bundled during store_scenario
         if isinstance(scenario.scenario_data, dict):
             pathway = scenario.scenario_data.get("_consensus_pathway_active")
             if pathway:
-                tool_context.state["consensus_pathway_active"] = pathway
+                state["consensus_pathway_active"] = pathway
         # Restore evaluation data
         if scenario.evaluation_score is not None:
-            tool_context.state["leadership_evaluation"] = {
+            state["leadership_evaluation"] = {
                 **(scenario.evaluation_result or {}),
                 "overall_score": scenario.evaluation_score,
             }
-            tool_context.state["evaluation_result"] = tool_context.state["leadership_evaluation"]
+            state["evaluation_result"] = state["leadership_evaluation"]
         elif scenario.evaluation_result:
-            tool_context.state["leadership_evaluation"] = scenario.evaluation_result
-            tool_context.state["evaluation_result"] = scenario.evaluation_result
+            state["leadership_evaluation"] = scenario.evaluation_result
+            state["evaluation_result"] = scenario.evaluation_result
         result["activated"] = True
         logger.info(
             "get_scenario: activated scenario %s into session state",
@@ -581,7 +744,12 @@ async def get_best_scenario(tool_context: ToolContext | None = None) -> dict:
     Returns:
         dict with the best scenario.
     """
-    scenario = await _store.get_best_scenario(owner_id=_resolve_owner_id(tool_context))
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    scenario = await _store.get_best_scenario(owner_id=owner_id)
     if scenario is None:
         return {"status": "error", "message": "No scenarios stored."}
     return {"status": "success", "scenario": _scenario_to_dict(scenario)}
@@ -607,12 +775,16 @@ async def get_planned_scenarios_data(
         ``{"status": "success", "count": N, "scenarios": [...]}``
         or ``{"status": "error", "message": "..."}``.
     """
-    owner_id = _resolve_owner_id(tool_context)
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
     if scenario_ids:
         scenarios = list(await asyncio.gather(*(_store.get_scenario(sid, owner_id=owner_id) for sid in scenario_ids)))
         scenarios = [s for s in scenarios if s]
     else:
-        scenarios = await _store.recall_scenarios(count=limit, sort_by="recent", owner_id=owner_id)
+        safe_limit = _clamp_limit(limit, default=5, max_limit=500)
+        scenarios = await _store.recall_scenarios(count=safe_limit, sort_by="recent", owner_id=owner_id)
 
     if not scenarios:
         return {"status": "error", "message": "No scenarios found."}
@@ -681,6 +853,57 @@ async def get_planned_scenarios_data(
 # Keep the two in sync when either changes.
 
 
+async def _resolve_a2ui_emit_target(
+    tool_context: ToolContext | None,
+    owner_id: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Resolve (mapped_session_id, simulation_id, user_id) for Organizer A2UI emission."""
+    from agents.utils.communication import resolve_tool_context_user_id
+
+    raw_sid = getattr(getattr(tool_context, "session", None), "id", None) if tool_context is not None else None
+    raw_session_id = raw_sid.strip() if isinstance(raw_sid, str) and raw_sid.strip() else "default"
+
+    state_obj = _get_state(tool_context)
+    raw_sim_id = state_obj.get("simulation_id") if state_obj is not None else None
+    if isinstance(raw_sim_id, str):
+        cleaned_sim = raw_sim_id.strip()
+        simulation_id = cleaned_sim if cleaned_sim and cleaned_sim != "\u2014" else None
+    else:
+        simulation_id = None
+
+    try:
+        uid = resolve_tool_context_user_id(tool_context, require_when_saas=False)
+    except ValueError as exc:
+        logger.warning("leadership_memory: invalid user_id context for A2UI emit: %s", exc)
+        uid = None
+
+    if uid is None and isinstance(owner_id, str):
+        cleaned_owner = owner_id.strip()
+        if cleaned_owner and cleaned_owner.lower() not in _ANONYMOUS_USER_IDS:
+            if tenant_keys._saas_mode_enabled():
+                try:
+                    uid = tenant_keys._validate_component(cleaned_owner, "user_id")
+                except ValueError:
+                    uid = None
+            else:
+                uid = cleaned_owner
+
+    mapped_session_id = raw_session_id
+    if raw_session_id != "default":
+        try:
+            ctx_id = (
+                await simulation_registry.get_context_id(raw_session_id, user_id=uid)
+                if uid is not None
+                else await simulation_registry.get_context_id(raw_session_id)
+            )
+            if ctx_id:
+                mapped_session_id = ctx_id
+        except ValueError as exc:
+            logger.debug("leadership_memory: skipped context_id lookup for %s (%s)", raw_session_id, exc)
+
+    return mapped_session_id, simulation_id, uid
+
+
 async def emit_scenario_list_a2ui(
     tool_context: ToolContext,
     limit: int = 3,
@@ -699,12 +922,12 @@ async def emit_scenario_list_a2ui(
     """
     from agents.utils.pulses import emit_gateway_message
 
-    if not isinstance(limit, int) or limit < 1:
-        limit = 3
-    if limit > 20:
-        limit = 20
+    limit = _clamp_limit(limit, default=3, max_limit=20)
 
-    owner_id = _resolve_owner_id(tool_context)
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
     scenarios = await _store.recall_scenarios(
         count=limit, sort_by="best_score", owner_id=owner_id
     )
@@ -738,10 +961,10 @@ async def emit_scenario_list_a2ui(
                 "root": "empty-root",
             }
         }
-        session_id = tool_context.session.id
-        simulation_id = tool_context.state.get("simulation_id")
+        session_id, simulation_id, uid = await _resolve_a2ui_emit_target(tool_context, owner_id=owner_id)
         origin = {"type": "agent", "id": "organizer", "session_id": session_id}
         destination = [session_id]
+        emit_kwargs: dict[str, Any] = {"user_id": uid} if uid is not None else {}
         try:
             await emit_gateway_message(
                 origin=origin,
@@ -751,6 +974,7 @@ async def emit_scenario_list_a2ui(
                 event="a2ui",
                 data=empty_card,
                 simulation_id=simulation_id,
+                **emit_kwargs,
             )
             await emit_gateway_message(
                 origin=origin,
@@ -760,6 +984,7 @@ async def emit_scenario_list_a2ui(
                 event="a2ui",
                 data=begin_rendering,
                 simulation_id=simulation_id,
+                **emit_kwargs,
             )
         except Exception:
             logger.error(
@@ -792,11 +1017,8 @@ async def emit_scenario_list_a2ui(
             )
             scount = sc.scenario_data.get("stakeholder_count", "\u2014")
 
-        score_str = (
-            str(int(sc.evaluation_score))
-            if sc.evaluation_score is not None
-            else "\u2014"
-        )
+        parsed_overall = _parse_valid_score(sc.evaluation_score)
+        score_str = str(parsed_overall) if parsed_overall is not None else "\u2014"
 
         # Sub-scores + findings only when present ─ per hard-rule "no invented values".
         eval_scores: dict = {}
@@ -988,12 +1210,8 @@ async def emit_scenario_list_a2ui(
             ("rs", "resource_stewardship",  "Resource Stewardship"),
         ]
         for id_prefix, db_key, label in subscore_defs:
-            raw = eval_scores.get(db_key)
-            if raw is None:
-                continue
-            try:
-                val = int(raw)
-            except (TypeError, ValueError):
+            val = _parse_valid_score(eval_scores.get(db_key))
+            if val is None:
                 continue
             components.append(
                 {
@@ -1202,10 +1420,10 @@ async def emit_scenario_list_a2ui(
         }
     }
 
-    session_id = tool_context.session.id
-    simulation_id = tool_context.state.get("simulation_id")
+    session_id, simulation_id, uid = await _resolve_a2ui_emit_target(tool_context, owner_id=owner_id)
     origin = {"type": "agent", "id": "organizer", "session_id": session_id}
     destination = [session_id]
+    emit_kwargs: dict[str, Any] = {"user_id": uid} if uid is not None else {}
 
     _emit_step = "surfaceUpdate"
     try:
@@ -1217,6 +1435,7 @@ async def emit_scenario_list_a2ui(
             event="a2ui",
             data=surface_update,
             simulation_id=simulation_id,
+            **emit_kwargs,
         )
         _emit_step = "beginRendering"
         await emit_gateway_message(
@@ -1227,6 +1446,7 @@ async def emit_scenario_list_a2ui(
             event="a2ui",
             data=begin_rendering,
             simulation_id=simulation_id,
+            **emit_kwargs,
         )
     except Exception:
         logger.error(
@@ -1255,17 +1475,18 @@ def _short_id(scenario_id: str) -> str:
 
     * UUIDs (``a1b2c3d4-...``)  →  ``a1b2c3d4`` (first 8 chars)
     * Seed rows (``seed-leadership-002``)  →  ``leadership-002``
-      (everything after the leading ``seed-`` prefix, then last 12 chars)
+      (everything after the leading ``seed-`` prefix if <=16 chars, else
+      last 12 chars so distinct trailing suffixes never collapse)
 
-    The old ``scenario_id[:4]`` implementation rendered every seed row
-    as ``#seed`` in the Organizer, which was worse than useless.
+    The old ``scenario_id[:4]`` / ``stripped[:12]`` implementation collapsed
+    all seed rows into ``#seed`` or ``#leadership-0`` in the Organizer.
     """
     if not isinstance(scenario_id, str) or not scenario_id:
         return ""
-    stripped = scenario_id[5:] if scenario_id.startswith("seed-") else scenario_id
-    # For UUIDs the leading 8 chars are the standard short form; for
-    # seed rows the last 12 chars keep the human-readable slug.
-    return stripped[:12] if "-" in stripped else stripped[:8]
+    if scenario_id.startswith("seed-"):
+        stripped = scenario_id[5:]
+        return stripped if len(stripped) <= 16 else stripped[-12:]
+    return scenario_id[:8]
 
 
 def _extract_scenario_id(text: str) -> str | None:
@@ -1344,7 +1565,10 @@ async def emit_scenario_detail_a2ui(
     if scenario_id in {"__list__", "list", "__back__"}:
         return await emit_scenario_list_a2ui(tool_context, limit=3)
 
-    owner_id = _resolve_owner_id(tool_context)
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
     scenario = await _store.get_scenario(scenario_id, owner_id=owner_id)
     if scenario is None:
         return {
@@ -1352,13 +1576,24 @@ async def emit_scenario_detail_a2ui(
             "message": f"Scenario {scenario_id} not found for this user.",
         }
 
-    if isinstance(getattr(tool_context, "state", None), dict) and not tool_context.state.get("leadership_scenario"):
-        tool_context.state["leadership_scenario"] = scenario.scenario_data
-        tool_context.state["active_scenario_id"] = scenario.scenario_id
-        if scenario.evaluation_result:
-            tool_context.state["leadership_evaluation"] = scenario.evaluation_result
-        elif scenario.evaluation_score is not None:
-            tool_context.state["leadership_evaluation"] = {"overall_score": scenario.evaluation_score}
+    state_obj = getattr(tool_context, "state", None) if tool_context else None
+    if state_obj is not None and hasattr(state_obj, "get") and hasattr(state_obj, "__setitem__"):
+        state_obj["leadership_scenario"] = scenario.scenario_data
+        state_obj["active_scenario_id"] = scenario.scenario_id
+        if isinstance(scenario.scenario_data, dict):
+            bundled_pw = scenario.scenario_data.get("_consensus_pathway_active")
+            if isinstance(bundled_pw, dict):
+                state_obj["consensus_pathway_active"] = bundled_pw
+        if scenario.evaluation_score is not None:
+            merged_eval = {
+                **(scenario.evaluation_result if isinstance(scenario.evaluation_result, dict) else {}),
+                "overall_score": scenario.evaluation_score,
+            }
+            state_obj["leadership_evaluation"] = merged_eval
+            state_obj["evaluation_result"] = merged_eval
+        elif scenario.evaluation_result:
+            state_obj["leadership_evaluation"] = scenario.evaluation_result
+            state_obj["evaluation_result"] = scenario.evaluation_result
 
     # ── PATHWAY-ONLY MODE ───────────────────────────────────────────────
     # User explicitly does NOT want the Organizer detail card. Clicking
@@ -1378,10 +1613,10 @@ async def emit_scenario_detail_a2ui(
             if candidate:
                 pathway_geojson = candidate
 
-    session_id = tool_context.session.id
-    simulation_id = tool_context.state.get("simulation_id")
+    session_id, simulation_id, uid = await _resolve_a2ui_emit_target(tool_context, owner_id=owner_id)
     origin = {"type": "agent", "id": "organizer", "session_id": session_id}
     destination = [session_id]
+    emit_kwargs: dict[str, Any] = {"user_id": uid} if uid is not None else {}
 
     if pathway_geojson is not None:
         try:
@@ -1402,6 +1637,7 @@ async def emit_scenario_detail_a2ui(
                     },
                 },
                 simulation_id=simulation_id,
+                **emit_kwargs,
             )
             logger.info(
                 "emit_scenario_detail_a2ui: pathway-only mode — emitted "
@@ -1475,8 +1711,9 @@ async def get_selected_scenarios(
             omitted, reads from ``state["selected_context_scenario_ids"]``.
 
     Returns:
-        ``{"status": "success", "count": N, "scenarios": [...]}``, or
-        ``{"status": "none_selected", "message": "...", "scenarios": []}``.
+        ``{"status": "success", "count": N, "scenarios": [...]}``,
+        ``{"status": "none_selected", "message": "...", "scenarios": []}``, or
+        ``{"status": "error", "message": "...", "failed_ids": [...], "scenarios": []}``.
         Never raises.
     """
     # 1. Resolve selected IDs: explicit param → session state.
@@ -1499,27 +1736,48 @@ async def get_selected_scenarios(
             "scenarios": [],
         }
 
-    # 2. Fetch each scenario. Skip missing IDs gracefully.
-    owner_id = _resolve_owner_id(tool_context)
+    # 2. Fetch each scenario. Skip missing IDs (None) gracefully, but track DB/config errors.
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+            "failed_ids": [],
+            "scenarios": [],
+        }
     scenarios: list[dict] = []
+    failed_ids: list[str] = []
+    errors: list[str] = []
     for sid in selected_ids:
         if not isinstance(sid, str) or not sid.strip():
             continue
+        clean_sid = sid.strip()
         try:
             scenario = await _store.get_scenario(
-                scenario_id=sid.strip(), owner_id=owner_id
+                scenario_id=clean_sid, owner_id=owner_id
             )
         except Exception as exc:
             logger.warning(
-                "get_selected_scenarios: failed to fetch %s: %s", sid, exc
+                "get_selected_scenarios: failed to fetch %s: %s", clean_sid, exc
             )
+            failed_ids.append(clean_sid)
+            errors.append(str(exc))
             continue
         if scenario is None:
             logger.debug(
-                "get_selected_scenarios: scenario %s not found (possibly deleted)", sid
+                "get_selected_scenarios: scenario %s not found (possibly deleted)", clean_sid
             )
             continue
         scenarios.append(_scenario_to_dict(scenario))
+
+    if not scenarios and failed_ids:
+        return {
+            "status": "error",
+            "message": f"Failed to load selected scenarios: {errors[0]}",
+            "failed_ids": failed_ids,
+            "scenarios": [],
+        }
 
     if not scenarios:
         return {
@@ -1536,11 +1794,14 @@ async def get_selected_scenarios(
         len(scenarios),
         len(selected_ids),
     )
-    return {
+    result: dict = {
         "status": "success",
         "count": len(scenarios),
         "scenarios": scenarios,
     }
+    if failed_ids:
+        result["failed_ids"] = failed_ids
+    return result
 
 
 

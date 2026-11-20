@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,7 +31,7 @@ from agents.planner_with_eval.tools import start_simulation, submit_plan_to_simu
 logger = logging.getLogger(__name__)
 
 
-def _load_additional_tools(base_skills_dir: pathlib.Path, shared_skills_dir: pathlib.Path) -> list:
+def _load_additional_tools(base_skills_dir: pathlib.Path) -> list:
     """Load skill tool functions as callables for SkillToolset additional_tools.
 
     These tools become available to the LLM only after load_skill activates
@@ -91,14 +93,11 @@ def get_tools() -> list:
     base_planner_dir = pathlib.Path(__file__).parent.parent / "planner"
     base_skills_dir = base_planner_dir / "skills"
 
-    # Load evaluation skills from own skills/ directory (plan-evaluation)
-    local_skills_dir = pathlib.Path(__file__).parent / "skills"
-
     # Load shared skills from the agents/skills/ directory (e.g. a2ui-rendering)
     shared_skills_dir = pathlib.Path(__file__).parent.parent / "skills"
 
     skills = []
-    for skills_dir in [base_skills_dir, local_skills_dir, shared_skills_dir]:
+    for skills_dir in [base_skills_dir, shared_skills_dir]:
         if skills_dir.exists():
             skills.extend(
                 load_skill_from_dir(d)
@@ -106,7 +105,7 @@ def get_tools() -> list:
                 if d.is_dir() and not d.name.startswith("_") and (d / "SKILL.md").exists()
             )
 
-    additional_tools = _load_additional_tools(base_skills_dir, shared_skills_dir)
+    additional_tools = _load_additional_tools(base_skills_dir)
 
     skill_toolset = SkillToolset(
         skills=skills,

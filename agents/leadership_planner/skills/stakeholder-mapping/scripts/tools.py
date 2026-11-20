@@ -99,8 +99,10 @@ async def map_stakeholders(
     enriched_stakeholders: List[Dict[str, Any]] = []
 
     for sh in stakeholders:
+        # Copy before enriching so scenario["echoes"] in session state is not mutated in place.
+        sh_copy = dict(sh)
         # Echoes use 'tier' and 'domain_principles' which map to 'seniority' and 'principles'
-        tier = sh.get("tier", 3)
+        tier = sh_copy.get("tier", 3)
         if tier == 1:
             seniority = "C-Suite"
         elif tier == 2:
@@ -108,17 +110,17 @@ async def map_stakeholders(
         else:
             seniority = "Director"
 
-        sh["seniority"] = seniority
-        sh["principles"] = sh.get("domain_principles", [])
+        sh_copy["seniority"] = seniority
+        sh_copy["principles"] = list(sh_copy.get("domain_principles", []))
 
-        patterns = _BEHAVIORAL_PATTERNS.get(seniority, _BEHAVIORAL_PATTERNS["Senior"])
+        patterns = dict(_BEHAVIORAL_PATTERNS.get(seniority, _BEHAVIORAL_PATTERNS["Senior"]))
 
         enriched = {
-            **sh,
+            **sh_copy,
             "behavioral_patterns": patterns,
-            "alignment_drivers": _compute_alignment_drivers(sh),
-            "resistance_triggers": _compute_resistance_triggers(sh),
-            "coalition_affinity": _compute_coalition_affinity(sh, stakeholders),
+            "alignment_drivers": _compute_alignment_drivers(sh_copy),
+            "resistance_triggers": _compute_resistance_triggers(sh_copy),
+            "coalition_affinity": _compute_coalition_affinity(sh_copy, stakeholders),
         }
         enriched_stakeholders.append(enriched)
 

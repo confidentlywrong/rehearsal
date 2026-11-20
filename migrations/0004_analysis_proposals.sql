@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS analysis_proposals (
     -- one who later approves; we record both — see decided_by).
     -- Multi-tenant filter joins on analyses.operator_id; this column
     -- is here for fast-path audit only.
-    operator_id              TEXT        NOT NULL REFERENCES users(id),
+    operator_id              TEXT        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
     -- Operator-supplied simulation handle. NOT a foreign key — there
     -- is no simulation_runs table in v1 (Step 8 Q1=(a) deferred a
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS analysis_proposals (
 
     -- For edit_node / deprecate_node: the live node the diff applies to.
     -- For add_node: NULL (Phase 6 creates a fresh node).
-    target_node_id           UUID        REFERENCES analysis_nodes(id),
+    target_node_id           UUID        REFERENCES analysis_nodes(id) ON DELETE SET NULL,
 
     -- For add_node: full payload of the new node. For edit_node: sparse
     -- field-overwrite map. For deprecate_node: {}.
@@ -95,18 +95,79 @@ CREATE TABLE IF NOT EXISTS analysis_proposals (
 
     -- Set when status leaves 'pending'.
     decided_at               TIMESTAMPTZ,
-    decided_by               TEXT        REFERENCES users(id),
+    decided_by               TEXT        REFERENCES users(id) ON DELETE SET NULL,
 
     -- For status='accepted': the :Learning node row this proposal
     -- created (Phase 6 institutionalization). NULL otherwise.
-    applied_learning_node_id UUID        REFERENCES analysis_nodes(id),
+    applied_learning_node_id UUID        REFERENCES analysis_nodes(id) ON DELETE SET NULL,
     -- For status='accepted' on add_node / edit_node: the new node row
     -- the proposal wrote (separate from the Learning node so the SPA
     -- can deep-link). NULL for deprecate_node (no new node row).
-    applied_node_id          UUID        REFERENCES analysis_nodes(id),
+    applied_node_id          UUID        REFERENCES analysis_nodes(id) ON DELETE SET NULL,
 
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Upgrade legacy FK constraints on existing databases so EraseUser and
+-- analysis cascade deletes never trip NO ACTION constraint checks.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_proposals_operator_id_fkey'
+           AND conrelid = 'analysis_proposals'::regclass
+           AND confdeltype <> 'c'
+    ) THEN
+        ALTER TABLE analysis_proposals DROP CONSTRAINT analysis_proposals_operator_id_fkey;
+        ALTER TABLE analysis_proposals
+            ADD CONSTRAINT analysis_proposals_operator_id_fkey
+            FOREIGN KEY (operator_id) REFERENCES users(id) ON DELETE CASCADE;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_proposals_decided_by_fkey'
+           AND conrelid = 'analysis_proposals'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_proposals DROP CONSTRAINT analysis_proposals_decided_by_fkey;
+        ALTER TABLE analysis_proposals
+            ADD CONSTRAINT analysis_proposals_decided_by_fkey
+            FOREIGN KEY (decided_by) REFERENCES users(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_proposals_target_node_id_fkey'
+           AND conrelid = 'analysis_proposals'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_proposals DROP CONSTRAINT analysis_proposals_target_node_id_fkey;
+        ALTER TABLE analysis_proposals
+            ADD CONSTRAINT analysis_proposals_target_node_id_fkey
+            FOREIGN KEY (target_node_id) REFERENCES analysis_nodes(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_proposals_applied_learning_node_id_fkey'
+           AND conrelid = 'analysis_proposals'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_proposals DROP CONSTRAINT analysis_proposals_applied_learning_node_id_fkey;
+        ALTER TABLE analysis_proposals
+            ADD CONSTRAINT analysis_proposals_applied_learning_node_id_fkey
+            FOREIGN KEY (applied_learning_node_id) REFERENCES analysis_nodes(id) ON DELETE SET NULL;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'analysis_proposals_applied_node_id_fkey'
+           AND conrelid = 'analysis_proposals'::regclass
+           AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE analysis_proposals DROP CONSTRAINT analysis_proposals_applied_node_id_fkey;
+        ALTER TABLE analysis_proposals
+            ADD CONSTRAINT analysis_proposals_applied_node_id_fkey
+            FOREIGN KEY (applied_node_id) REFERENCES analysis_nodes(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 -- Hot path A: SPA Reflect tab fetching pending proposals for an analysis.
 CREATE INDEX IF NOT EXISTS analysis_proposals_pending_idx

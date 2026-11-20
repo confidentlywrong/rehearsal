@@ -84,7 +84,7 @@ WebSocket handler) for the rationale and the re-enablement checklist
 ### Connecting
 
 ```
-ws://localhost:8101/ws?sessionId=abc-123&simulationId=sim-456
+ws://localhost:9101/ws?sessionId=abc-123&simulationId=sim-456
 ```
 
 - `sessionId` identifies the client for targeted message routing
@@ -176,7 +176,7 @@ is empty post-flush.
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `GATEWAY_PORT` | `8101` | HTTP listen port |
+| `PORT` / `GATEWAY_PORT` | `9101` | HTTP listen port |
 | `REDIS_ADDR` | (required) | Redis connection address |
 | `AGENT_URLS` | (required) | Comma-separated agent base URLs |
 | `MAX_RUNNERS` | `100` | Max runners per spawn batch (clamped to 1-1000) |

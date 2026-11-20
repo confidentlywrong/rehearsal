@@ -64,8 +64,7 @@ type Receiver interface {
 }
 
 // Message is the minimal subset of pubsub.Message the drainer
-// needs. *pubsubMessageAdapter (defined in pubsub_drainer_gcp.go)
-// wraps a real `*pubsub.Message`.
+// needs. *pubsubMessageAdapter wraps a real `*pubsub.Message`.
 type Message interface {
 	Data() []byte
 	Attributes() map[string]string
@@ -88,6 +87,9 @@ func NewPubSubDrainer(receiver Receiver, forwarder EventForwarder) *PubSubDraine
 // Run blocks until ctx is cancelled. Returns the receiver's final
 // error (typically context.Canceled on graceful shutdown).
 func (d *PubSubDrainer) Run(ctx context.Context) error {
+	if d == nil {
+		return errors.New("pubsub drainer: receiver is nil")
+	}
 	if d.forwarder == nil {
 		return errors.New("pubsub drainer: forwarder is nil")
 	}
@@ -97,16 +99,32 @@ func (d *PubSubDrainer) Run(ctx context.Context) error {
 	return d.receiver.Receive(ctx, d.handle)
 }
 
+// log writes via d.logf or falls back to log.Printf when nil.
+func (d *PubSubDrainer) log(format string, args ...any) {
+	if d != nil && d.logf != nil {
+		d.logf(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func (d *PubSubDrainer) now() time.Time {
+	if d != nil && d.clock != nil {
+		return d.clock()
+	}
+	return time.Now().UTC()
+}
+
 // handle is the per-message callback. Exposed (lowercase) so the
 // in-process tests can drive it directly without spinning up a
 // goroutine via Run.
 func (d *PubSubDrainer) handle(ctx context.Context, m Message) {
-	event, err := parsePubSubMessage(m.Data(), d.clock)
+	event, err := parsePubSubMessage(m.Data(), d.now)
 	if err != nil {
 		// Malformed payloads are a developer error, not a transient
 		// failure. Ack to remove from the queue rather than loop
 		// forever; log loud so it's discoverable.
-		d.logf("BILLING_PUBSUB_DRAIN: dropping malformed message: %v", err)
+		d.log("BILLING_PUBSUB_DRAIN: dropping malformed message: %v", err)
 		m.Ack()
 		return
 	}
@@ -118,14 +136,14 @@ func (d *PubSubDrainer) handle(ctx context.Context, m Message) {
 		// log and Ack so it doesn't loop. The event is lost but
 		// surfaced loudly.
 		if isPermanentInsertError(err) {
-			d.logf("BILLING_PUBSUB_DRAIN: dropping event for user=%q: %v", event.UserID, err)
+			d.log("BILLING_PUBSUB_DRAIN: dropping event for user=%q: %v", event.UserID, err)
 			m.Ack()
 			return
 		}
 		// Transient (connection dropped, statement timeout): Nack so
 		// Pub/Sub redelivers. BIGSERIAL absorbs any duplicate insert
 		// on the retry.
-		d.logf("BILLING_PUBSUB_DRAIN: insert event nack: %v", err)
+		d.log("BILLING_PUBSUB_DRAIN: insert event nack: %v", err)
 		m.Nack()
 		return
 	}
@@ -136,7 +154,7 @@ func (d *PubSubDrainer) handle(ctx context.Context, m Message) {
 		// (absorbed by BIGSERIAL), the rollup will eventually
 		// converge. A Phase 7 reconcile job would also catch the
 		// drift.
-		d.logf("BILLING_PUBSUB_DRAIN: upsert rollup nack: %v", err)
+		d.log("BILLING_PUBSUB_DRAIN: upsert rollup nack: %v", err)
 		m.Nack()
 		return
 	}
@@ -171,6 +189,7 @@ func parsePubSubMessage(data []byte, clock func() time.Time) (Event, error) {
 		PromptTokens     *int64  `json:"prompt_tokens"`
 		CompletionTokens *int64  `json:"completion_tokens"`
 		TotalTokens      *int64  `json:"total_tokens"`
+		CostMicros       *int64  `json:"cost_micros"`
 		TimestampISO     string  `json:"timestamp_iso"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -200,6 +219,7 @@ func parsePubSubMessage(data []byte, clock func() time.Time) (Event, error) {
 		PromptTokens:     raw.PromptTokens,
 		CompletionTokens: raw.CompletionTokens,
 		TotalTokens:      raw.TotalTokens,
+		CostMicros:       raw.CostMicros,
 		Timestamp:        ts,
 	}, nil
 }
@@ -241,6 +261,7 @@ func isPermanentInsertError(err error) bool {
 		"foreign key constraint",
 		"violates foreign key",
 		"23503", // PostgreSQL SQLSTATE for FK violation
+		"requires user_id",
 	} {
 		if containsCaseInsensitive(msg, marker) {
 			return true
@@ -295,6 +316,12 @@ func NewPubSubReceiver(ctx context.Context, projectID, subscriptionID string) (*
 // Receive blocks until ctx is cancelled or a fatal error occurs.
 // The handler is invoked concurrently for each message.
 func (r *PubSubReceiver) Receive(ctx context.Context, handler func(context.Context, Message)) error {
+	if r == nil || r.subscriber == nil {
+		return errors.New("pubsub receiver: not initialized")
+	}
+	if handler == nil {
+		return errors.New("pubsub receiver: handler is nil")
+	}
 	return r.subscriber.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
 		handler(ctx, pubsubMessageAdapter{m: m})
 	})
@@ -302,7 +329,7 @@ func (r *PubSubReceiver) Receive(ctx context.Context, handler func(context.Conte
 
 // Close releases the underlying client.
 func (r *PubSubReceiver) Close() error {
-	if r.client == nil {
+	if r == nil || r.client == nil {
 		return nil
 	}
 	return r.client.Close()

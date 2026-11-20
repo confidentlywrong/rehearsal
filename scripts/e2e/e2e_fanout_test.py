@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: update default gateway port to 9101 and await cancelled observer task cleanly.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +48,7 @@ from gen_proto.gateway import gateway_pb2
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8101")
+GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:9101")
 GATEWAY_WS_URL = os.getenv(
     "GATEWAY_WS_URL",
     GATEWAY_HTTP_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws",
@@ -110,10 +112,11 @@ async def spawn_sessions(count: int) -> list[str] | None:
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 status = resp.status
-                data = await resp.json()
                 if status >= 400:
-                    print(f"  [FAIL] Spawn returned HTTP {status}: {data}")
+                    err_text = await resp.text()
+                    print(f"  [FAIL] Spawn returned HTTP {status}: {err_text[:300]}")
                     return None
+                data = await resp.json()
 
                 # Response: {"sessions": [{"sessionId": "...", "agentType": "..."}]}
                 sessions = data.get("sessions", [])
@@ -293,13 +296,19 @@ async def run_test(count: int) -> bool:
         return await send_broadcast(session_ids)
 
     observer_task = asyncio.create_task(collect_responses(count, session_set, COLLECTION_TIMEOUT))
-    broadcast_ok = await delayed_broadcast()
+    try:
+        broadcast_ok = await delayed_broadcast()
 
-    if not broadcast_ok:
-        observer_task.cancel()
-        return False
+        if not broadcast_ok:
+            observer_task.cancel()
+            await asyncio.gather(observer_task, return_exceptions=True)
+            return False
 
-    results = await observer_task
+        results = await observer_task
+    finally:
+        if not observer_task.done():
+            observer_task.cancel()
+            await asyncio.gather(observer_task, return_exceptions=True)
 
     # 4. Report.
     responded = results["responded_sessions"]

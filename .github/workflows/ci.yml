@@ -62,7 +62,7 @@ jobs:
         # Year range tolerates files written 2024-2030 without yearly churn.
         run: |
           go install github.com/google/addlicense@latest
-          addlicense -check -y "2024-2030" -ignore 'LICENSE' -ignore 'gen_proto/**' -ignore 'web/**/node_modules/**' -ignore 'web/**/dist/**' -ignore 'web/**/.angular/**' -ignore '.venv/**' -ignore '.uv_cache/**' -ignore '**/.terraform.lock.hcl' .
+          addlicense -check -y "2024-2030" -ignore 'LICENSE' -ignore 'gen_proto/**' -ignore 'web/**/node_modules/**' -ignore 'web/**/dist/**' -ignore 'web/**/.angular/**' -ignore '.venv/**' -ignore '.uv_cache/**' -ignore '**/.terraform/**' -ignore '**/.terraform.lock.hcl' -ignore 'data/**' .
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
@@ -119,8 +119,19 @@ jobs:
         # and config (yaml/json) linters. Matches what contributors run locally.
         run: make lint
 
+      - name: Lint scripts and embedding backfill
+        run: uv run ruff check scripts/ infra/modules/cloud-sql-postgres/embedding_backfill*.py
+
       - name: Test Python
         env:
           GOOGLE_CLOUD_PROJECT: test-project
           GOOGLE_CLOUD_LOCATION: global
-        run: uv run pytest agents/ -x -q -m "not slow"
+        run: uv run pytest agents/ -x -q -m "not slow and not integration"
+
+      - name: Test Scripts and Embedding Backfill
+        env:
+          GOOGLE_CLOUD_PROJECT: test-project
+          GOOGLE_CLOUD_LOCATION: global
+        run: |
+          uv run pytest scripts/tests/ scripts/deploy/deploy_test.py infra/modules/cloud-sql-postgres/embedding_backfill_test.py -x -q
+          bash scripts/deploy_test.sh

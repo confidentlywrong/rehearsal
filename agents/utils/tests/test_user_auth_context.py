@@ -128,3 +128,20 @@ class TestCapEviction:
         assert user_auth_context.get_session_token("s2") is None
         assert user_auth_context.get_session_token("s3") == "t3"
         assert user_auth_context.get_session_token("s4") == "t4"
+
+
+class TestMalformedTokenRejection:
+    @pytest.mark.parametrize(
+        "bad_token",
+        [
+            "tok\r\ninjected",
+            "tok\ninjected",
+            "tok\x00nul",
+            "tok with spaces",
+            "tok-nonascii-\u00e9",
+        ],
+    )
+    def test_rejects_control_whitespace_and_non_ascii_tokens(self, bad_token: str) -> None:
+        user_auth_context.set_session_token("s-bad", bad_token)
+        assert user_auth_context.get_session_token("s-bad") is None
+        assert user_auth_context._is_valid_bearer_token(bad_token) is False

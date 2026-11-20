@@ -95,8 +95,16 @@ async def test_evaluate_plan_includes_llm_suggestions():
     """evaluate_plan result must include LLM-generated suggestions and summary."""
     from agents.planner_with_eval.evaluator.tools import evaluate_plan
 
-    fake_scores = {"safety_compliance": 80}
-    fake_details = {"safety_compliance": "stub"}
+    fake_scores = {
+        "safety_compliance": 80,
+        "logistics_completeness": 80,
+        "participant_experience": 80,
+        "community_impact": 80,
+        "financial_viability": 80,
+        "intent_alignment": 80,
+        "distance_compliance": 100,
+    }
+    fake_details = {k: "stub" for k in fake_scores}
 
     with patch(
         "agents.planner_with_eval.evaluator.tools._run_custom_eval",
@@ -143,7 +151,7 @@ async def test_realistic_plan_passes_vertex_ai_evaluation():
             }
         )
     )
-    assert result["eval_method"] in ("vertex_ai_eval", "heuristic"), f"Unexpected eval method: {result['eval_method']}"
+    assert result["eval_method"] == "vertex_ai_eval", f"Unexpected eval method: {result['eval_method']}"
     assert result["passed"] is True, (
         f"Realistic plan should pass evaluation (method={result['eval_method']}). Scores: {result['scores']}, Overall: {result['overall_score']}, Findings: {result['findings']}"
     )
@@ -259,3 +267,175 @@ class TestScoreNormalization:
         result = _normalize_score(3.5)
         assert isinstance(result, int)
         assert result == 70
+
+    def test_huge_int_overflow_returns_zero(self):
+        """Regression: 10**400 must not raise OverflowError in float()."""
+        from agents.planner_with_eval.evaluator.tools import _normalize_score
+
+        assert _normalize_score(10**400) == 0
+
+    def test_finite_float_overflow_after_scale_clamps_to_100(self):
+        """Regression: 1e308 * 20 -> inf must clamp to 100 instead of raising OverflowError in round()."""
+        from agents.planner_with_eval.evaluator.tools import _normalize_score
+
+        assert _normalize_score(1e308) == 100
+
+
+class TestEvaluatorNoSilentFallbacks:
+    """Regression tests ensuring evaluator never fabricates scores or feedback on errors."""
+
+    def test_build_result_raises_on_missing_criteria(self):
+        from agents.planner_with_eval.evaluator.tools import _build_result
+
+        with pytest.raises(ValueError, match="Missing evaluation score"):
+            _build_result(
+                scores={"safety_compliance": 80},
+                details={"safety_compliance": "partial"},
+                eval_method="vertex_ai_eval",
+            )
+
+    @pytest.mark.asyncio
+    async def test_whitespace_project_id_raises_runtime_error(self, monkeypatch):
+        from agents.planner_with_eval.evaluator.tools import evaluate_plan
+
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "   ")
+        request = json.dumps({"user_intent": "NYC marathon", "proposed_plan": "26.2 miles"})
+
+        with patch("agents.utils.local_ai.is_local_gemma_active", return_value=False):
+            with pytest.raises(RuntimeError, match="GOOGLE_CLOUD_PROJECT is not set"):
+                await evaluate_plan(request)
+
+    @pytest.mark.asyncio
+    async def test_local_gemma_does_not_copy_overall_score_to_missing_criteria(self):
+        from agents.planner_with_eval.evaluator.tools import evaluate_plan
+
+        # JSON has top-level "score" and only 1 criterion; missing criteria must NOT copy "score".
+        incomplete_json = json.dumps(
+            {
+                "score": 4,
+                "explanation": {"safety_compliance": 4},
+            }
+        )
+        request = json.dumps({"user_intent": "Las Vegas marathon", "proposed_plan": "26.2 miles"})
+
+        with (
+            patch("agents.utils.local_ai.is_local_gemma_active", return_value=True),
+            patch("agents.utils.local_ai.generate_local_json_async", new=AsyncMock(return_value=incomplete_json)),
+        ):
+            result = await evaluate_plan(request)
+
+        assert result["eval_method"] == "error"
+        assert result["passed"] is False
+        assert "logistics_completeness" not in result["scores"]
+        missing_criteria = {f["criterion"] for f in result["findings"]}
+        assert "logistics_completeness" in missing_criteria
+
+    @pytest.mark.asyncio
+    async def test_local_gemma_feedback_failure_returns_error_not_synthetic_suggestions(self):
+        from agents.planner_with_eval.evaluator.tools import evaluate_plan
+
+        complete_scores_json = json.dumps(
+            {
+                "score": 4,
+                "explanation": {
+                    "safety_compliance": 4,
+                    "logistics_completeness": 3,
+                    "participant_experience": 4,
+                    "community_impact": 4,
+                    "financial_viability": 4,
+                    "intent_alignment": 4,
+                },
+            }
+        )
+        request = json.dumps({"user_intent": "Las Vegas marathon", "proposed_plan": "26.2 miles"})
+
+        with (
+            patch("agents.utils.local_ai.is_local_gemma_active", return_value=True),
+            patch("agents.utils.local_ai.generate_local_json_async", new=AsyncMock(return_value=complete_scores_json)),
+            patch(
+                "agents.planner_with_eval.evaluator.tools._generate_feedback",
+                new=AsyncMock(side_effect=RuntimeError("ollama timeout")),
+            ),
+        ):
+            result = await evaluate_plan(request)
+
+        assert result["eval_method"] == "error"
+        assert result["passed"] is False
+        assert result["overall_score"] == 0
+        assert not any(s.startswith("Improve ") for s in result["improvement_suggestions"])
+        assert "Evaluation completed using local Gemma model." not in result.get("summary", "")
+
+    @pytest.mark.asyncio
+    async def test_local_gemma_criterion_overflow_int_does_not_raise_overflow_error(self):
+        """Regression: evaluate_plan local Gemma path must not raise OverflowError when a criterion score is 10**400."""
+        from agents.planner_with_eval.evaluator.tools import evaluate_plan
+
+        overflow_json = json.dumps(
+            {
+                "score": 4,
+                "explanation": {
+                    "safety_compliance": 10**400,
+                    "logistics_completeness": 4,
+                    "participant_experience": 4,
+                    "community_impact": 4,
+                    "financial_viability": 4,
+                    "intent_alignment": 4,
+                },
+            }
+        )
+        request = json.dumps({"user_intent": "Las Vegas marathon", "proposed_plan": "26.2 miles"})
+
+        with (
+            patch("agents.utils.local_ai.is_local_gemma_active", return_value=True),
+            patch("agents.utils.local_ai.generate_local_json_async", new=AsyncMock(return_value=overflow_json)),
+        ):
+            result = await evaluate_plan(request)
+
+        assert result["eval_method"] == "error"
+        assert result["passed"] is False
+        assert "safety_compliance" not in result["scores"]
+
+    @pytest.mark.asyncio
+    async def test_run_custom_eval_criterion_overflow_int_does_not_raise_overflow_error(self):
+        """Regression: _run_custom_eval must not raise OverflowError when explanation JSON has criterion 10**400."""
+        from types import SimpleNamespace
+        from agents.planner_with_eval.evaluator.tools import _run_custom_eval
+
+        overflow_explanation = json.dumps(
+            {
+                "safety_compliance": 10**400,
+                "logistics_completeness": 4,
+                "participant_experience": 4,
+                "community_impact": 4,
+                "financial_viability": 4,
+                "intent_alignment": 4,
+            }
+        )
+        fake_eval_result = SimpleNamespace(
+            eval_case_results=[
+                SimpleNamespace(
+                    response_candidate_results=[
+                        SimpleNamespace(
+                            metric_results={
+                                "distance_compliance": SimpleNamespace(score=5.0, explanation="ok"),
+                                "combined_criteria": SimpleNamespace(explanation=overflow_explanation),
+                            }
+                        )
+                    ]
+                )
+            ]
+        )
+        fake_client = MagicMock()
+        fake_client.evals.evaluate.return_value = fake_eval_result
+
+        with (
+            patch("agents.planner_with_eval.evaluator.tools.vertexai.init"),
+            patch("agents.planner_with_eval.evaluator.tools.vertexai.Client", return_value=fake_client),
+        ):
+            with pytest.raises(RuntimeError, match="Combined metric missing scores for"):
+                await _run_custom_eval(
+                    project_id="test-project",
+                    location="global",
+                    user_intent="Las Vegas marathon",
+                    proposed_plan="26.2 miles",
+                )

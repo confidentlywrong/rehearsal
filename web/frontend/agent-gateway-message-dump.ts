@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: include leadership simulation tick tools in NDJSON replay timing window and burst collapsing.
  */
 
 /**
@@ -246,6 +249,9 @@ export const SIMULATION_GATEWAY_TOOL_NAMES = new Set<string>([
   'fire_start_gun',
   'advance_tick',
   'process_tick',
+  'process_leadership_tick',
+  'process_decision_round_tool',
+  'process_decision_round',
   'check_race_complete',
   'compile_results',
 ]);
@@ -295,7 +301,13 @@ export function isRunnerProcessTickToolEndRow(row: Record<string, unknown>): boo
     return false;
   }
   const d = data as Record<string, unknown>;
-  return d['tool_name'] === 'process_tick';
+  const toolName = d['tool_name'];
+  return (
+    toolName === 'process_tick' ||
+    toolName === 'process_leadership_tick' ||
+    toolName === 'process_decision_round_tool' ||
+    toolName === 'process_decision_round'
+  );
 }
 
 /**

@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,20 +76,36 @@ class TestCloudRunServicesPoolConfig:
         },
         clear=False,
     )
+    def test_invalid_pool_size_raises_value_error(self):
+        """Non-integer DB_POOL_SIZE raises ValueError instead of silently falling back."""
+        import pytest
+        from agents.utils.runtime import _create_cloud_run_services
+
+        os.environ.pop("DB_MAX_OVERFLOW", None)
+        with pytest.raises(ValueError, match="DB_POOL_SIZE"):
+            _create_cloud_run_services()
+
+    @patch.dict(
+        os.environ,
+        {
+            "DATABASE_URL": "postgresql+asyncpg://user:pass@10.0.0.1/db?options=-c%20statement_timeout%3D5000%20-c%20search_path%3Dleadership",
+        },
+        clear=False,
+    )
     @patch("google.adk.sessions.database_session_service.DatabaseSessionService")
-    def test_invalid_pool_size_falls_back_to_default(self, mock_db_svc):
-        """Non-integer DB_POOL_SIZE falls back to default."""
+    def test_preserves_other_c_options_when_extracting_search_path(self, mock_db_svc):
+        """Extracting search_path from options preserves unrelated -c options."""
+        os.environ.pop("DB_POOL_SIZE", None)
         os.environ.pop("DB_MAX_OVERFLOW", None)
 
         from agents.utils.runtime import _create_cloud_run_services
 
         _create_cloud_run_services()
 
-        mock_db_svc.assert_called_once_with(
-            db_url="postgresql+asyncpg://user:pass@10.0.0.1/db",
-            pool_size=20,
-            max_overflow=20,
-        )
+        call_kwargs = mock_db_svc.call_args.kwargs
+        assert call_kwargs["connect_args"] == {"server_settings": {"search_path": "leadership"}}
+        assert "statement_timeout" in call_kwargs["db_url"]
+        assert "search_path" not in call_kwargs["db_url"]
 
 
 class TestSessionStoreOverride:
@@ -196,17 +214,14 @@ class TestSessionStoreOverride:
         },
         clear=False,
     )
-    def test_redis_override_malformed_port_falls_back(self):
-        """Malformed port in REDIS_ADDR falls back to 6379."""
-        from google.adk_community.sessions import RedisSessionService
-
-        os.environ.pop("DATABASE_URL", None)
-
+    def test_redis_override_malformed_port_raises_value_error(self):
+        """Malformed port in REDIS_ADDR raises ValueError instead of silently falling back."""
+        import pytest
         from agents.utils.runtime import create_services
 
-        result = create_services()
-        assert isinstance(result.session_service, RedisSessionService)
-        assert result.target == "redis_override"
+        os.environ.pop("DATABASE_URL", None)
+        with pytest.raises(ValueError, match="REDIS_ADDR port"):
+            create_services()
 
     @patch.dict(
         os.environ,
@@ -281,17 +296,17 @@ class TestSessionStoreOverride:
         },
         clear=False,
     )
-    @patch("google.adk.sessions.database_session_service.DatabaseSessionService")
-    def test_unrecognized_override_falls_through(self, mock_db_svc):
-        """Unrecognized override value falls through to normal chain."""
+    def test_unrecognized_override_raises_value_error(self):
+        """Unrecognized SESSION_STORE_OVERRIDE raises ValueError instead of silent fallthrough."""
+        import pytest
+        from agents.utils.runtime import create_services
+
         os.environ.pop("DB_POOL_SIZE", None)
         os.environ.pop("DB_MAX_OVERFLOW", None)
         os.environ.pop("GOOGLE_CLOUD_AGENT_ENGINE_ID", None)
 
-        from agents.utils.runtime import create_services
-
-        result = create_services()
-        assert result.target == "cloud_run"
+        with pytest.raises(ValueError, match="SESSION_STORE_OVERRIDE"):
+            create_services()
 
     @patch.dict(
         os.environ,
@@ -331,7 +346,9 @@ class TestIntEnvHelper:
         assert _int_env("TEST_VAR", 10) == 10
 
     @patch.dict(os.environ, {"TEST_VAR": "bad"}, clear=False)
-    def test_invalid_var_returns_default(self):
+    def test_invalid_var_raises_value_error(self):
+        import pytest
         from agents.utils.runtime import _int_env
 
-        assert _int_env("TEST_VAR", 10) == 10
+        with pytest.raises(ValueError, match="TEST_VAR"):
+            _int_env("TEST_VAR", 10)

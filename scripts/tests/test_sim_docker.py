@@ -173,7 +173,7 @@ class TestStopInfraProcessProtection:
 
         def check_output_side_effect(*args, **kwargs):
             cmd = args[0]
-            if isinstance(cmd, str) and "lsof" in cmd:
+            if isinstance(cmd, list) and "lsof" in cmd and "-ti" in cmd:
                 return b"12345"
             if isinstance(cmd, list) and "lsof" in cmd:
                 return "n/Users/me/.colima/_lima/colima/ssh.sock [mux]\n"
@@ -200,7 +200,7 @@ class TestStopInfraProcessProtection:
 
         def check_output_side_effect(*args, **kwargs):
             cmd = args[0]
-            if isinstance(cmd, str) and "lsof" in cmd:
+            if isinstance(cmd, list) and "lsof" in cmd and "-ti" in cmd:
                 return b"99999"
             if isinstance(cmd, list) and "lsof" in cmd:
                 return "ngo run cmd/frontend/main.go\n"
@@ -236,3 +236,37 @@ class TestStopDockerTeardown:
         compose_down_cmds = [cmd for cmd in commands if "down" in cmd]
         assert len(compose_down_cmds) >= 1
         assert "--remove-orphans" in compose_down_cmds[0]
+
+
+class TestFlushRedisSafety:
+    """Verify flush_redis passes password via REDISCLI_AUTH without shell=True."""
+
+    @patch("scripts.core.sim._read_redis_port_from_env", return_value=9102)
+    @patch("scripts.core.sim._read_env_file_value", return_value="p@ss'word$(whoami)")
+    @patch("subprocess.run")
+    def test_uses_argv_list_and_env_password(self, mock_run, _read_pw, _read_port):
+        from scripts.core.sim import flush_redis
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="OK\n", stderr=""
+        )
+
+        flush_redis()
+
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        assert call_args[0] == ["redis-cli", "-p", "9102", "flushall"]
+        assert not call_kwargs.get("shell", False)
+        assert call_kwargs["env"]["REDISCLI_AUTH"] == "p@ss'word$(whoami)"
+
+
+class TestEmergencyFlushDynamicProject:
+    """Verify emergency_flush resolves project/region after _load_env populates os.environ."""
+
+    def test_get_project_reads_runtime_env(self, monkeypatch):
+        from scripts.ops import emergency_flush
+
+        monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "loaded-from-dotenv-proj")
+        monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west4")
+        assert emergency_flush._get_project() == "loaded-from-dotenv-proj"
+        assert emergency_flush._get_region() == "europe-west4"

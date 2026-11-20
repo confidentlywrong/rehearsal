@@ -15,11 +15,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -96,6 +97,25 @@ const (
 	maxTimezoneLen    = 64
 )
 
+// sanitizeAndTruncateRunes ensures valid UTF-8 and clips s to at most maxRunes
+// Unicode code points without ever splitting a multi-byte UTF-8 sequence.
+func sanitizeAndTruncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 || s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
+	count := 0
+	for i := range s {
+		if count == maxRunes {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
 // updateProfileHandler patches the user's profile row.
 //
 // Body: {"display_name": "...", "timezone": "Europe/London"}
@@ -120,19 +140,28 @@ func updateProfileHandler(store profileStore) gin.HandlerFunc {
 		}
 		var body profileUpdateRequest
 		// Decode tolerantly — an empty body is a valid no-op
-		// PATCH. Only malformed JSON is a 400.
-		if c.Request.ContentLength != 0 {
-			if err := json.NewDecoder(c.Request.Body).Decode(&body); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json", "hint": err.Error()})
+		// PATCH. Only malformed JSON or trailing data is a 400.
+		if err := decodeStrictJSON(c, &body, 1<<20, true); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
 				return
 			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json", "hint": err.Error()})
+			return
 		}
 		// Trim + validate. Pointers stay nil for absent fields so
 		// the store's per-column SET skips them entirely.
 		var changedFields []string
 		if body.DisplayName != nil {
 			trimmed := strings.TrimSpace(*body.DisplayName)
-			if len(trimmed) > maxDisplayNameLen {
+			if !utf8.ValidString(trimmed) {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "display_name_invalid_utf8",
+				})
+				return
+			}
+			if utf8.RuneCountInString(trimmed) > maxDisplayNameLen {
 				c.JSON(http.StatusBadRequest, gin.H{
 					"error":     "display_name_too_long",
 					"max_chars": maxDisplayNameLen,
@@ -197,6 +226,7 @@ func updateProfileHandler(store profileStore) gin.HandlerFunc {
 		// wants to render the other unchanged).
 		u, err := store.GetUser(c.Request.Context(), uc.UserID)
 		if err != nil {
+			log.Printf("PATCH /api/v1/me/profile post-update GetUser failed user=%s: %v", uc.UserID, err)
 			c.JSON(http.StatusOK, gin.H{"updated": true})
 			return
 		}

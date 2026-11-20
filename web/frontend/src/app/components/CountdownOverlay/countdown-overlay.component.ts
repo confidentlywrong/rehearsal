@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate countdown:show numeric detail and guard callbacks after destroy.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,9 +84,12 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
   private pulseStartMs: number | null = null;
   private pulseAngle = 90;
   private dashChangesSub: Subscription | null = null;
+  private destroyed = false;
 
   private readonly onShow = (e: Event) => {
-    const value = (e as CustomEvent<number>).detail;
+    const rawValue = (e as CustomEvent<unknown>).detail;
+    if (typeof rawValue !== 'number' || !Number.isFinite(rawValue)) return;
+    const value = Math.floor(rawValue);
     if (this.hideTimer !== undefined) {
       clearTimeout(this.hideTimer);
       this.hideTimer = undefined;
@@ -112,6 +117,7 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
       if (this.prepTimer !== undefined) clearTimeout(this.prepTimer);
       this.prepTimer = setTimeout(() => {
         this.prepTimer = undefined;
+        if (this.destroyed) return;
         if (newHidden === 'A') this.slotA = nextNext;
         else this.slotB = nextNext;
         this.cdr.markForCheck();
@@ -140,6 +146,7 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
     if (this.hideTimer !== undefined) clearTimeout(this.hideTimer);
     this.hideTimer = setTimeout(() => {
       this.hideTimer = undefined;
+      if (this.destroyed) return;
       this.slotA = null;
       this.slotB = null;
       this.rotationDeg = 0;
@@ -161,6 +168,7 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
   }
 
   ngOnDestroy(): void {
+    this.destroyed = true;
     window.removeEventListener('countdown:show', this.onShow);
     window.removeEventListener('countdown:hide', this.onHide);
     if (this.hideTimer !== undefined) clearTimeout(this.hideTimer);
@@ -171,6 +179,7 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
   }
 
   private startPulse(rotationAtTriggerDeg: number): void {
+    if (this.destroyed) return;
     this.pulseStartMs = performance.now();
     this.pulseAngle = (((90 - rotationAtTriggerDeg) % 360) + 360) % 360;
     if (this.rafId === null) {
@@ -180,7 +189,7 @@ export class CountdownOverlayComponent implements OnDestroy, AfterViewInit {
 
   private tick = (now: number): void => {
     this.rafId = null;
-    if (this.pulseStartMs === null) return;
+    if (this.destroyed || this.pulseStartMs === null) return;
 
     const elapsed = now - this.pulseStartMs;
     const t = elapsed / PULSE_DURATION_MS;

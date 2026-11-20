@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,9 +18,11 @@ package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -44,7 +46,10 @@ func TestCORS_DefaultAllowsAll(t *testing.T) {
 
 	assert.Equal(t, "*", w.Header().Get("Access-Control-Allow-Origin"))
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Methods"), "GET")
+	assert.Contains(t, w.Header().Get("Access-Control-Allow-Methods"), "PATCH")
 	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "Content-Type")
+	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Firebase-AppCheck")
+	assert.Contains(t, w.Header().Get("Access-Control-Allow-Headers"), "X-Request-ID")
 }
 
 func TestCORS_RespectsConfiguredOrigin(t *testing.T) {
@@ -120,15 +125,21 @@ func TestCORS_OptionsReturns204(t *testing.T) {
 func TestConfigJS_SafeEncoding(t *testing.T) {
 	result := RenderConfigJS(map[string]string{
 		"FOO": "bar",
-		"XSS": "'; alert('pwned'); '",
+		"URL": "https://example.com/cb?a=1&b=2",
+		"XSS": "</script><script>alert('pwned')</script>",
 	})
 	assert.Contains(t, result, "window.ENV =")
-	// Single quotes must be backslash-escaped to prevent JS string breakout.
-	// JSEscapeString turns ' into \' so the raw sequence "'; " cannot appear.
-	// Instead it becomes "\\'; " in the output (backslash-escaped single quote).
-	assert.Contains(t, result, `\\'`)
-	// Normal values pass through unescaped
+	assert.NotContains(t, result, "</script>")
+	assert.Contains(t, result, `\u003c/script\u003e`)
 	assert.Contains(t, result, `"FOO":"bar"`)
+
+	rawJSON := strings.TrimSuffix(strings.TrimPrefix(result, "window.ENV = "), ";")
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(rawJSON), &decoded); err != nil {
+		t.Fatalf("RenderConfigJS did not emit valid JSON: %v", err)
+	}
+	assert.Equal(t, "https://example.com/cb?a=1&b=2", decoded["URL"])
+	assert.Equal(t, "</script><script>alert('pwned')</script>", decoded["XSS"])
 }
 
 func TestConfigJS_EmptyMap(t *testing.T) {
@@ -168,8 +179,12 @@ func (f *fakeTokenSource) Token() (*oauth2.Token, error) {
 }
 
 func TestAttachOIDCToken_Success(t *testing.T) {
+	resetOIDCTokenCacheForTest()
 	orig := newTokenSource
-	defer func() { newTokenSource = orig }()
+	defer func() {
+		newTokenSource = orig
+		resetOIDCTokenCacheForTest()
+	}()
 
 	newTokenSource = func(_ context.Context, _ string, _ ...idtoken.ClientOption) (oauth2.TokenSource, error) {
 		return &fakeTokenSource{
@@ -184,8 +199,12 @@ func TestAttachOIDCToken_Success(t *testing.T) {
 }
 
 func TestAttachOIDCToken_TokenSourceCreationError(t *testing.T) {
+	resetOIDCTokenCacheForTest()
 	orig := newTokenSource
-	defer func() { newTokenSource = orig }()
+	defer func() {
+		newTokenSource = orig
+		resetOIDCTokenCacheForTest()
+	}()
 
 	newTokenSource = func(_ context.Context, _ string, _ ...idtoken.ClientOption) (oauth2.TokenSource, error) {
 		return nil, errors.New("no credentials found")
@@ -199,8 +218,12 @@ func TestAttachOIDCToken_TokenSourceCreationError(t *testing.T) {
 }
 
 func TestAttachOIDCToken_TokenFetchError(t *testing.T) {
+	resetOIDCTokenCacheForTest()
 	orig := newTokenSource
-	defer func() { newTokenSource = orig }()
+	defer func() {
+		newTokenSource = orig
+		resetOIDCTokenCacheForTest()
+	}()
 
 	newTokenSource = func(_ context.Context, _ string, _ ...idtoken.ClientOption) (oauth2.TokenSource, error) {
 		return &fakeTokenSource{err: errors.New("token expired")}, nil
@@ -211,4 +234,46 @@ func TestAttachOIDCToken_TokenFetchError(t *testing.T) {
 
 	// Should not set Authorization header when token fetch fails
 	assert.Empty(t, header.Get("Authorization"))
+}
+
+func TestCORS_TrimsWildcardAndChecksGAE(t *testing.T) {
+	t.Setenv("CORS_REFUSE_WILDCARD", "true")
+	r := gin.New()
+	r.Use(CORS("  *  "))
+	r.GET("/test", func(c *gin.Context) { c.String(200, "ok") })
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+	assert.Empty(t, w.Header().Get("Access-Control-Allow-Origin"))
+}
+
+func TestAttachOIDCTokenAsE_CachesAndErrorsAndNilHeader(t *testing.T) {
+	resetOIDCTokenCacheForTest()
+	orig := newTokenSource
+	defer func() {
+		newTokenSource = orig
+		resetOIDCTokenCacheForTest()
+	}()
+
+	if err := AttachOIDCTokenAsE(context.Background(), nil, "https://svc.run.app", "Authorization"); err == nil {
+		t.Fatal("expected error on nil header")
+	}
+
+	calls := 0
+	newTokenSource = func(_ context.Context, _ string, _ ...idtoken.ClientOption) (oauth2.TokenSource, error) {
+		calls++
+		return &fakeTokenSource{token: &oauth2.Token{AccessToken: "cached-tok"}}, nil
+	}
+
+	h1 := make(http.Header)
+	h2 := make(http.Header)
+	assert.NoError(t, AttachOIDCTokenAsE(context.Background(), h1, "https://cached.run.app", "X-Serverless-Authorization"))
+	assert.NoError(t, AttachOIDCTokenAsE(context.Background(), h2, "https://cached.run.app", "X-Serverless-Authorization"))
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, "Bearer cached-tok", h1.Get("X-Serverless-Authorization"))
+	assert.Equal(t, "Bearer cached-tok", h2.Get("X-Serverless-Authorization"))
+
+	newTokenSource = func(_ context.Context, _ string, _ ...idtoken.ClientOption) (oauth2.TokenSource, error) {
+		return nil, errors.New("boom")
+	}
+	assert.Error(t, AttachOIDCTokenAsE(context.Background(), make(http.Header), "https://err.run.app", "Authorization"))
 }

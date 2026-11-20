@@ -15,6 +15,7 @@ package billing
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
@@ -51,8 +52,8 @@ func LoadPriceMapFromEnv(raw string) (PriceTierMap, error) {
 		if priceID == "" {
 			return nil, fmt.Errorf("STRIPE_PRICE_MAP: blank price id in entry %q", pair)
 		}
-		if !tier.IsKnown() {
-			return nil, fmt.Errorf("STRIPE_PRICE_MAP: unknown tier %q (want one of free|pro|team|enterprise)", tier)
+		if !tier.IsKnown() || tier == account.PlanComp {
+			return nil, fmt.Errorf("STRIPE_PRICE_MAP: unknown or disallowed tier %q (want one of free|pro|team|enterprise)", tier)
 		}
 		if _, dup := out[priceID]; dup {
 			return nil, fmt.Errorf("STRIPE_PRICE_MAP: duplicate price id %q", priceID)
@@ -80,10 +81,15 @@ func (m PriceTierMap) Lookup(priceID string) (account.PlanTier, bool) {
 // "" when no price is mapped to tier — the SPA renders a "billing
 // not configured" message in that case.
 func (m PriceTierMap) PriceForTier(tier account.PlanTier) string {
+	var matches []string
 	for p, t := range m {
 		if t == tier {
-			return p
+			matches = append(matches, p)
 		}
 	}
-	return ""
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	return matches[0]
 }

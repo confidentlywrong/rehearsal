@@ -50,9 +50,8 @@ runner agents.
 
 ## Tools
 
-- `prepare_simulation(plan_json, tool_context, duration_seconds=120, tick_interval_seconds=10, total_race_hours=6.0)`:
-  Parse the plan JSON, compute max_ticks, and store simulation config
-  in state.
+- `prepare_simulation(plan_json, tool_context)`:
+  Parse the plan JSON (including optional `simulation_config` fields), compute max_ticks, and store simulation config in state.
 - `spawn_runners(count, tool_context)`:
   HTTP POST to the gateway spawn API to create runner agent sessions.
 - `start_race_collector(tool_context)`:

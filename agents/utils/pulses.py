@@ -1,22 +1,48 @@
 # Copyright 2026 Google LLC
 # Modifications copyright 2026 Christian Haeussinger
 # Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import json
 import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Any, Dict, List
 
 from agents.utils import redis_pool
+from agents.utils import simulation_registry
 from agents.utils import tenant_keys
 from gen_proto.gateway import gateway_pb2
 
 logger = logging.getLogger(__name__)
 
 _NUM_PUBLISH_WORKERS = 16
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("pulses: invalid integer for %s=%r; using default %d", name, raw, default)
+        return default
+
 
 # P1-7 (2026-06-23 audit): publish-queue capacity is operator-tunable so
 # burst capacity can be raised without a code change. Default 50_000
@@ -26,13 +52,13 @@ _NUM_PUBLISH_WORKERS = 16
 # average → ~500MB worst case at the cap).
 _PULSE_QUEUE_MAXSIZE: int = max(
     100,
-    min(500_000, int(os.environ.get("PULSE_QUEUE_MAXSIZE", "50000"))),
+    min(500_000, _parse_int_env("PULSE_QUEUE_MAXSIZE", 50_000)),
 )
 # Emit a WARN once per crossing of this fill-percentage so operators can see
 # producer-vs-consumer imbalance long before the queue saturates. 0 disables.
 _PULSE_QUEUE_HIGH_WATER_PCT: int = max(
     0,
-    min(100, int(os.environ.get("PULSE_QUEUE_HIGH_WATER_PCT", "80"))),
+    min(100, _parse_int_env("PULSE_QUEUE_HIGH_WATER_PCT", 80)),
 )
 # Edge-trigger latch per loop so we WARN on the first crossing rather than
 # spamming on every put once the queue is hot. Cleared when queue drops
@@ -55,7 +81,22 @@ _dropped_messages_total: int = 0
 # H6 fix: Scope queue/workers per event loop. The dispatcher runs in its
 # own thread with its own loop; module-level globals bound to the wrong
 # loop caused "Future attached to a different loop" errors or silent drops.
-_loop_state: dict[int, tuple["asyncio.Queue[bytes]", list["asyncio.Task[None]"]]] = {}
+_loop_state: dict[
+    int,
+    tuple["asyncio.Queue[tuple[str, bytes] | bytes]", list["asyncio.Task[None]"]],
+] = {}
+
+
+def _gateway_broadcast_channel(user_id: Optional[str] = None) -> str:
+    """Resolve the tenant-scoped Redis Pub/Sub channel for gateway broadcasts.
+
+    Matches ``agents/simulator/collector.py:_gateway_broadcast_channel``:
+    - ``SAAS_MODE=off`` -> ``"gateway:broadcast"``
+    - ``SAAS_MODE=on`` with authenticated ``user_id`` -> ``"{ACCOUNT_KEY_PREFIX}:{user}:gateway:broadcast"``
+    - ``SAAS_MODE=on`` without authenticated ``user_id`` -> ``"gateway:broadcast"``
+    """
+    eff_user = simulation_registry._resolve_registry_user(user_id, require_when_saas=False)
+    return tenant_keys.key_for_user(eff_user, "gateway", "broadcast")
 
 
 def get_drop_stats() -> dict[str, int]:
@@ -73,7 +114,7 @@ def _reset_drop_stats() -> None:
     _dropped_messages_total = 0
 
 
-def _get_queue() -> asyncio.Queue[bytes]:
+def _get_queue() -> asyncio.Queue[tuple[str, bytes] | bytes]:
     """Lazy-init the publish queue for the *current* event loop."""
     loop = asyncio.get_running_loop()
     key = id(loop)
@@ -101,76 +142,98 @@ async def _publish_worker() -> None:
     """Background task: drain queue, pipeline publishes to Redis with bounded retry."""
     global _dropped_batches_total, _dropped_messages_total
     while True:
-        # Block for at least one item
-        queue = _get_queue()
-        batch: list[bytes] = [await queue.get()]
-        # Drain any additional ready items (up to 100)
-        while not queue.empty() and len(batch) < 100:
-            batch.append(queue.get_nowait())
+        batch: list[tuple[str, bytes] | bytes] = []
+        try:
+            # Block for at least one item
+            queue = _get_queue()
+            batch = [await queue.get()]
+            # Drain any additional ready items (up to 100)
+            while not queue.empty() and len(batch) < 100:
+                batch.append(queue.get_nowait())
 
-        r = _get_redis_client()
-        if r is None:
-            _dropped_batches_total += 1
-            _dropped_messages_total += len(batch)
-            logger.error(
-                "GATEWAY_DROP: Redis client unavailable, dropping %d messages (cumulative batches=%d msgs=%d)",
-                len(batch),
-                _dropped_batches_total,
-                _dropped_messages_total,
-            )
-            continue
-
-        last_err: Exception | None = None
-        for attempt in range(_MAX_PUBLISH_ATTEMPTS):
-            try:
-                # Tenant-scope the broadcast channel name so each tenant's
-                # collector only receives its own traffic (M3). SAAS_MODE=off
-                # collapses to the legacy literal "gateway:broadcast" so the
-                # single-tenant local stack and switchboard tests are
-                # byte-identical.
-                channel = tenant_keys.key_for_user(
-                    os.environ.get("DISPATCHER_USER_ID", "").strip(),
-                    "gateway",
-                    "broadcast",
-                )
-                async with r.pipeline(transaction=False) as pipe:
-                    for msg in batch:
-                        pipe.publish(channel, msg)
-                    t_pub_start = time.perf_counter()
-                    await pipe.execute()
-                    t_pub_end = time.perf_counter()
-                logger.info(
-                    "PERF_TRACE: batch_published count=%d elapsed_ms=%.1f attempt=%d",
+            r = _get_redis_client()
+            if r is None:
+                _dropped_batches_total += 1
+                _dropped_messages_total += len(batch)
+                logger.error(
+                    "GATEWAY_DROP: Redis client unavailable, dropping %d messages (cumulative batches=%d msgs=%d)",
                     len(batch),
-                    (t_pub_end - t_pub_start) * 1000,
-                    attempt + 1,
+                    _dropped_batches_total,
+                    _dropped_messages_total,
                 )
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if attempt + 1 < _MAX_PUBLISH_ATTEMPTS:
-                    backoff = _PUBLISH_RETRY_BACKOFF_S[attempt]
-                    logger.warning(
-                        "GATEWAY_RETRY: Pipeline publish failed (%d msgs, attempt %d/%d), retrying in %.2fs: %s",
+                continue
+
+            # Resolve legacy raw-bytes entries (direct _get_queue().put_nowait
+            # in unit tests) using DISPATCHER_USER_ID only — never reading
+            # ContextVar inside the shared worker task — so retries republish
+            # to each item's enqueued channel.
+            legacy_channel: str | None = None
+            resolved_batch: list[tuple[str, bytes]] = []
+            for item in batch:
+                if isinstance(item, tuple):
+                    resolved_batch.append(item)
+                else:
+                    if legacy_channel is None:
+                        legacy_channel = tenant_keys.key_for_user(
+                            os.environ.get("DISPATCHER_USER_ID", "").strip(),
+                            "gateway",
+                            "broadcast",
+                        )
+                    resolved_batch.append((legacy_channel, item))
+
+            last_err: Exception | None = None
+            for attempt in range(_MAX_PUBLISH_ATTEMPTS):
+                try:
+                    async with r.pipeline(transaction=False) as pipe:
+                        for item_channel, msg_bytes in resolved_batch:
+                            pipe.publish(item_channel, msg_bytes)
+                        t_pub_start = time.perf_counter()
+                        await pipe.execute()
+                        t_pub_end = time.perf_counter()
+                    logger.info(
+                        "PERF_TRACE: batch_published count=%d elapsed_ms=%.1f attempt=%d",
                         len(batch),
+                        (t_pub_end - t_pub_start) * 1000,
                         attempt + 1,
-                        _MAX_PUBLISH_ATTEMPTS,
-                        backoff,
-                        e,
                     )
-                    await asyncio.sleep(backoff)
-        if last_err is not None:
-            _dropped_batches_total += 1
-            _dropped_messages_total += len(batch)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt + 1 < _MAX_PUBLISH_ATTEMPTS:
+                        backoff = _PUBLISH_RETRY_BACKOFF_S[attempt]
+                        logger.warning(
+                            "GATEWAY_RETRY: Pipeline publish failed (%d msgs, attempt %d/%d), retrying in %.2fs: %s",
+                            len(batch),
+                            attempt + 1,
+                            _MAX_PUBLISH_ATTEMPTS,
+                            backoff,
+                            e,
+                        )
+                        await asyncio.sleep(backoff)
+            if last_err is not None:
+                _dropped_batches_total += 1
+                _dropped_messages_total += len(batch)
+                logger.error(
+                    "GATEWAY_DROP: Pipeline publish failed after %d attempts; "
+                    "dropping %d messages (cumulative batches=%d msgs=%d): %s",
+                    _MAX_PUBLISH_ATTEMPTS,
+                    len(batch),
+                    _dropped_batches_total,
+                    _dropped_messages_total,
+                    last_err,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if batch:
+                _dropped_batches_total += 1
+                _dropped_messages_total += len(batch)
             logger.error(
-                "GATEWAY_DROP: Pipeline publish failed after %d attempts; "
-                "dropping %d messages (cumulative batches=%d msgs=%d): %s",
-                _MAX_PUBLISH_ATTEMPTS,
+                "GATEWAY_WORKER_ERROR: Unexpected publish worker error (dropped=%d): %s",
                 len(batch),
-                _dropped_batches_total,
-                _dropped_messages_total,
-                last_err,
+                exc,
+                exc_info=True,
             )
 
 
@@ -189,12 +252,16 @@ async def _ensure_worker() -> None:
         tasks.append(task)
 
 
-async def _publish_to_gateway(wrapper_bytes: bytes) -> None:
+async def _publish_to_gateway(
+    wrapper_bytes: bytes,
+    user_id: Optional[str] = None,
+) -> None:
     global _dropped_batches_total, _dropped_messages_total
+    channel = _gateway_broadcast_channel(user_id=user_id)
     await _ensure_worker()
     queue = _get_queue()
     try:
-        queue.put_nowait(wrapper_bytes)
+        queue.put_nowait((channel, wrapper_bytes))
     except asyncio.QueueFull:
         _dropped_batches_total += 1  # treat queue-overflow as a single-message batch
         _dropped_messages_total += 1
@@ -237,12 +304,14 @@ async def emit_gateway_message(
     data: Any,
     metadata: Optional[Dict[str, Any]] = None,
     simulation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """Unified function to emit standardized gateway messages."""
     try:
         # Import dynamically to avoid circular dependencies
         from agents.utils.plugins import _safe_json_dumps
-    except ImportError:
+    except ImportError as exc:
+        logger.debug("pulses: plugins._safe_json_dumps unavailable (%s); using json.dumps", exc)
 
         def _safe_json_dumps(obj: Any) -> str:
             return json.dumps(obj, default=str)
@@ -273,7 +342,7 @@ async def emit_gateway_message(
         meta_bytes = _safe_json_dumps(metadata).encode("utf-8")
 
     wrapper = gateway_pb2.Wrapper(
-        timestamp=datetime.now().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         type=msg_type,
         request_id=f"gw-{uuid.uuid4().hex[:12]}",
         session_id=origin_msg.session_id,  # Legacy fallback for routing
@@ -288,7 +357,12 @@ async def emit_gateway_message(
     if simulation_id:
         wrapper.simulation_id = simulation_id
 
-    await _publish_to_gateway(wrapper.SerializeToString())
+    serialized = wrapper.SerializeToString()
+    if user_id is not None:
+        with simulation_registry.user_scope(user_id):
+            await _publish_to_gateway(serialized)
+    else:
+        await _publish_to_gateway(serialized)
     logger.debug(f"GATEWAY_MSG: [{event}] from {origin_msg.id} to {destination} ({status})")
 
 
@@ -300,6 +374,7 @@ async def emit_narrative_pulse(
     type: str = "text",
     metadata: Optional[dict] = None,
     simulation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """Legacy wrapper for narrative pulses. Maps to emit_gateway_message."""
     await emit_gateway_message(
@@ -311,6 +386,7 @@ async def emit_narrative_pulse(
         data={"text": text},
         metadata=metadata,
         simulation_id=simulation_id,
+        user_id=user_id,
     )
 
 
@@ -321,6 +397,7 @@ async def emit_inter_agent_pulse(
     message: str,
     direction: str = "request",
     simulation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """Legacy wrapper for inter-agent communication visibility."""
     if direction == "request":
@@ -334,6 +411,7 @@ async def emit_inter_agent_pulse(
         type="inter-agent",
         author=from_agent,
         simulation_id=simulation_id,
+        user_id=user_id,
     )
 
 
@@ -345,6 +423,7 @@ async def emit_telemetry_pulse(
     payload: dict,
     type: str = "agent-telemetry",
     simulation_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """Legacy wrapper for raw telemetry events. Maps to emit_gateway_message."""
     agent_id = payload.get("agent", "system")
@@ -360,4 +439,5 @@ async def emit_telemetry_pulse(
         data=payload,
         metadata={"seq": payload.get("seq")},
         simulation_id=simulation_id,
+        user_id=user_id,
     )

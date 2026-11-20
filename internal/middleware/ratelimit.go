@@ -46,10 +46,12 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
@@ -120,7 +122,7 @@ local cost = tonumber(ARGV[4])
 local data = redis.call('HMGET', key, 't', 'u')
 local tokens = tonumber(data[1])
 local last = tonumber(data[2])
-if tokens == nil then
+if tokens == nil or last == nil then
   tokens = capacity
   last = now
 end
@@ -139,7 +141,7 @@ else
   retry_us = math.ceil((deficit / refill) * 1000000)
 end
 redis.call('HSET', key, 't', tokens, 'u', now)
-local ttl = math.ceil((capacity / refill) + 60)
+local ttl = math.min(math.ceil((capacity / refill) + 60), 2592000)
 redis.call('EXPIRE', key, ttl)
 return {allowed, retry_us}
 `
@@ -159,7 +161,8 @@ func RateLimitIfEnabled(opts RateLimitOptions) gin.HandlerFunc {
 // is logged once so an operator can correlate "rate limit not
 // working" with the boot-time message.
 func RateLimit(opts RateLimitOptions) gin.HandlerFunc {
-	if opts.Client == nil || opts.Capacity <= 0 || opts.RefillPerSecond <= 0 {
+	if opts.Client == nil || opts.Capacity <= 0 || opts.RefillPerSecond <= 0 ||
+		math.IsNaN(opts.RefillPerSecond) || math.IsInf(opts.RefillPerSecond, 0) {
 		log.Printf("RATELIMIT: disabled (client=%v capacity=%d refill=%g)",
 			opts.Client != nil, opts.Capacity, opts.RefillPerSecond)
 		return noop
@@ -176,17 +179,15 @@ func RateLimit(opts RateLimitOptions) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// Skip-path match is a strict path-segment compare,
-		// NOT a raw prefix compare. "/api/v1/usage" must skip
-		// exactly that path and its sub-tree ("/api/v1/usage/foo")
-		// but MUST NOT silently bypass throttling on a future
-		// sibling like "/api/v1/usagereport".
-		path := c.Request.URL.Path
-		for _, p := range skips {
-			if path == p || strings.HasPrefix(path, p+"/") {
-				c.Next()
-				return
-			}
+		// Skip-path match is a strict path-segment compare on the
+		// cleaned request path, NOT a raw prefix compare. "/api/v1/usage"
+		// must skip exactly that path and its sub-tree ("/api/v1/usage/foo")
+		// but MUST NOT silently bypass throttling on a future sibling like
+		// "/api/v1/usagereport" or a traversal like "/api/v1/usage/../expensive".
+		reqPath := cleanRequestPath(c.Request)
+		if hasPathPrefix(reqPath, skips) {
+			c.Next()
+			return
 		}
 		uc := account.FromContext(c.Request.Context())
 		if uc.UserID == "" {
@@ -259,17 +260,21 @@ func noop(c *gin.Context) { c.Next() }
 // the returned options to set them at the call site.
 func RateLimitFromEnv(client *redis.Client, getenv func(string) string) RateLimitOptions {
 	if getenv == nil {
-		getenv = func(string) string { return "" }
+		getenv = os.Getenv
 	}
 	opts := RateLimitOptions{Client: client}
 	if v := getenv("RATELIMIT_CAPACITY"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			opts.Capacity = n
+		} else {
+			log.Printf("RATELIMIT: invalid RATELIMIT_CAPACITY=%q (%v); disabling", v, err)
 		}
 	}
 	if v := getenv("RATELIMIT_REFILL_PER_SEC"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			opts.RefillPerSecond = f
+		} else {
+			log.Printf("RATELIMIT: invalid RATELIMIT_REFILL_PER_SEC=%q (%v); disabling", v, err)
 		}
 	}
 	if v := getenv("RATELIMIT_KEY_PREFIX"); v != "" {
@@ -299,7 +304,10 @@ func runRateLimitForTest(ctx context.Context, client *redis.Client, key string, 
 	if err != nil {
 		return false, 0, err
 	}
-	arr := res.([]interface{})
+	arr, ok := res.([]interface{})
+	if !ok || len(arr) < 2 {
+		return false, 0, fmt.Errorf("unexpected script result %T %v", res, res)
+	}
 	allowed, _ := arr[0].(int64)
 	retryUs, _ := arr[1].(int64)
 	return allowed == 1, retryUs, nil

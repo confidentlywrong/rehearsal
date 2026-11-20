@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate station radii/positions against NaN and negative values and safely dispose Three.js materials and textures once.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +37,35 @@ export interface StationZone {
 
 export type WaterStationZone = StationZone;
 
+function sanitizeVector3(pos: THREE.Vector3 | null | undefined): THREE.Vector3 {
+  if (!pos) return new THREE.Vector3(0, 0, 0);
+  return new THREE.Vector3(
+    Number.isFinite(pos.x) ? pos.x : 0,
+    Number.isFinite(pos.y) ? pos.y : 0,
+    Number.isFinite(pos.z) ? pos.z : 0,
+  );
+}
+
+function disposeMeshResources(mesh: THREE.Mesh | undefined | null): void {
+  if (!mesh) return;
+  mesh.geometry?.dispose();
+  const mat = mesh.material;
+  const disposeMat = (m: THREE.Material | undefined | null) => {
+    if (!m) return;
+    for (const val of Object.values(m as unknown as Record<string, unknown>)) {
+      if (val && typeof val === 'object' && (val as { isTexture?: boolean }).isTexture) {
+        (val as THREE.Texture).dispose();
+      }
+    }
+    m.dispose();
+  };
+  if (Array.isArray(mat)) {
+    for (const m of mat) disposeMat(m);
+  } else {
+    disposeMat(mat);
+  }
+}
+
 /** Lightweight StationZone for collision detection only (no scene visuals). */
 export class SimpleStationZone implements StationZone {
   readonly id: number;
@@ -52,12 +83,21 @@ export class SimpleStationZone implements StationZone {
   ) {
     this.id = id;
     this.stationType = type;
-    this.worldPos = worldPos.clone();
-    this.radius = radius;
-    this.kmMark = kmMark;
+    this.worldPos = sanitizeVector3(worldPos);
+    this.radius = Number.isFinite(radius) && radius > 0 ? radius : 0;
+    this.kmMark = Number.isFinite(kmMark) ? kmMark : 0;
   }
 
   isInsideRadius(position: THREE.Vector3): boolean {
+    if (
+      !position ||
+      !Number.isFinite(position.x) ||
+      !Number.isFinite(position.z) ||
+      !Number.isFinite(this.radius) ||
+      this.radius <= 0
+    ) {
+      return false;
+    }
     const dx = position.x - this.worldPos.x;
     const dz = position.z - this.worldPos.z;
     return Math.sqrt(dx * dx + dz * dz) <= this.radius;
@@ -104,14 +144,24 @@ abstract class BaseStation implements StationZone {
 
   protected groundMesh!: THREE.Mesh;
   protected columnMesh!: THREE.Mesh;
+  private disposed = false;
 
   constructor(def: StationDef) {
-    this.id = def.id;
-    this.kmMark = def.kmMark;
-    this.worldPos = def.worldPos.clone();
+    this.id = def?.id ?? 0;
+    this.kmMark = Number.isFinite(def?.kmMark) ? def.kmMark : 0;
+    this.worldPos = sanitizeVector3(def?.worldPos);
   }
 
   isInsideRadius(position: THREE.Vector3): boolean {
+    if (
+      !position ||
+      !Number.isFinite(position.x) ||
+      !Number.isFinite(position.z) ||
+      !Number.isFinite(this.radius) ||
+      this.radius <= 0
+    ) {
+      return false;
+    }
     const dx = position.x - this.worldPos.x;
     const dz = position.z - this.worldPos.z;
     return Math.sqrt(dx * dx + dz * dz) <= this.radius;
@@ -123,12 +173,12 @@ abstract class BaseStation implements StationZone {
   }
 
   removeFromScene(scene: THREE.Scene): void {
-    scene.remove(this.groundMesh);
-    scene.remove(this.columnMesh);
-    this.groundMesh.geometry.dispose();
-    (this.groundMesh.material as THREE.Material).dispose();
-    this.columnMesh.geometry.dispose();
-    (this.columnMesh.material as THREE.Material).dispose();
+    scene?.remove(this.groundMesh);
+    scene?.remove(this.columnMesh);
+    if (this.disposed) return;
+    this.disposed = true;
+    disposeMeshResources(this.groundMesh);
+    disposeMeshResources(this.columnMesh);
   }
 }
 

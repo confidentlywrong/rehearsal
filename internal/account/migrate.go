@@ -12,6 +12,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // MigrationFileEnv overrides the path to a SINGLE migration file.
@@ -39,10 +42,18 @@ const migrationLockKey int64 = 0x55534552
 
 // migrationDB is the minimal pgx surface ApplyMigration needs.
 // Smaller than PgxConn so tests can pass a fake that only implements
-// Exec.
+// Exec and QueryVersions.
 type migrationDB interface {
 	Exec(ctx context.Context, sql string, args ...any) (any, error)
+	QueryVersions(ctx context.Context) (map[string]bool, error)
 }
+
+var errMigrationUnlockFailed = errors.New("advisory unlock failed")
+
+const createSchemaMigrationsSQL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+	version    TEXT        PRIMARY KEY,
+	applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);`
 
 // pgxExecAdapter wraps a PgxConn to fit migrationDB. The adapter
 // drops the concrete pgconn.CommandTag return value (callers here
@@ -54,77 +65,149 @@ func (a pgxExecAdapter) Exec(ctx context.Context, sql string, args ...any) (any,
 	return tag, err
 }
 
+func (a pgxExecAdapter) QueryVersions(ctx context.Context) (map[string]bool, error) {
+	rows, err := a.inner.Query(ctx, "SELECT version FROM schema_migrations")
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		return map[string]bool{}, nil
+	}
+	defer rows.Close()
+	applied := make(map[string]bool)
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+		applied[version] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return applied, nil
+}
+
 // ApplyMigration discovers every migrations/*.sql file in lexical
-// order and applies each in turn. Called from every service's main()
-// right after pgx.Connect. The SQL in every file is idempotent
-// (CREATE ... IF NOT EXISTS + INSERT ... WHERE NOT EXISTS) so
-// re-running on every boot is safe.
-//
-// We still do NOT track applied migrations in a separate table.
-// Lexical ordering + idempotent statements is the v1 contract; if a
-// future migration needs to be non-idempotent (rare) we'll add a
-// real runner with a versions table then.
+// order, ensures schema_migrations exists, skips already-recorded
+// versions, and applies pending migrations under a fail-closed
+// PostgreSQL advisory lock. Called from every service's main() right
+// after connecting.
 func ApplyMigration(ctx context.Context, db PgxConn) error {
 	if db == nil {
 		return errors.New("account: ApplyMigration: nil db")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	paths, err := migrationFilePaths()
 	if err != nil {
 		return fmt.Errorf("account: ApplyMigration: %w", err)
+	}
+	// Session-level pg_advisory_lock requires connection affinity across lock,
+	// DDL statements, and unlock. If a caller passes a *pgxpool.Pool directly,
+	// acquire and pin a single pooled connection for the entire migration run.
+	switch v := db.(type) {
+	case *pgx.Conn:
+		if v == nil {
+			return errors.New("account: ApplyMigration: nil db")
+		}
+	case *pgxpool.Pool:
+		if v == nil {
+			return errors.New("account: ApplyMigration: nil db")
+		}
+		conn, aerr := v.Acquire(ctx)
+		if aerr != nil {
+			return fmt.Errorf("account: ApplyMigration: acquire conn: %w", aerr)
+		}
+		var connBad bool
+		defer func() {
+			if connBad {
+				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer ccancel()
+				_ = conn.Conn().Close(cctx)
+			}
+			conn.Release()
+		}()
+		err := applyMigrationFiles(ctx, pgxExecAdapter{inner: conn}, paths)
+		if errors.Is(err, errMigrationUnlockFailed) {
+			connBad = true
+		}
+		return err
 	}
 	return applyMigrationFiles(ctx, pgxExecAdapter{inner: db}, paths)
 }
 
 // applyMigrationFiles is the testable inner of ApplyMigration. Tests
 // call it directly with a fake migrationDB. The advisory lock is
-// acquired once for the whole batch so all files apply atomically
-// w.r.t. other booting services.
-func applyMigrationFiles(ctx context.Context, db migrationDB, paths []string) error {
+// acquired fail-closed once for the whole batch so all files apply
+// atomically w.r.t. other booting services.
+func applyMigrationFiles(ctx context.Context, db migrationDB, paths []string) (retErr error) {
 	if db == nil {
 		return errors.New("account: applyMigrationFiles: nil db")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if len(paths) == 0 {
 		return errors.New("account: applyMigrationFiles: no migration files found")
 	}
 
-	// Acquire a project-wide advisory lock. Best-effort: if the call
-	// returns an error (DB hiccup, test fake doesn't implement
-	// SELECT) we log and continue — the migrations' CREATEs are
-	// already IF NOT EXISTS and seeds are guarded by NOT EXISTS, so
-	// the worst case without the lock is a one-time PK collision on
-	// the very first concurrent boot.
-	lockHeld := false
+	// Acquire a project-wide advisory lock fail-closed. Concurrent cold
+	// starts must serialize so schema_migrations and non-idempotent DDL
+	// cannot race.
 	if _, err := db.Exec(ctx, fmt.Sprintf("SELECT pg_advisory_lock(%d)", migrationLockKey)); err != nil {
-		log.Printf("ACCOUNT MIGRATION: advisory lock unavailable (%v); proceeding without serialization", err)
-	} else {
-		lockHeld = true
-		defer func() {
-			// Unlock on a fresh context so a cancelled parent
-			// doesn't leave the lock held until session close.
-			uctx, ucancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ucancel()
-			if _, uerr := db.Exec(uctx, fmt.Sprintf("SELECT pg_advisory_unlock(%d)", migrationLockKey)); uerr != nil {
-				log.Printf("ACCOUNT MIGRATION: advisory unlock failed (%v); will release on session close", uerr)
+		return fmt.Errorf("account: acquire advisory lock: %w", err)
+	}
+	defer func() {
+		// Unlock on a fresh context so a cancelled parent
+		// doesn't leave the lock held until session close.
+		uctx, ucancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer ucancel()
+		if _, uerr := db.Exec(uctx, fmt.Sprintf("SELECT pg_advisory_unlock(%d)", migrationLockKey)); uerr != nil {
+			log.Printf("ACCOUNT MIGRATION: advisory unlock failed (%v)", uerr)
+			unlockErr := fmt.Errorf("account: %w: %v", errMigrationUnlockFailed, uerr)
+			if retErr == nil {
+				retErr = unlockErr
+			} else {
+				retErr = errors.Join(retErr, unlockErr)
 			}
-		}()
+		}
+	}()
+
+	if _, err := db.Exec(ctx, createSchemaMigrationsSQL); err != nil {
+		return fmt.Errorf("account: create schema_migrations: %w", err)
+	}
+	applied, err := db.QueryVersions(ctx)
+	if err != nil {
+		return fmt.Errorf("account: query schema_migrations: %w", err)
 	}
 
 	for _, path := range paths {
-		sql, err := os.ReadFile(path)
+		version := filepath.Base(path)
+		if applied[version] {
+			log.Printf("ACCOUNT MIGRATION: skipping already-applied %s", path)
+			continue
+		}
+		sqlBytes, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("account: read %s: %w", path, err)
 		}
-		if len(sql) == 0 {
+		if strings.TrimSpace(string(sqlBytes)) == "" {
 			return fmt.Errorf("account: %s is empty", path)
 		}
-		if _, err := db.Exec(ctx, string(sql)); err != nil {
+		if _, err := db.Exec(ctx, string(sqlBytes)); err != nil {
 			return fmt.Errorf("account: apply %s: %w", path, err)
 		}
-		if lockHeld {
-			log.Printf("ACCOUNT MIGRATION: applied %s (advisory lock held)", path)
-		} else {
-			log.Printf("ACCOUNT MIGRATION: applied %s", path)
+		if _, err := db.Exec(
+			ctx,
+			"INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+			version,
+		); err != nil {
+			return fmt.Errorf("account: record %s in schema_migrations: %w", path, err)
 		}
+		applied[version] = true
+		log.Printf("ACCOUNT MIGRATION: applied %s (advisory lock held)", path)
 	}
 	return nil
 }

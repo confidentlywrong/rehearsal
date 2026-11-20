@@ -24,6 +24,7 @@ No LLM dependency — this is purely deterministic configuration management.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,12 +51,72 @@ LEADERSHIP_PRINCIPLES = [
 ]
 
 
+def _require_finite_float(value: Any, field_name: str) -> float:
+    """Reject booleans, NaN, +/-Inf, and overflowing values in numeric quest schema fields."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must not be a boolean, got {value!r}")
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(num):
+        raise ValueError(f"{field_name} must be a finite number, got {value!r}")
+    return num
+
+
+def _validate_gatekeeper_route_entry(role: str, entry: Any) -> None:
+    """Validate finite non-negative ranges for a gatekeeper_route_map entry."""
+    if isinstance(entry, bool):
+        raise ValueError(f"gatekeeper_route_map[{role!r}] must not be a boolean")
+    if isinstance(entry, (int, float)):
+        val = _require_finite_float(entry, f"gatekeeper_route_map[{role!r}]")
+        if val < 0.0:
+            raise ValueError(f"gatekeeper_route_map[{role!r}] must be non-negative, got {val}")
+        return
+    if isinstance(entry, (list, tuple)):
+        nums: list[float] = []
+        for idx, elem in enumerate(entry):
+            if isinstance(elem, bool):
+                raise ValueError(f"gatekeeper_route_map[{role!r}][{idx}] must not be a boolean")
+            if isinstance(elem, (int, float)):
+                val = _require_finite_float(elem, f"gatekeeper_route_map[{role!r}][{idx}]")
+                if val < 0.0:
+                    raise ValueError(f"gatekeeper_route_map[{role!r}][{idx}] must be non-negative, got {val}")
+                nums.append(val)
+        if len(entry) == 2 and len(nums) == 2 and nums[0] > nums[1]:
+            raise ValueError(
+                f"gatekeeper_route_map[{role!r}] start ({nums[0]}) must not exceed end ({nums[1]})"
+            )
+        return
+    if isinstance(entry, dict):
+        parsed_nums: dict[str, float] = {}
+        for key, raw_val in entry.items():
+            if isinstance(raw_val, bool):
+                raise ValueError(f"gatekeeper_route_map[{role!r}][{key!r}] must not be a boolean")
+            if isinstance(raw_val, (int, float)):
+                num = _require_finite_float(raw_val, f"gatekeeper_route_map[{role!r}][{key!r}]")
+                if key in ("start_mi", "end_mi", "mile") and num < 0.0:
+                    raise ValueError(
+                        f"gatekeeper_route_map[{role!r}][{key!r}] must be non-negative, got {num}"
+                    )
+                parsed_nums[key] = num
+        if "start_mi" in parsed_nums and "end_mi" in parsed_nums and parsed_nums["start_mi"] > parsed_nums["end_mi"]:
+            raise ValueError(
+                f"gatekeeper_route_map[{role!r}] start_mi ({entry.get('start_mi')}) must not exceed end_mi ({entry.get('end_mi')})"
+            )
+
+
 class ResourceConfig(BaseModel):
     """Configuration for a single organizational resource pool."""
 
     initial: float = Field(..., ge=0, description="Starting value for the resource")
     regen_per_tick: float = Field(0.0, description="Amount regenerated (or decayed if negative) per tick")
     critical_threshold: float = Field(20.0, ge=0, description="Value below which ECSI fires a threshold breach alert")
+
+    @field_validator("initial", "regen_per_tick", "critical_threshold", mode="before")
+    @classmethod
+    def validate_finite_resource_fields(cls, v: Any, info) -> float:
+        return _require_finite_float(v, info.field_name or "resource_field")
 
 
 class BlackSwanTrigger(BaseModel):
@@ -64,6 +125,17 @@ class BlackSwanTrigger(BaseModel):
     type: Literal["tick", "condition"] = Field(..., description="Trigger type: tick-based or condition-based")
     tick: int | None = Field(None, ge=0, description="Tick number to fire (for tick-based triggers)")
     when: str | None = Field(None, description="Condition expression, e.g. 'OWB < 30' (for condition triggers)")
+
+    @field_validator("tick", mode="before")
+    @classmethod
+    def reject_bool_or_non_finite_tick(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("tick must not be a boolean")
+        if isinstance(v, float) and not math.isfinite(v):
+            raise ValueError(f"tick must be finite, got {v!r}")
+        return v
 
     @field_validator("tick")
     @classmethod
@@ -88,6 +160,16 @@ class BlackSwanEvent(BaseModel):
     resource_impact: dict[str, float] = Field(
         default_factory=dict, description="Resource deltas, e.g. {'OWB': -15, 'BT': -50}"
     )
+
+    @field_validator("resource_impact", mode="before")
+    @classmethod
+    def validate_finite_resource_impact(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return v
+        return {
+            key: _require_finite_float(val, f"resource_impact[{key!r}]")
+            for key, val in v.items()
+        }
 
 
 class EchoConfig(BaseModel):
@@ -122,13 +204,23 @@ class EchoConfig(BaseModel):
         description="Source document IDs referenced by the cited nodes (passthrough only)",
     )
 
-    @field_validator("affinity")
+    @field_validator("affinity", mode="before")
     @classmethod
-    def validate_affinity_range(cls, v: list[float]) -> list[float]:
+    def validate_affinity_range(cls, v: Any) -> Any:
+        if not isinstance(v, (list, tuple)):
+            return v
+        validated: list[float] = []
         for i, val in enumerate(v):
-            if not 0.0 <= val <= 1.0:
+            num = _require_finite_float(val, f"affinity[{i}]")
+            if not 0.0 <= num <= 1.0:
                 raise ValueError(f"affinity[{i}] must be between 0.0 and 1.0, got {val}")
-        return v
+            validated.append(num)
+        return validated
+
+    @field_validator("initial_sentiment", "initial_resistance", "initial_influence", mode="before")
+    @classmethod
+    def validate_finite_echo_scalars(cls, v: Any, info) -> float:
+        return _require_finite_float(v, info.field_name or "echo_scalar")
 
 
 class InfluenceEdgeConfig(BaseModel):
@@ -137,6 +229,11 @@ class InfluenceEdgeConfig(BaseModel):
     source: str = Field(..., min_length=1, description="Source Echo role")
     target: str = Field(..., min_length=1, description="Target Echo role")
     weight: float = Field(0.5, ge=0.0, le=1.0, description="Influence strength (0.0-1.0)")
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def validate_finite_weight(cls, v: Any) -> float:
+        return _require_finite_float(v, "weight")
 
 
 class QuestConfig(BaseModel):
@@ -163,6 +260,10 @@ class QuestConfig(BaseModel):
         default_factory=list,
         description="Optional inter-Echo influence edges. Auto-generated from role heuristics if omitted.",
     )
+    gatekeeper_route_map: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional mapping of gatekeeper Echo roles to route segments or mile markers.",
+    )
 
     @field_validator("resources")
     @classmethod
@@ -171,6 +272,13 @@ class QuestConfig(BaseModel):
         missing = required - set(v.keys())
         if missing:
             raise ValueError(f"Missing required resources: {missing}")
+        return v
+
+    @field_validator("gatekeeper_route_map")
+    @classmethod
+    def validate_gatekeeper_route_map(cls, v: dict[str, Any]) -> dict[str, Any]:
+        for role, entry in v.items():
+            _validate_gatekeeper_route_entry(role, entry)
         return v
 
 
@@ -205,19 +313,44 @@ def load_quest_from_yaml(quest_id: str, quest_dir: str | Path | None = None) -> 
     except ImportError:
         raise ImportError("PyYAML is required for quest loading. Install with: pip install pyyaml")
 
+    if not quest_id or not isinstance(quest_id, str) or "/" in quest_id or "\\" in quest_id or ".." in quest_id:
+        raise ValueError(f"Invalid quest_id: {quest_id!r}")
+
     quest_path = Path(quest_dir or DEFAULT_QUEST_DIR)
     file_path = quest_path / f"{quest_id}.yaml"
+    raw: Any = None
 
     if not file_path.exists():
         # Try .yml extension
         file_path = quest_path / f"{quest_id}.yml"
         if not file_path.exists():
-            available = [f.stem for f in quest_path.glob("*.y*ml")] if quest_path.exists() else []
-            raise FileNotFoundError(f"Quest '{quest_id}' not found in {quest_path}. Available quests: {available}")
+            # Fallback: scan YAML files in quest_path for matching quest.id
+            matched_path: Path | None = None
+            available: list[str] = []
+            if quest_path.exists():
+                for candidate in sorted(quest_path.glob("*.y*ml")):
+                    try:
+                        with open(candidate, "r") as cf:
+                            candidate_raw = yaml.safe_load(cf)
+                    except Exception:
+                        available.append(candidate.stem)
+                        continue
+                    candidate_quest = candidate_raw.get("quest") if isinstance(candidate_raw, dict) else None
+                    candidate_id = candidate_quest.get("id") if isinstance(candidate_quest, dict) else None
+                    available.append(str(candidate_id or candidate.stem))
+                    if candidate_id == quest_id and matched_path is None:
+                        matched_path = candidate
+                        raw = candidate_raw
+            if matched_path is None:
+                raise FileNotFoundError(
+                    f"Quest '{quest_id}' not found in {quest_path}. Available quests: {available}"
+                )
+            file_path = matched_path
 
     logger.info("Loading quest from %s", file_path)
-    with open(file_path, "r") as f:
-        raw = yaml.safe_load(f)
+    if raw is None:
+        with open(file_path, "r") as f:
+            raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict) or "quest" not in raw:
         raise ValueError(f"Quest file {file_path} must have a top-level 'quest' key")
@@ -274,12 +407,21 @@ def inject_quest_into_state(state: Any, quest: QuestConfig) -> None:
     state["declared_commitments"] = []
     state["contradiction_log"] = []
     state["principle_scores"] = [0.0] * 7
+    state["_raw_principle_scores"] = None
+    state["_principle_scores_normalized"] = False
     state["alert_history"] = []
     state["revealed_agendas"] = []
 
-    # Store influence edges (if defined in quest YAML)
-    if quest.influence_edges:
-        state["influence_edges"] = [edge.model_dump() for edge in quest.influence_edges]
+    # Store influence edges and quest_config topology for advance_tick
+    serialized_edges = [edge.model_dump() for edge in quest.influence_edges]
+    state["influence_edges"] = serialized_edges
+    state["influence_network"] = None
+    state["quest_config"] = {
+        "id": quest.id,
+        "name": quest.name,
+        "gatekeeper_route_map": dict(quest.gatekeeper_route_map),
+        "influence_edges": serialized_edges,
+    }
 
     logger.info(
         "Quest '%s' injected into session state: resources=%s, echoes=%d",

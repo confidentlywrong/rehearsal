@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: guard zero-length road segment projection in buildRoadGraph.
  */
 
 import * as THREE from 'three';
@@ -420,6 +423,10 @@ export class GeoJSONMap {
       if (!pts.length) { graphSegs.push({ roadId, a: ca, b: cb }); continue; }
       const dir = cb.clone().sub(ca);
       const tLen = dir.length();
+      if (tLen < 1e-9) {
+        graphSegs.push({ roadId, a: ca, b: cb });
+        continue;
+      }
       const sorted = pts
         .map(p => ({ p, t: p.clone().sub(ca).dot(dir) / (tLen * tLen) }))
         .filter(x => x.t > 1e-6 && x.t < 1 - 1e-6)

@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: support rediss:// TLS Redis URIs in PrunedRedisSessionService override.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,15 +24,42 @@ deployment environment variables:
 - GOOGLE_CLOUD_AGENT_ENGINE_ID set → VertexAiSessionService (Agent Engine)
 
 CRITICAL: This module must NEVER import or reference SQLite session stores.
-See .agents/skills/high-concurrency-sessions/SKILL.md for rationale.
 """
 
 import logging
 import os
+import re
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _redact_redis_addr(addr: str) -> str:
+    """Mask inline password in redis:// or rediss:// URIs before logging."""
+    return re.sub(r"(rediss?://[^:/@\s]*:)[^@\s]+@", r"\1***@", addr)
+
+
+def _parse_redis_host_port(addr: str) -> tuple[str, int]:
+    """Parse host and port from a non-URI REDIS_ADDR (supports IPv4, hostnames, and IPv6)."""
+    s = (addr or "").strip()
+    if not s:
+        return "localhost", 6379
+    if s.startswith("["):
+        if "]:" in s:
+            bracket_host, _, port_str = s.rpartition("]:")
+            host = bracket_host[1:] or "::1"
+            return host, _int_env_raw(port_str, 6379, "REDIS_ADDR port")
+        if s.endswith("]"):
+            return s[1:-1] or "::1", 6379
+    # Unbracketed IPv6 literal (2+ colons, e.g. "::1") has no port suffix
+    if s.count(":") >= 2:
+        return s, 6379
+    if ":" in s:
+        host, _, port_str = s.rpartition(":")
+        return host or "localhost", _int_env_raw(port_str, 6379, "REDIS_ADDR port")
+    return s, 6379
 
 
 def _int_env(name: str, default: int) -> int:
@@ -40,12 +69,14 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _int_env_raw(raw: str, default: int, label: str) -> int:
-    """Parse *raw* as an integer, falling back to *default* on failure."""
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r, using default %d", label, raw, default)
+    """Parse *raw* as an integer, raising ``ValueError`` if non-empty and invalid."""
+    cleaned = raw.strip()
+    if not cleaned:
         return default
+    try:
+        return int(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer for {label}={raw!r}") from exc
 
 
 @dataclass
@@ -76,13 +107,15 @@ def create_services() -> ServiceConfig:
         ServiceConfig with the appropriate service instances.
     """
     # Check for session store override first
-    override = os.environ.get("SESSION_STORE_OVERRIDE", "").lower()
+    override = os.environ.get("SESSION_STORE_OVERRIDE", "").strip().lower()
     if override == "inmemory":
         return _create_inmemory_override_services()
     elif override == "redis":
         return _create_redis_override_services()
     elif override:
-        logger.warning("Unrecognized SESSION_STORE_OVERRIDE=%r, falling through to default chain.", override)
+        raise ValueError(
+            f"Unrecognized SESSION_STORE_OVERRIDE={override!r}; expected 'inmemory' or 'redis'"
+        )
 
     agent_engine_id = os.environ.get("GOOGLE_CLOUD_AGENT_ENGINE_ID", "")
     database_url = os.environ.get("DATABASE_URL", "")
@@ -130,21 +163,34 @@ def _create_redis_override_services() -> ServiceConfig:
     from agents.utils.pruned_session_service import PrunedRedisSessionService
 
     redis_addr = os.environ.get("REDIS_ADDR", "localhost:6379")
+    redis_password = os.environ.get("REDIS_PASSWORD", "")
+    tls_enabled = os.environ.get("REDIS_TLS_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     max_conn = _int_env("REDIS_SESSION_MAX_CONNECTIONS", 100)
-    if redis_addr.startswith("redis://"):
-        redis_svc = PrunedRedisSessionService(uri=redis_addr, max_connections=max_conn)
-    elif ":" in redis_addr:
-        host, _, port_str = redis_addr.rpartition(":")
-        port = _int_env_raw(port_str, 6379, "REDIS_ADDR port")
-        redis_svc = PrunedRedisSessionService(host=host or "localhost", port=port, max_connections=max_conn)
+    if redis_addr.startswith(("redis://", "rediss://")):
+        uri = redis_addr
+        if tls_enabled and uri.startswith("redis://"):
+            uri = "rediss://" + uri[len("redis://") :]
+        redis_svc = PrunedRedisSessionService(uri=uri, max_connections=max_conn)
     else:
-        # Bare hostname without port — use default Redis port
-        redis_svc = PrunedRedisSessionService(host=redis_addr or "localhost", port=6379, max_connections=max_conn)
+        host, port = _parse_redis_host_port(redis_addr)
+        if redis_password or tls_enabled:
+            scheme = "rediss" if tls_enabled else "redis"
+            auth_part = f":{urllib.parse.quote(redis_password, safe='')}@" if redis_password else ""
+            host_part = f"[{host}]" if ":" in host else host
+            uri = f"{scheme}://{auth_part}{host_part}:{port}"
+            redis_svc = PrunedRedisSessionService(uri=uri, max_connections=max_conn)
+        else:
+            redis_svc = PrunedRedisSessionService(host=host, port=port, max_connections=max_conn)
 
     logger.warning(
         "Runtime target: redis_override (SESSION_STORE_OVERRIDE=redis). "
         "Using PrunedRedisSessionService at %s (max_connections=%d).",
-        redis_addr,
+        _redact_redis_addr(redis_addr),
         max_conn,
     )
     return ServiceConfig(
@@ -218,8 +264,8 @@ def _create_cloud_run_services() -> ServiceConfig:
     # Connection pool sizing — forwarded as **kwargs to create_async_engine().
     # Defaults are intentionally higher than SQLAlchemy's (5/10) to support
     # concurrent session fan-out during broadcast events.
-    pool_size = _int_env("DB_POOL_SIZE", 20)
-    max_overflow = _int_env("DB_MAX_OVERFLOW", 20)
+    pool_size = max(1, _int_env("DB_POOL_SIZE", 20))
+    max_overflow = max(0, _int_env("DB_MAX_OVERFLOW", 20))
     logger.info("DB pool: pool_size=%d, max_overflow=%d", pool_size, max_overflow)
 
     # Workaround for asyncpg dialect not supporting options=-c search_path
@@ -229,11 +275,21 @@ def _create_cloud_run_services() -> ServiceConfig:
         query = urllib.parse.parse_qs(parsed.query)
         schema_name = None
 
-        # Check for options=-c search_path=schema
+        # Check for options=-c search_path=schema (preserve unrelated -c options)
         if "options" in query:
-            options_str = query["options"][0]
-            if "search_path=" in options_str:
-                schema_name = options_str.split("search_path=")[-1].strip()
+            remaining_opts: list[str] = []
+            for opt_val in query["options"]:
+                m = re.search(r"(?:^|\s)(?:-c\s*)?search_path=([^\s]+)", opt_val)
+                if m:
+                    schema_name = m.group(1).strip()
+                    cleaned_opt = re.sub(r"(?:^|\s)(?:-c\s*)?search_path=[^\s]+", "", opt_val).strip()
+                    if cleaned_opt:
+                        remaining_opts.append(cleaned_opt)
+                else:
+                    remaining_opts.append(opt_val)
+            if remaining_opts:
+                query["options"] = remaining_opts
+            else:
                 query.pop("options")
 
         # Also check for explicit server_settings.search_path

@@ -164,7 +164,12 @@ infra/services.auto.tfvars.json
 # google provider for `data` lookups (e.g. cloud-run-services).
 infra/modules/*/.terraform/
 infra/modules/*/.terraform.lock.hcl
-tests/
+/tests/
 
 # Local AI runtime settings
 data/
+
+# Local-only test use-case suites (never pushed to GitHub)
+agents/utils/test_local_ai.py
+agents/leadership_planner_with_eval/tests/test_consultant_and_a2ui_hardening.py
+agents/leadership_planner_with_eval/evaluator/tests/test_evaluator.py

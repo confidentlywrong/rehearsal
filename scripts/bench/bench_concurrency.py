@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: preserve sub-0.1/s benchmark throughput precision instead of rounding to 0.0.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,6 +39,8 @@ import argparse
 import asyncio
 import importlib
 import json
+import logging
+import os
 import time
 import tracemalloc
 import uuid
@@ -45,11 +49,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 from google.genai import types  # noqa: E402
 
-DB_URL = "postgresql+asyncpg://testuser:testpass@127.0.0.1:8104/testdb"
+DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://testuser:testpass@127.0.0.1:9213/testdb")
 
 DEFAULT_LEVELS = [10, 50, 100, 250, 500, 1000, 2000, 5000]
 
@@ -112,8 +118,9 @@ async def run_level(
                 new_message=content,
             ):
                 pass
-        except Exception:
+        except Exception as exc:
             error_count += 1
+            logger.warning("Benchmark session %s failed: %s", sid, exc)
         return time.perf_counter() - t0
 
     wall_start = time.perf_counter()
@@ -139,7 +146,7 @@ async def run_level(
 
     return LevelResult(
         n=n,
-        throughput=round(throughput, 1),
+        throughput=round(throughput, 4),
         p50=pcts["p50"],
         p95=pcts["p95"],
         p99=pcts["p99"],
@@ -186,7 +193,10 @@ def print_results(
     threshold_str = format_duration(p95_threshold)
     for idx, r in enumerate(results):
         if r.p95 > p95_threshold:
-            prev = results[idx - 1] if idx > 0 else r
+            if idx == 0:
+                print(f"\n--- No passing concurrency level (lowest N={r.n} P95 >= {threshold_str}) ---")
+                return
+            prev = results[idx - 1]
             rec_concurrency = prev.n
             rec_10k = max(1, 10_000 // rec_concurrency)
             rec_40k = max(1, 40_000 // rec_concurrency)

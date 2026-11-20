@@ -1,4 +1,6 @@
 // Copyright 2026 Google LLC
+// Modifications copyright 2026 Christian Haeussinger
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -392,7 +394,7 @@ func TestIntegration_CatalogDiscovery_NoPathCardUsesBaseURL(t *testing.T) {
 	card := AgentCard{
 		Name:    "runner_autopilot",
 		Version: "1.0.0",
-		URL:     "http://some-host:8210/",
+		URL:     "http://some-host:9120/",
 	}
 	cardJSON, _ := json.Marshal(card)
 

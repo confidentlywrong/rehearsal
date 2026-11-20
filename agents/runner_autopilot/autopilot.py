@@ -26,6 +26,7 @@ independently testable with mock state dicts and LlmRequest objects.
 """
 
 import logging
+import math
 import random
 from collections.abc import Callable
 from enum import Enum
@@ -75,12 +76,44 @@ def detect_phase(llm_request: LlmRequest) -> Phase:
     return Phase.DECIDE
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
 def extract_last_user_text(llm_request: LlmRequest) -> str:
     """Extract the text from the last user message in the request.
 
     Walks backwards through contents to find the last content with role='user'
     that has text parts, skipping model responses and function_response entries.
     """
+    if not llm_request.contents:
+        return ""
     for content in reversed(llm_request.contents):
         if content.role != "user":
             continue
@@ -136,8 +169,8 @@ def handle_start_gun(state: StateLike, data: dict) -> LlmResponse:
 
 def handle_crowd_boost(state: StateLike, data: dict) -> LlmResponse:
     """Crowd cheering. Accelerate with provided or default intensity."""
-    intensity = data.get("intensity", 0.5)
-    return _function_call_response("accelerate", {"intensity": float(intensity)})
+    intensity = max(0.0, min(1.0, _finite_float(data.get("intensity"), 0.5)))
+    return _function_call_response("accelerate", {"intensity": intensity})
 
 
 def handle_distance_update(state: StateLike, data: dict) -> LlmResponse:
@@ -169,12 +202,15 @@ def handle_hydration_station(state: StateLike, data: dict) -> LlmResponse:
     - >60: 30% chance to stop
     - Exhausted: always stop
     """
-    water = state.get("water", 100)
-    exhausted = state.get("exhausted", False)
+    water = max(0.0, min(100.0, _finite_float(state.get("water", 100), 100.0)))
+    exhausted = bool(state.get("exhausted", False))
 
     # L9: Use session-seeded RNG for deterministic replays.
-    session_id = data.get("_session_id", "default")
-    tick = data.get("tick", state.get("tick", 0))
+    session_id = data.get("_session_id") or "default"
+    raw_tick = data.get("tick")
+    if raw_tick is None:
+        raw_tick = state.get("tick", 0)
+    tick = _finite_int(raw_tick, 0)
     rng = random.Random(runner_seed(str(session_id), salt=tick))
 
     should_stop = (
@@ -203,22 +239,56 @@ def handle_tick(state: StateLike, data: dict) -> LlmResponse:
     """
     # Initialize on first tick if not yet done.
     if state.get("velocity") is None:
-        session_id = data.get("_session_id", "default")
-        runner_count = data.get("runner_count", 1)
+        session_id = data.get("_session_id") or "default"
+        runner_count = data.get("runner_count")
+        if runner_count is None:
+            runner_count = state.get("runner_count")
+        if (
+            not isinstance(runner_count, int)
+            or isinstance(runner_count, bool)
+            or runner_count <= 0
+        ):
+            logger.warning(
+                "CRITICAL: runner_count is missing/invalid (%r) for session %s, defaulting to 1",
+                runner_count,
+                session_id,
+            )
+            runner_count = 1
         initialize_runner(state, session_id, runner_count=runner_count)
 
+    minutes_per_tick = max(0.0, _finite_float(data.get("minutes_per_tick"), 15.0))
+    elapsed_minutes = max(0.0, _finite_float(data.get("elapsed_minutes"), 0.0))
+    race_distance_mi = _finite_float(data.get("race_distance_mi"), DEFAULT_RACE_DISTANCE_MI)
+    if race_distance_mi <= 0.0:
+        race_distance_mi = DEFAULT_RACE_DISTANCE_MI
+    tick = max(0, _finite_int(data.get("tick"), 0))
+    raw_cbk = data.get("collector_buffer_key")
+    collector_key = raw_cbk if isinstance(raw_cbk, str) else ""
+    raw_stations = data.get("station_index")
+    raw_sim_id = data.get("simulation_id")
+
+    state["_tick_params"] = {
+        "tick": tick,
+        "minutes_per_tick": minutes_per_tick,
+        "elapsed_minutes": elapsed_minutes,
+        "race_distance_mi": race_distance_mi,
+        "collector_buffer_key": collector_key,
+        "station_index": raw_stations if isinstance(raw_stations, dict) else {},
+        "weather_modifier": data.get("weather_modifier", 1.0),
+        "simulation_id": raw_sim_id if isinstance(raw_sim_id, str) else "",
+    }
+
     args: dict = {
-        "minutes_per_tick": data.get("minutes_per_tick", 15.0),
-        "elapsed_minutes": data.get("elapsed_minutes", 0.0),
-        "race_distance_mi": data.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
-        "tick": data.get("tick", 0),
+        "minutes_per_tick": minutes_per_tick,
+        "elapsed_minutes": elapsed_minutes,
+        "race_distance_mi": race_distance_mi,
+        "tick": tick,
         # process_tick now requires inner_thought (Task I made it
         # schema-required to prevent small-model LLM runners from dropping
         # the optional field). The deterministic autopilot has no LLM to
         # generate prose; empty string preserves the prior result shape.
         "inner_thought": "",
     }
-    collector_key = data.get("collector_buffer_key", "")
     if collector_key:
         args["collector_buffer_key"] = collector_key
     return _function_call_response("process_tick", args)
@@ -226,9 +296,9 @@ def handle_tick(state: StateLike, data: dict) -> LlmResponse:
 
 def build_summary(state: StateLike) -> LlmResponse:
     """Build a one-sentence summary after tool execution."""
-    velocity = state.get("velocity", 0.0)
-    water = state.get("water", 100)
-    distance = state.get("distance", 0.0)
+    velocity = _finite_float(state.get("velocity", 0.0), 0.0)
+    water = _finite_float(state.get("water", 100), 100.0)
+    distance = _finite_float(state.get("distance", 0.0), 0.0)
     exhausted = state.get("exhausted", False)
     finished = state.get("finished", False)
     collapsed = state.get("collapsed", False)
@@ -292,7 +362,7 @@ def autopilot_callback(
     # Inject session_id for handlers that need it (START_GUN for ack,
     # TICK for initialize_runner on tick 0).
     if event.event in (RunnerEventType.START_GUN, RunnerEventType.TICK):
-        event.data["_session_id"] = getattr(getattr(callback_context, "session", None), "id", "default")
+        event.data["_session_id"] = getattr(getattr(callback_context, "session", None), "id", None) or "default"
 
     return handler(state, event.data)
 

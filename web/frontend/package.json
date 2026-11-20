@@ -3,11 +3,12 @@
   "version": "0.0.0",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve --host 0.0.0.0 --port 9119 --proxy-config proxy.conf.json",
+    "start": "ng serve --host 0.0.0.0 --port 9119 --proxy-config proxy.conf.json --no-live-reload --no-hmr",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "test": "ng test --no-watch",
-    "test:vitest": "vitest run"
+    "test": "vitest run",
+    "test:vitest": "vitest run",
+    "test:ng": "ng test --no-watch"
   },
   "prettier": {
     "printWidth": 100,

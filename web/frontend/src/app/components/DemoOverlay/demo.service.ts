@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: support Shift+Digit5/Digit7 hotkeys across keyboard layouts and normalize letter hotkeys.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,19 +37,23 @@ export class DemoService implements OnDestroy {
 
   /** Ctrl+5/7 map to 5a/7a; Ctrl+Shift+5/7 map to 5b/7b. Other digit hotkeys align by index with DEMO_IDS. */
   private demoIdFromHotkey(e: KeyboardEvent): DemoId | undefined {
-    const { key, shiftKey } = e;
-    if (key === '5') return shiftKey ? '5b' : '5a';
-    if (key === '7') return shiftKey ? '7b' : '7a';
+    const { shiftKey, code } = e;
+    const key = e.key.toLowerCase();
+    if (key === '5' || code === 'Digit5') return shiftKey ? '5b' : '5a';
+    if (key === '7' || code === 'Digit7') return shiftKey ? '7b' : '7a';
     const idx = DEMO_HOTKEYS.indexOf(key);
     if (idx < 0 || key === 'd' || key === 'r') return undefined;
     return DEMO_IDS[idx];
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
-    if (e.ctrlKey && DEMO_HOTKEYS.includes(e.key)) {
-      if (e.key === 'a' || e.key === 's' || e.key === 'd') {
+    if (!e.ctrlKey) return;
+    const key = e.key.toLowerCase();
+    const isShiftDigitDemo = e.code === 'Digit5' || e.code === 'Digit7';
+    if (DEMO_HOTKEYS.includes(key) || isShiftDigitDemo) {
+      if (key === 'a' || key === 's' || key === 'd') {
         const cameras = ['a', 's', 'd'];
-        const index = cameras.findIndex((v) => v === e.key);
+        const index = cameras.findIndex((v) => v === key);
         const item = {
           id: 'camera',
           icon: 'videocam',
@@ -64,20 +70,14 @@ export class DemoService implements OnDestroy {
             detail: { id: item.id, value: item.options[index], index: index },
           }),
         );
-        if (e.key === 'd') {
-          return;
-        }
-      }
-      if (e.key === 'd') {
-        this.showAlternativePanels.set(!this.showAlternativePanels());
         return;
       }
-      if (e.key === 'l') {
+      if (key === 'l') {
         this.cachedMessagesToggle.update((n) => n + 1);
         return;
       }
       const nextId = this.demoIdFromHotkey(e);
-      if (e.key === 'r' || nextId === this.activeDemo()) {
+      if (key === 'r' || nextId === this.activeDemo()) {
         this.reset.update((n) => n + 1);
         return;
       }

@@ -1,7 +1,20 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changed for The Rehearsal: trigger OnPush change detection inside NgZone when route intro completes.
  */
 
 import { Injectable, NgZone, ChangeDetectorRef, inject } from '@angular/core';
@@ -22,14 +35,21 @@ export class AgentPanelTabExpansionService {
   showTabLabels = true;
 
   private panelCollapseInProgress = false;
+  private destroyed = false;
   private showTabLabelsAfterGrowTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private shrinkThenClosePanelTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private pendingTab: 'agent' | 'organizer' | 'log' | null = null;
   private tabSwitchAfterShrinkTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
   connect(cdr: ChangeDetectorRef, scheduleAutoResize: () => void): void {
+    this.destroyed = false;
     this.cdr = cdr;
     this.scheduleAutoResize = scheduleAutoResize;
+  }
+
+  dispose(): void {
+    this.destroyed = true;
+    this.clearAnimationTimers();
   }
 
   private mark(): void {
@@ -52,7 +72,12 @@ export class AgentPanelTabExpansionService {
   }
 
   onRouteIntroComplete(): void {
-    this.isExpanded = true;
+    if (this.destroyed) return;
+    this.ngZone.run(() => {
+      if (this.destroyed) return;
+      this.isExpanded = true;
+      this.mark();
+    });
   }
 
   setActiveTab(tab: 'agent' | 'organizer' | 'log'): void {
@@ -121,7 +146,9 @@ export class AgentPanelTabExpansionService {
     }
     this.showTabLabelsAfterGrowTimeoutId = setTimeout(() => {
       this.showTabLabelsAfterGrowTimeoutId = null;
+      if (this.destroyed) return;
       this.ngZone.run(() => {
+        if (this.destroyed) return;
         this.showTabLabels = true;
         this.mark();
       });
@@ -161,7 +188,9 @@ export class AgentPanelTabExpansionService {
       this.mark();
       this.shrinkThenClosePanelTimeoutId = setTimeout(() => {
         this.shrinkThenClosePanelTimeoutId = null;
+        if (this.destroyed) return;
         this.ngZone.run(() => {
+          if (this.destroyed) return;
           this.isExpanded = false;
           this.mark();
         });
@@ -194,6 +223,7 @@ export class AgentPanelTabExpansionService {
       this.mark();
       this.tabSwitchAfterShrinkTimeoutId = setTimeout(() => {
         this.tabSwitchAfterShrinkTimeoutId = null;
+        if (this.destroyed) return;
         this.ngZone.run(() => this.applyTabOpenAfterSwitch());
       }, TAB_ANIM_PILL_MS);
       return;
@@ -205,7 +235,9 @@ export class AgentPanelTabExpansionService {
     this.mark();
     this.shrinkThenClosePanelTimeoutId = setTimeout(() => {
       this.shrinkThenClosePanelTimeoutId = null;
+      if (this.destroyed) return;
       this.ngZone.run(() => {
+        if (this.destroyed) return;
         this.isExpanded = false;
         this.mark();
       });

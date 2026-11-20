@@ -47,6 +47,8 @@ INFRA_DIR="$(cd "$BACKEND_DIR/infra" && pwd)"
 ALLOYDB_USER="${ALLOYDB_USER:-postgres}"
 ALLOYDB_DATABASE="${ALLOYDB_DATABASE:-postgres}"
 ALLOYDB_PORT="${ALLOYDB_PORT:-5432}"
+ALLOYDB_SCHEMA="${ALLOYDB_SCHEMA:-public}"
+ALLOYDB_SECRET_NAME="${ALLOYDB_SECRET_NAME:-am-db-password}"
 
 
 
@@ -66,19 +68,27 @@ require psql   "Install with: brew install libpq && brew link --force libpq"
 require gcloud "Install from: https://cloud.google.com/sdk/docs/install"
 require uv     "Install from: https://docs.astral.sh/uv/getting-started/installation/"
 
+if [[ ! "$ALLOYDB_SCHEMA" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  die "Invalid ALLOYDB_SCHEMA identifier: '$ALLOYDB_SCHEMA'"
+fi
+export PGOPTIONS="-c search_path=${ALLOYDB_SCHEMA},public"
+
 # ---------------------------------------------------------------------------
 # Step 1: Resolve ALLOYDB_PASSWORD
 # ---------------------------------------------------------------------------
 log "Resolving AlloyDB password..."
+if [[ -n "${ALLOYDB_PASSWORD:-}" && -z "${ALLOYDB_PASSWORD//[[:space:]]/}" ]]; then
+  die "ALLOYDB_PASSWORD is set to whitespace only. Provide a valid password or unset it to fetch from Secret Manager."
+fi
 if [[ -z "${ALLOYDB_PASSWORD:-}" ]]; then
-  PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
-  if SECRET=$(gcloud secrets versions access latest --secret="am-db-password" --project="$PROJECT_ID" 2>/dev/null); then
+  PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
+  [[ -n "$PROJECT_ID" ]] || die "ALLOYDB_PASSWORD is not set and gcloud project is unset (cannot fetch secret '$ALLOYDB_SECRET_NAME')."
+  if SECRET=$(gcloud secrets versions access latest --secret="$ALLOYDB_SECRET_NAME" --project="$PROJECT_ID" 2>/dev/null); then
+    [[ -n "${SECRET//[[:space:]]/}" ]] || die "Secret Manager returned an empty/whitespace password for secret '$ALLOYDB_SECRET_NAME' in project '$PROJECT_ID'."
     export ALLOYDB_PASSWORD="$SECRET"
-    ok "Password fetched from Secret Manager (alloydb-password)"
+    ok "Password fetched from Secret Manager ($ALLOYDB_SECRET_NAME)"
   else
-    warn "ALLOYDB_PASSWORD not set and Secret Manager fetch failed."
-    warn "Falling back to Terraform hardcoded dev password."
-    export ALLOYDB_PASSWORD="DevPassword123!"
+    die "ALLOYDB_PASSWORD is not set and Secret Manager fetch failed for secret '$ALLOYDB_SECRET_NAME' in project '$PROJECT_ID'."
   fi
 else
   ok "ALLOYDB_PASSWORD already set."
@@ -89,8 +99,13 @@ export PGPASSWORD="$ALLOYDB_PASSWORD"
 # Step 2: Resolve ALLOYDB_HOST
 # ---------------------------------------------------------------------------
 log "Resolving AlloyDB host IP..."
+if [[ -n "${ALLOYDB_HOST:-}" ]]; then
+  ALLOYDB_HOST="${ALLOYDB_HOST#"${ALLOYDB_HOST%%[![:space:]]*}"}"
+  ALLOYDB_HOST="${ALLOYDB_HOST%"${ALLOYDB_HOST##*[![:space:]]}"}"
+  [[ -z "$ALLOYDB_HOST" ]] && die "ALLOYDB_HOST is set to whitespace only. Set it manually: export ALLOYDB_HOST=<ip>"
+fi
 if [[ -z "${ALLOYDB_HOST:-}" ]]; then
-  PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+  PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
   REGION="${REGION:-us-central1}"
 
   # Try terraform output first
@@ -98,21 +113,32 @@ if [[ -z "${ALLOYDB_HOST:-}" ]]; then
     ALLOYDB_HOST="$(terraform -chdir="$INFRA_DIR" output -raw alloydb_ip_address 2>/dev/null || true)"
   fi
 
-  if [[ -z "$ALLOYDB_HOST" ]]; then
+  if [[ -n "${ALLOYDB_HOST:-}" ]]; then
+    ALLOYDB_HOST="${ALLOYDB_HOST#"${ALLOYDB_HOST%%[![:space:]]*}"}"
+    ALLOYDB_HOST="${ALLOYDB_HOST%"${ALLOYDB_HOST##*[![:space:]]}"}"
+  fi
+
+  if [[ -z "${ALLOYDB_HOST:-}" ]]; then
     warn "Could not get IP from terraform output — trying gcloud..."
     ALLOYDB_HOST="$(
       gcloud alloydb instances describe agent-memory \
         --cluster=am-cluster \
         --region="$REGION" \
         --project="$PROJECT_ID" \
-        --format="value(ipAddress)" 2>/dev/null
+        --format="value(ipAddress)" 2>/dev/null || true
     )"
   fi
 
-  [[ -z "$ALLOYDB_HOST" ]] && die "Could not determine ALLOYDB_HOST. Set it manually: export ALLOYDB_HOST=<ip>"
+  if [[ -n "${ALLOYDB_HOST:-}" ]]; then
+    ALLOYDB_HOST="${ALLOYDB_HOST#"${ALLOYDB_HOST%%[![:space:]]*}"}"
+    ALLOYDB_HOST="${ALLOYDB_HOST%"${ALLOYDB_HOST##*[![:space:]]}"}"
+  fi
+
+  [[ -z "${ALLOYDB_HOST:-}" ]] && die "Could not determine ALLOYDB_HOST. Set it manually: export ALLOYDB_HOST=<ip>"
   export ALLOYDB_HOST
   ok "AlloyDB host: $ALLOYDB_HOST"
 else
+  export ALLOYDB_HOST
   ok "ALLOYDB_HOST already set: $ALLOYDB_HOST"
 fi
 
@@ -129,7 +155,7 @@ ok "Connection successful."
 # ---------------------------------------------------------------------------
 # Step 4: Apply schema (idempotent)
 # ---------------------------------------------------------------------------
-log "Applying schema (rules + planned_routes + simulation_records)..."
+log "Applying schema (rules + planned_routes + simulation_records + simulation_summaries)..."
 psql "host=$ALLOYDB_HOST port=$ALLOYDB_PORT user=$ALLOYDB_USER dbname=$ALLOYDB_DATABASE" \
   --file="$SCRIPT_DIR/schema.sql" \
   --quiet
@@ -153,9 +179,11 @@ ok "Rules table has $RULES_COUNT row(s)."
 # ---------------------------------------------------------------------------
 log "Seeding planned_routes from memory/seeds/*.json..."
 ALLOYDB_HOST="$ALLOYDB_HOST" \
+ALLOYDB_PORT="$ALLOYDB_PORT" \
 ALLOYDB_PASSWORD="$ALLOYDB_PASSWORD" \
 ALLOYDB_DATABASE="$ALLOYDB_DATABASE" \
 ALLOYDB_USER="$ALLOYDB_USER" \
+ALLOYDB_SCHEMA="$ALLOYDB_SCHEMA" \
   uv run --directory="$BACKEND_DIR" \
     python -m agents.planner_with_memory.alloydb.seed_routes
 

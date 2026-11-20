@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: add unit tests for non-finite and negative buffer cap/batch options.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -205,5 +207,23 @@ describe("createLogBuffer (rAF-batched)", () => {
     // evictionBatch (10) clamped to container.children.length (3) => all removed
     expect(container.children.length).toBe(0);
     expect(buf.droppedCount()).toBe(3);
+  });
+
+  it("falls back to safe defaults on NaN, zero, or negative maxEntries/evictionBatch", async () => {
+    const buf = createLogBuffer({
+      container: () => container,
+      maxEntries: Number.NaN,
+      evictionBatch: -5,
+    });
+
+    for (let i = 0; i < 6; i++) {
+      buf.append(document.createElement("div"));
+    }
+
+    await flushRAF();
+
+    // Should retain entries up to default cap instead of breaking comparison against NaN
+    expect(container.children.length).toBe(6);
+    expect(buf.droppedCount()).toBe(0);
   });
 });

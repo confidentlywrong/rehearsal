@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +32,7 @@ from google.adk.apps import App
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 
+from agents.utils.models import DEFAULT_PLANNER_MODEL
 from agents.utils.simulation_executor import SimulationExecutor
 
 
@@ -62,7 +65,7 @@ def test_register_a2a_routes_uses_simulation_executor():
     from agents.utils.a2a import register_a2a_routes
 
     app = FastAPI()
-    agent = Agent(name="test_agent", model="gemini-3-flash-preview")
+    agent = Agent(name="test_agent", model=DEFAULT_PLANNER_MODEL)
     adk_app = App(name="test_agent", root_agent=agent)
     runner = Runner(app=adk_app, session_service=InMemorySessionService())
     card = _make_agent_card("test_agent")
@@ -104,7 +107,7 @@ def test_register_a2a_routes_executor_has_runner():
     from agents.utils.a2a import register_a2a_routes
 
     app = FastAPI()
-    agent = Agent(name="test_agent", model="gemini-3-flash-preview")
+    agent = Agent(name="test_agent", model=DEFAULT_PLANNER_MODEL)
     adk_app = App(name="test_agent", root_agent=agent)
     runner = Runner(app=adk_app, session_service=InMemorySessionService())
     card = _make_agent_card("test_agent")
@@ -146,7 +149,7 @@ def test_register_a2a_routes_executor_has_runner():
 
 def test_simulation_executor_external_runner_skips_lazy_init():
     """SimulationExecutor with external runner should skip _init_runner."""
-    agent = Agent(name="test", model="gemini-3-flash-preview")
+    agent = Agent(name="test", model=DEFAULT_PLANNER_MODEL)
     adk_app = App(name="test", root_agent=agent)
     session_svc = InMemorySessionService()
     runner = Runner(app=adk_app, session_service=session_svc)

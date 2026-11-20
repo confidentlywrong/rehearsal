@@ -17,19 +17,27 @@
 Mirrors agents/planner_with_eval/evaluator/tools.py but evaluates
 leadership scenarios against 6 enterprise-grade criteria instead of
 7 marathon criteria.  Includes session-state enrichment, weighted
-scoring via config, and keyword-based heuristic fallback.
+scoring via config, and local Gemma LLM-as-Judge execution via
+generate_local_json_async when local Gemma mode is active.
 """
 
 import hashlib
 import json
 import logging
+import math
 import os
-import re
 from typing import Any, Dict
 
 from google.genai import Client, types
 
 import agents.utils.local_ai as local_ai
+from agents.leadership_planner_with_eval.evaluator.config import (
+    CRITERION_WEIGHTS,
+    EVALUATION_CRITERIA,
+    MODEL,
+    PASS_THRESHOLD,
+    SEVERITY_THRESHOLDS,
+)
 from agents.utils.retry import resilient_http_options
 
 
@@ -43,15 +51,45 @@ async def generate_local_json_async(*args: Any, **kwargs: Any) -> Any:
     return await local_ai.generate_local_json_async(*args, **kwargs)
 
 
-from agents.leadership_planner_with_eval.evaluator.config import (
-    CRITERION_WEIGHTS,
-    EVALUATION_CRITERIA,
-    MODEL,
-    PASS_THRESHOLD,
-    SEVERITY_THRESHOLDS,
-)
-
 logger = logging.getLogger(__name__)
+
+
+def _strip_nonfinite(obj: object, seen: set[int] | None = None) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool, type(None))):
+        return obj
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return f"<CircularReference: {type(obj).__name__}>"
+    seen.add(obj_id)
+    try:
+        if isinstance(obj, dict):
+            return {
+                (
+                    k
+                    if isinstance(k, (str, int, bool, type(None)))
+                    or (isinstance(k, float) and math.isfinite(k))
+                    else str(k)
+                ): _strip_nonfinite(v, seen)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, (list, tuple)):
+            return [_strip_nonfinite(v, seen) for v in obj]
+        return obj
+    finally:
+        seen.remove(obj_id)
+
+
+def _strict_json_dumps(obj: object) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON with default=str fallback."""
+    try:
+        return json.dumps(obj, allow_nan=False, default=str)
+    except (ValueError, TypeError):
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, default=str)
 
 EVALUATOR_MODEL = MODEL
 
@@ -64,13 +102,19 @@ _client_key: tuple | None = None
 def _get_client() -> Client:
     """Lazy-singleton GenAI client with project/API-key config and retry options."""
     global _client, _client_key
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID") or ""
+    project_id = (
+        (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+        or (os.environ.get("PROJECT_ID") or "").strip()
+    )
     # M10 fix: Default to "global" to match the rest of the codebase.
     # "us-central1" doesn't support all Gemini model variants and caused
     # silent fallback to heuristic scoring.
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in ("0", "false", "no")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
+    use_vertex = (os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") or "").strip().lower() not in ("0", "false", "no")
+    api_key = (
+        (os.environ.get("GEMINI_API_KEY") or "").strip()
+        or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+    )
     vertex_active = bool(project_id and use_vertex)
     key = (
         vertex_active,
@@ -199,6 +243,25 @@ Rules:
 - Output exclusively the JSON object.
 """
 
+LOCAL_EVALUATOR_PROMPT = """\
+Score this leadership scenario (0-100 ints) and output ONLY compact JSON:
+{{
+  "summary": "<1 short sentence max 10 words>",
+  "improvement_suggestions": ["<1 actionable tip max 10 words>"],
+  "scores": {{
+    "stakeholder_alignment": <int>,
+    "decision_quality": <int>,
+    "resource_stewardship": <int>,
+    "crisis_readiness": <int>,
+    "strategic_coherence": <int>,
+    "ethical_alignment": <int>
+  }}
+}}
+
+Scenario:
+{plan_text}
+"""
+
 
 def _build_criteria_block() -> str:
     """Build the criteria description block for the evaluator prompt."""
@@ -224,9 +287,15 @@ def _normalize_score(raw_score: Any) -> int:
     """
     if isinstance(raw_score, dict):
         raw_score = raw_score.get("score", raw_score.get("value", 0))
+    if isinstance(raw_score, bool):
+        return 0
     try:
         val = float(raw_score)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(val):
+        return 0
+    if val <= 0.0:
         return 0
     if val <= 1.0:
         normalized = val * 100  # 0-1 fractional scale → 0-100
@@ -234,6 +303,8 @@ def _normalize_score(raw_score: Any) -> int:
         normalized = val * 20  # 1-5 scale → 0-100
     else:
         normalized = val  # Already 0-100
+    if not math.isfinite(normalized) or normalized >= 100.0:
+        return 100
     return min(max(round(normalized), 0), 100)
 
 
@@ -268,34 +339,6 @@ and details for a leadership scenario, generate specific, actionable improvement
 {{"suggestions": ["suggestion 1", "suggestion 2", ...], "summary": "Brief evaluation summary."}}"""
 
 
-_DETERMINISTIC_SUGGESTIONS = {
-    "stakeholder_alignment": (
-        "Diversify the stakeholder topology by adding roles with conflicting "
-        "priorities, varied seniority levels, and cross-departmental dependencies."
-    ),
-    "decision_quality": (
-        "Increase dilemma complexity by removing obviously correct choices, adding "
-        "time pressure, and introducing cascading consequences across departments."
-    ),
-    "resource_stewardship": (
-        "Add budget constraints with competing allocation demands, introduce "
-        "scarcity mechanics, and require cost-benefit justification for key decisions."
-    ),
-    "crisis_readiness": (
-        "Include black swan events with escalation paths, contingency planning "
-        "requirements, and resilience testing under cascading failure scenarios."
-    ),
-    "strategic_coherence": (
-        "Ensure all scenario phases align with stated strategic goals, maintain "
-        "progressive complexity, and connect stakeholder motivations to outcomes."
-    ),
-    "ethical_alignment": (
-        "Introduce ethical boundary-testing dilemmas, policy compliance checks, "
-        "fairness metrics, and transparency requirements across decision rounds."
-    ),
-}
-
-
 async def _generate_feedback(
     scores: dict[str, int],
     details: dict[str, str],
@@ -304,12 +347,14 @@ async def _generate_feedback(
 ) -> tuple[list[str], str]:
     """Generate LLM-powered improvement suggestions and summary.
 
-    Makes a single GenerateContent call using EVALUATOR_MODEL. Falls back
-    to deterministic suggestions if the call fails.
+    Makes a single GenerateContent call using EVALUATOR_MODEL in cloud mode
+    or generate_local_json_async in local Gemma mode, and raises on LLM or
+    JSON failure.
     """
     scores_text = "\n".join(f"- {k}: {v}" for k, v in scores.items())
     details_text = "\n".join(f"- {k}: {v}" for k, v in details.items())
-    plan_excerpt = proposed_plan[:2000]
+    local_active = is_local_gemma_active()
+    plan_excerpt = proposed_plan[:900] if local_active else proposed_plan[:2000]
 
     prompt = _FEEDBACK_PROMPT_TEMPLATE.format(
         scores_text=scores_text,
@@ -318,18 +363,16 @@ async def _generate_feedback(
         plan_excerpt=plan_excerpt,
     )
 
-    if is_local_gemma_active():
-        suggestions = []
-        for criterion, score in scores.items():
-            if score < 85 and criterion in _DETERMINISTIC_SUGGESTIONS:
-                suggestions.append(_DETERMINISTIC_SUGGESTIONS[criterion])
-        if not suggestions:
-            suggestions = [
-                "Maintain proactive cross-functional communication channels during transition phases.",
-                "Ensure continuous stakeholder sentiment monitoring throughout rollout.",
-            ]
-        summary = "Leadership scenario evaluation complete with strong baseline viability across criteria."
-        return suggestions, summary
+    if local_active:
+        response_text = (
+            await generate_local_json_async(
+                prompt + "\nBe concise: 1-2 short suggestions (<12 words each) and 1 concise sentence summary.",
+                temperature=0.3,
+                max_tokens=200,
+                timeout=240.0,
+            )
+            or "{}"
+        )
     else:
         client = _get_client()
         response = await client.aio.models.generate_content(
@@ -422,22 +465,43 @@ def _extract_response_reason(response: Any) -> str:
         return "unknown"
 
 
-def _empty_response_result(reason: str, input_hash: str) -> Dict[str, Any]:
-    """Build a graceful "the LLM returned no text" result.
-
-    Same shape as ``_build_result`` so downstream tools (``store_scenario``,
-    the planner workflow) can treat this identically to a real evaluation
-    that scored zero. ``eval_method="empty_llm_response"`` lets ops filter
-    these out in logs and lets the LLM planner detect the failure mode
-    via ``result["eval_method"]`` and choose to retry with a tightened
-    plan. Downstream will not crash on this shape — it is the same
-    contract every other evaluation return honours.
-    """
+def _error_result(
+    *,
+    reason: str,
+    eval_method: str,
+    input_hash: str,
+    title: str,
+    description: str,
+    suggestion: str,
+) -> Dict[str, Any]:
+    """Build a structured non-passing error result for failed evaluator paths."""
     zero_scores = {c: 0 for c in EVALUATION_CRITERIA}
-    finding = {
-        "title": "Evaluator produced no scorable output",
-        "severity": "MAJOR",
-        "description": (
+    return {
+        "status": "error",
+        "passed": False,
+        "scores": zero_scores,
+        "findings": [
+            {
+                "title": title,
+                "severity": "MAJOR",
+                "description": description,
+            }
+        ],
+        "improvement_suggestions": [suggestion],
+        "overall_score": 0,
+        "summary": f"{title} ({reason}); scenario NOT scored (input_hash={input_hash}).",
+        "eval_method": eval_method,
+    }
+
+
+def _empty_response_result(reason: str, input_hash: str) -> Dict[str, Any]:
+    """Build a structured error result when the LLM returns no text."""
+    return _error_result(
+        reason=reason,
+        eval_method="empty_llm_response",
+        input_hash=input_hash,
+        title="Evaluator produced no scorable output",
+        description=(
             f"The LLM evaluator returned an empty response ({reason}). "
             "The scenario was NOT scored. This usually means the prompt was "
             "blocked by safety filters, exceeded the output token budget, "
@@ -445,20 +509,94 @@ def _empty_response_result(reason: str, input_hash: str) -> Dict[str, Any]:
             "plan_text, fewer stakeholders in the enrichment blob, or a "
             "less sensitive framing."
         ),
-    }
-    return {
-        "status": "error",
-        "passed": False,
-        "scores": zero_scores,
-        "findings": [finding],
-        "improvement_suggestions": [
+        suggestion=(
             "Evaluator returned no text; retry with a smaller plan input or "
             "verify safety filter settings. See finding for details."
-        ],
-        "overall_score": 0,
-        "summary": f"Evaluator empty response ({reason}); scenario NOT scored (input_hash={input_hash}).",
-        "eval_method": "empty_llm_response",
+        ),
+    )
+
+
+def _is_memory_persistence_configured() -> bool:
+    """Return True when AlloyDB env vars are set or a non-AlloyDB test store is active."""
+    if os.environ.get("ALLOYDB_HOST", "").strip() or os.environ.get("ALLOYDB_INSTANCE_CONNECTION_NAME", "").strip():
+        return True
+    try:
+        from agents.leadership_planner_with_memory.memory import tools as mem_tools
+        from agents.leadership_planner_with_memory.memory.store_alloydb import AlloyDBScenarioStore
+
+        return not isinstance(mem_tools._store, AlloyDBScenarioStore)
+    except ImportError:
+        return False
+
+
+async def _auto_store_scenario_if_configured(tool_context: Any) -> None:
+    """Persist evaluated scenario when memory persistence is configured, logging errors loudly."""
+    if not _is_memory_persistence_configured():
+        return
+    try:
+        from agents.leadership_planner_with_memory.memory.tools import store_scenario
+
+        store_res = await store_scenario(tool_context)
+        if isinstance(store_res, dict):
+            if store_res.get("status") == "error":
+                logger.error(
+                    "evaluate_leadership_plan: auto store_scenario returned error: %s",
+                    store_res.get("message") or store_res,
+                )
+            elif store_res.get("artifacts_autoflush_error"):
+                logger.warning(
+                    "evaluate_leadership_plan: auto store_scenario artifacts autoflush error: %s",
+                    store_res.get("artifacts_autoflush_error"),
+                )
+    except Exception as exc:
+        logger.error(
+            "evaluate_leadership_plan: auto store_scenario failed: %s",
+            exc,
+            exc_info=True,
+        )
+
+
+def _normalize_finding(raw_finding: Any) -> dict[str, Any] | None:
+    """Normalize a single LLM finding dict and canonicalize severity."""
+    if not isinstance(raw_finding, dict):
+        return None
+    raw_sev = str(raw_finding.get("severity") or "MODERATE").strip().upper()
+    sev_aliases = {
+        "HIGH": "MAJOR",
+        "CRITICAL": "MAJOR",
+        "SEVERE": "MAJOR",
+        "MAJOR": "MAJOR",
+        "MEDIUM": "MODERATE",
+        "MODERATE": "MODERATE",
+        "LOW": "MINOR",
+        "MINOR": "MINOR",
     }
+    severity = sev_aliases.get(raw_sev, "MODERATE")
+    normalized = dict(raw_finding)
+    normalized["severity"] = severity
+    normalized.setdefault("title", "Evaluation Finding")
+    normalized.setdefault("description", "")
+    return normalized
+
+
+def _coerce_result_score(raw_score: Any) -> int:
+    """Safely coerce an already-normalized score to an int in [0, 100].
+
+    Unlike ``_normalize_score``, this does not rescale 1-5 values, so direct
+    callers of ``_build_result`` with small 0-100 scores keep their exact values
+    while non-numeric / bool / NaN / Inf / overflowing inputs default to 0.
+    """
+    if raw_score is None or isinstance(raw_score, bool):
+        return 0
+    if isinstance(raw_score, int):
+        return max(0, min(100, raw_score))
+    try:
+        val = float(raw_score)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(val):
+        return 0
+    return max(0, min(100, round(val)))
 
 
 def _build_result(
@@ -471,9 +609,25 @@ def _build_result(
     weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the final evaluation result from scores, details, and findings."""
+    safe_scores: dict[str, int] = (
+        {str(k): _coerce_result_score(v) for k, v in scores.items()}
+        if isinstance(scores, dict)
+        else {}
+    )
+
+    if findings is not None:
+        if isinstance(findings, list):
+            normalized_findings = [
+                nf for nf in (_normalize_finding(item) for item in findings) if nf is not None
+            ]
+            # Fall back to score-based findings if a non-empty list held only non-dicts.
+            findings = normalized_findings if (normalized_findings or not findings) else None
+        else:
+            findings = None
+
     if findings is None:
         findings = []
-        for criterion, score in scores.items():
+        for criterion, score in safe_scores.items():
             if score < 80:
                 if score < SEVERITY_THRESHOLDS["high"]:
                     severity = "MAJOR"
@@ -493,207 +647,23 @@ def _build_result(
     effective_weights = weights or CRITERION_WEIGHTS
     overall_score = 0
     for criterion, weight in effective_weights.items():
-        overall_score += scores.get(criterion, 50) * weight
+        overall_score += safe_scores.get(criterion, 0) * weight
     overall_score = round(overall_score)
 
-    passed = overall_score >= PASS_THRESHOLD and not any(f.get("severity") == "MAJOR" for f in findings)
+    passed = overall_score >= PASS_THRESHOLD and not any(
+        f.get("severity") == "MAJOR" for f in findings if isinstance(f, dict)
+    )
 
     return {
         "status": "success",
         "passed": passed,
-        "scores": scores,
+        "scores": safe_scores,
         "findings": findings,
         "improvement_suggestions": improvement_suggestions or [],
         "overall_score": overall_score,
         "summary": summary,
         "eval_method": eval_method,
     }
-
-
-def _heuristic_leadership_eval(
-    proposed_plan: str = "",
-    tool_context: Any = None,
-) -> Dict[str, Any]:
-    """Deterministically score leadership scenario via DCNS / ECSI / Decision Physics.
-
-    Computes realistic scores in range 78-86 in <5ms from session state:
-    - stakeholder_alignment (weight 0.25): derived from consensus_pathway_active['consensus_score']
-    - decision_quality (weight 0.20): derived from scenario dilemmas and DCNS waypoint diversity
-    - resource_stewardship (weight 0.15): derived from pathway costs vs scenario budget
-    - crisis_readiness (weight 0.15): derived from black swan preparedness and ECSI contention absence
-    - strategic_coherence (weight 0.15): derived from milestone sequencing and goal convergence
-    - ethical_alignment (weight 0.10): derived from tier fairness across stakeholder map
-    """
-    state = getattr(tool_context, "state", {}) if tool_context else {}
-    if not isinstance(state, dict):
-        state = {}
-
-    scenario = state.get("leadership_scenario") or {}
-    if not isinstance(scenario, dict):
-        scenario = {}
-
-    pathway = state.get("consensus_pathway_active") or {}
-    if not isinstance(pathway, dict):
-        pathway = {}
-
-    stakeholder_map = state.get("stakeholder_map") or []
-
-    # 1. Stakeholder Alignment (weight 0.25)
-    raw_consensus = pathway.get("consensus_score")
-    if raw_consensus is None and proposed_plan:
-        m = re.search(r'consensus[_\s]*score["\']?\s*[:=]\s*([\d.]+)', proposed_plan, re.IGNORECASE)
-        if m:
-            raw_consensus = m.group(1)
-    if raw_consensus is not None:
-        try:
-            c_score = float(raw_consensus)
-            if c_score <= 1.0:
-                c_score = c_score * 100.0
-            stakeholder_alignment = round(max(75.0, min(95.0, c_score)))
-        except (ValueError, TypeError):
-            stakeholder_alignment = 85
-    else:
-        stakeholder_alignment = 85
-    sa_detail = f"Stakeholder alignment derived from DCNS consensus pathway score: {stakeholder_alignment}% across coalition topology."
-
-    # 2. Decision Quality (weight 0.20)
-    dilemmas = scenario.get("dilemmas") or []
-    waypoints = pathway.get("waypoints") or []
-    waypoint_types = set()
-    if isinstance(waypoints, list):
-        for wp in waypoints:
-            if isinstance(wp, dict):
-                waypoint_types.add(wp.get("venue_type") or wp.get("type") or "checkpoint")
-    base_dq = 78 + min(5, len(dilemmas) * 2) + min(4, len(waypoint_types) * 2) + min(3, len(waypoints) // 2)
-    decision_quality = max(75, min(88, base_dq))
-    dq_detail = f"Decision quality verified across {len(dilemmas)} dilemma branches and {len(waypoints)} DCNS waypoints ({len(waypoint_types)} node types)."
-
-    # 3. Resource Stewardship (weight 0.15)
-    budget_alloc = str(scenario.get("budget_allocation", "balanced")).lower()
-    base_rs = 83
-    if "conservative" in budget_alloc:
-        base_rs += 2
-    elif "aggressive" in budget_alloc:
-        base_rs -= 2
-    cost = pathway.get("cost") or {}
-    resources = scenario.get("resources") or {}
-    if isinstance(cost, dict) and isinstance(resources, dict) and cost and resources:
-        over_budget = False
-        for res_name, cost_val in cost.items():
-            pool = resources.get(res_name)
-            initial = (
-                pool.get("initial", 100)
-                if isinstance(pool, dict)
-                else (pool if isinstance(pool, (int, float)) else 100)
-            )
-            if isinstance(cost_val, (int, float)) and initial and cost_val > initial:
-                over_budget = True
-                break
-        if not over_budget:
-            base_rs += 2
-        else:
-            base_rs -= 3
-    resource_stewardship = max(75, min(88, base_rs))
-    rs_detail = f"Resource stewardship confirmed for '{budget_alloc}' allocation with pathway costs vs scenario budget safety buffers preserved."
-
-    # 4. Crisis Readiness (weight 0.15)
-    black_swans = (
-        scenario.get("black_swan_events")
-        or scenario.get("black_swans")
-        or []
-    )
-    bs_count = len(black_swans) if isinstance(black_swans, list) else 1
-    contention = any(
-        wp.get("contention", False)
-        for wp in waypoints
-        if isinstance(wp, dict)
-    )
-    base_cr = 80 + min(4, bs_count * 2) - (3 if contention else 0)
-    crisis_readiness = max(75, min(86, base_cr))
-    cr_detail = f"Crisis readiness validated against {bs_count} black swan contingency triggers under ECSI contention models."
-
-    # 5. Strategic Coherence (weight 0.15)
-    milestones = pathway.get("milestones") or []
-    m_count = len(milestones) if isinstance(milestones, list) else max(1, len(waypoints) // 3)
-    base_sc = 81 + min(4, max(1, m_count) * 2)
-    strategic_coherence = max(75, min(88, base_sc))
-    sc_detail = f"Strategic coherence confirmed across {max(1, m_count)} sequenced transformation milestones driving convergence."
-
-    # 6. Ethical Alignment (weight 0.10)
-    tiers = set()
-    if isinstance(stakeholder_map, list):
-        for s in stakeholder_map:
-            if isinstance(s, dict):
-                tiers.add(s.get("tier", 1))
-    elif isinstance(stakeholder_map, dict):
-        for s in stakeholder_map.values():
-            if isinstance(s, dict):
-                tiers.add(s.get("tier", 1))
-    tier_count = max(1, len(tiers))
-    base_ea = 82 + (3 if tier_count >= 3 else 2 if tier_count >= 2 else 0)
-    ethical_alignment = max(75, min(88, base_ea))
-    ea_detail = f"Ethical alignment verified with balanced representation across {tier_count} stakeholder hierarchy tiers."
-
-    scores = {
-        "stakeholder_alignment": stakeholder_alignment,
-        "decision_quality": decision_quality,
-        "resource_stewardship": resource_stewardship,
-        "crisis_readiness": crisis_readiness,
-        "strategic_coherence": strategic_coherence,
-        "ethical_alignment": ethical_alignment,
-    }
-    details = {
-        "stakeholder_alignment": sa_detail,
-        "decision_quality": dq_detail,
-        "resource_stewardship": rs_detail,
-        "crisis_readiness": cr_detail,
-        "strategic_coherence": sc_detail,
-        "ethical_alignment": ea_detail,
-    }
-
-    findings = [
-        {
-            "title": "Frontline Consensus Pacing",
-            "severity": "MINOR",
-            "description": "Stakeholder alignment is strong across leadership tiers; pace waypoint execution between milestones to minimize frontline cognitive load.",
-        },
-        {
-            "title": "Contingency Capital Buffers",
-            "severity": "MINOR",
-            "description": "Crisis readiness protocols are well-defined; ensure dynamic resource reallocation reserve remains accessible during black swan events.",
-        },
-    ]
-
-    suggestions = [
-        "Incorporate mid-cadence feedback forums between major milestones to reinforce frontline buy-in.",
-        "Pre-allocate a 10% leadership capital buffer specifically earmarked for black swan contingency mitigation.",
-        "Deploy cross-functional change ambassadors to proactively address localized friction in resistant departments.",
-    ]
-
-    summary = (
-        "Deterministic DCNS / ECSI / Decision Physics evaluation completed. "
-        "The leadership scenario exhibits balanced stakeholder representation, "
-        "sustainable resource envelopes, and coherent milestone progression."
-    )
-
-    dcns_weights = {
-        "stakeholder_alignment": 0.25,
-        "decision_quality": 0.20,
-        "resource_stewardship": 0.15,
-        "crisis_readiness": 0.15,
-        "strategic_coherence": 0.15,
-        "ethical_alignment": 0.10,
-    }
-
-    return _build_result(
-        scores=scores,
-        details=details,
-        eval_method="dcns_heuristic",
-        findings=findings,
-        summary=summary,
-        improvement_suggestions=suggestions,
-        weights=dcns_weights,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -722,15 +692,22 @@ async def evaluate_leadership_plan(
         dict with overall_score (0-100), scores dict (6 criteria),
         and findings list.
     """
+    state = getattr(tool_context, "state", None) if tool_context else None
+    if state is not None and not hasattr(state, "get"):
+        state = None
+
     # --- Parse structured input (mirror marathon pattern) ---
     if isinstance(evaluation_request, dict):
-        user_intent = str(evaluation_request.get("user_intent", "Leadership scenario evaluation"))
-        proposed_plan = str(evaluation_request.get("proposed_plan", json.dumps(evaluation_request)))
+        raw_intent = evaluation_request.get("user_intent")
+        user_intent = str(raw_intent if raw_intent is not None else "Leadership scenario evaluation")
+        raw_plan = evaluation_request.get("proposed_plan")
+        proposed_plan = str(raw_plan if raw_plan is not None else _strict_json_dumps(evaluation_request))
     else:
         try:
             request_data = json.loads(evaluation_request) if evaluation_request else {}
             if isinstance(request_data, dict):
-                user_intent = str(request_data.get("user_intent", "Leadership scenario evaluation"))
+                raw_intent = request_data.get("user_intent")
+                user_intent = str(raw_intent if raw_intent is not None else "Leadership scenario evaluation")
                 proposed_plan = str(
                     request_data.get("proposed_plan")
                     or evaluation_request
@@ -744,9 +721,16 @@ async def evaluate_leadership_plan(
             user_intent = "Leadership scenario evaluation"
             proposed_plan = str(evaluation_request or "Leadership scenario consensus pathway and stakeholder alignment plan")
 
+    local_active = is_local_gemma_active()
+
+    # Keep CPU-bound local Gemma prompts compact so prompt processing and
+    # single-pass JSON scoring stay responsive even for large user prompts.
+    if local_active and len(proposed_plan) > 900:
+        proposed_plan = proposed_plan[:900] + "\n[... truncated for local evaluator budget ...]"
+
     # --- Enrich from session state (the key missing piece) ---
-    if tool_context:
-        scenario = tool_context.state.get("leadership_scenario")
+    if state is not None:
+        scenario = state.get("leadership_scenario")
         if isinstance(scenario, dict):
             scenario_meta = {
                 "name": scenario.get("name", "Unknown"),
@@ -755,37 +739,34 @@ async def evaluate_leadership_plan(
                 "complexity": scenario.get("complexity", "unknown"),
                 "summary": scenario.get("summary", ""),
             }
-            proposed_plan = f"{proposed_plan}\n\n[Scenario Metadata (from session state)]: {json.dumps(scenario_meta)}"
+            proposed_plan = f"{proposed_plan}\n\n[Scenario Metadata (from session state)]: {_strict_json_dumps(scenario_meta)}"
 
-        pathway = tool_context.state.get("consensus_pathway_active")
+        pathway = state.get("consensus_pathway_active")
         if isinstance(pathway, dict):
+            raw_milestones = pathway.get("milestones")
+            raw_waypoints = pathway.get("waypoints")
+            if not isinstance(raw_waypoints, list):
+                raw_waypoints = pathway.get("pathway")
             pathway_summary = {
                 "persona": pathway.get("persona", "pragmatist"),
-                "milestones": len(pathway.get("milestones", [])),
-                "waypoints": len(pathway.get("waypoints", [])),
+                "milestones": len(raw_milestones) if isinstance(raw_milestones, list) else 0,
+                "waypoints": len(raw_waypoints) if isinstance(raw_waypoints, list) else 0,
             }
             proposed_plan = (
-                f"{proposed_plan}\n\n[Consensus Pathway (from session state)]: {json.dumps(pathway_summary)}"
+                f"{proposed_plan}\n\n[Consensus Pathway (from session state)]: {_strict_json_dumps(pathway_summary)}"
             )
 
-        stakeholders = tool_context.state.get("stakeholder_map")
+        stakeholders = state.get("stakeholder_map")
         if isinstance(stakeholders, (dict, list)):
-            # Cap at ~1200 chars: nothing about the evaluation task benefits
-            # from a giant stakeholder blob, and larger enrichments push the
-            # model toward MAX_TOKENS finish-reason with empty visible output
-            # (see 2026-07-02 evaluator empty-response fix). Previously 2000.
+            # Cap at ~1200 chars in cloud mode (~350 in local CPU mode): nothing
+            # about evaluation benefits from a giant stakeholder blob.
+            sh_cap = 350 if local_active else 1200
             proposed_plan = (
-                f"{proposed_plan}\n\n[Stakeholder Map (from session state)]: {json.dumps(stakeholders)[:1200]}"
+                f"{proposed_plan}\n\n[Stakeholder Map (from session state)]: {_strict_json_dumps(stakeholders)[:sh_cap]}"
             )
 
     # --- Cap total prompt input to protect the output-token budget ---
-    # The visible-output budget is finite (see max_output_tokens below).
-    # Overly large prompts push Gemini 2.5's thinking traces to consume the
-    # entire budget, leaving ``response.text`` as ``None`` and causing the
-    # tool to fall through to the empty-response guard. Truncating here at
-    # ~8000 chars keeps prompts well within the safe operating band while
-    # still preserving the plan's essential structure for scoring.
-    _PROMPT_CHAR_CAP = 8000
+    _PROMPT_CHAR_CAP = 1500 if local_active else 8000
     if len(proposed_plan) > _PROMPT_CHAR_CAP:
         overflow = len(proposed_plan) - _PROMPT_CHAR_CAP
         proposed_plan = proposed_plan[:_PROMPT_CHAR_CAP] + f"\n\n[... {overflow} chars truncated for evaluator budget ...]"
@@ -798,126 +779,151 @@ async def evaluate_leadership_plan(
         len(proposed_plan),
     )
 
-    async def _fallback_to_heuristic() -> Dict[str, Any]:
-        logger.info("evaluate_leadership_plan: executing heuristic DCNS evaluation")
-        result = _heuristic_leadership_eval(
-            proposed_plan=proposed_plan,
-            tool_context=tool_context,
-        )
-        if tool_context:
-            tool_context.state["leadership_evaluation"] = result
-            tool_context.state["evaluation_result"] = result
-            if isinstance(tool_context.state.get("leadership_scenario"), dict):
-                try:
-                    from agents.leadership_planner_with_memory.memory.tools import store_scenario
-
-                    await store_scenario(tool_context)
-                except Exception:
-                    logger.debug("evaluate_leadership_plan: auto store_scenario failed in heuristic fallback", exc_info=True)
-        result["message"] = (
-            'Evaluation complete and saved to state. NEXT STEP: Call validate_and_emit_a2ui(payload="dashboard")'
-        )
-        return result
-
-    if is_local_gemma_active():
-        logger.info(
-            "evaluate_leadership_plan: local gemma active, bypassing CPU Ollama call and using DCNS heuristic scoring (input_hash=%s)",
-            input_hash,
-        )
-        return await _fallback_to_heuristic()
-
-    # --- Build LLM prompt for cloud LLM ---
+    # --- Build LLM prompt ---
     criteria_block = _build_criteria_block()
-    prompt = EVALUATOR_PROMPT.format(
-        criteria_block=criteria_block,
-        plan_text=proposed_plan,
+    prompt = (
+        LOCAL_EVALUATOR_PROMPT.format(plan_text=proposed_plan)
+        if local_active
+        else EVALUATOR_PROMPT.format(
+            criteria_block=criteria_block,
+            plan_text=proposed_plan,
+        )
     )
 
     response = None
-    local_err_reason: str | None = None
-    client = _get_client()
-    try:
-        response = await client.aio.models.generate_content(
-            model=EVALUATOR_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.5,  # Higher temperature for better score variance (Marathon uses Vertex AI Eval internally)
-                max_output_tokens=4096,
-                thinking_config=types.ThinkingConfig(thinking_budget=1024),
-                response_mime_type="application/json",
-            ),
-        )
-        raw_text = response.text
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "evaluate_leadership_plan: generate_content call failed (%s, input_hash=%s)",
-            exc,
-            input_hash,
-        )
-        raw_text = None
-        local_err_reason = f"llm_eval_{type(exc).__name__}"
+    raw_text: Any = None
+    if local_active:
+        try:
+            raw_text = await generate_local_json_async(
+                prompt,
+                temperature=0.3,
+                max_tokens=200,
+                timeout=480.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "evaluate_leadership_plan: generate_local_json_async call failed (%s, input_hash=%s)",
+                exc,
+                input_hash,
+                exc_info=True,
+            )
+            result = _error_result(
+                reason=f"local_llm_eval_{type(exc).__name__}",
+                eval_method="local_llm_eval_error",
+                input_hash=input_hash,
+                title="Local LLM evaluator call failed",
+                description=(
+                    f"Local LLM evaluation request failed ({type(exc).__name__}: {exc}). "
+                    "Scenario was NOT scored."
+                ),
+                suggestion="Ensure local Ollama / Gemma service is running and retry evaluation.",
+            )
+            if state is not None:
+                state["leadership_evaluation"] = result
+                state["evaluation_result"] = result
+            return result
+    else:
+        client = _get_client()
+        try:
+            response = await client.aio.models.generate_content(
+                model=EVALUATOR_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.5,  # Higher temperature for better score variance (Marathon uses Vertex AI Eval internally)
+                    max_output_tokens=4096,
+                    thinking_config=types.ThinkingConfig(thinking_budget=1024),
+                    response_mime_type="application/json",
+                ),
+            )
+            raw_text = response.text
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "evaluate_leadership_plan: generate_content call failed (%s, input_hash=%s)",
+                exc,
+                input_hash,
+                exc_info=True,
+            )
+            result = _error_result(
+                reason=f"llm_eval_{type(exc).__name__}",
+                eval_method="llm_eval_error",
+                input_hash=input_hash,
+                title="LLM evaluator call failed",
+                description=f"Cloud LLM evaluation request failed ({type(exc).__name__}: {exc}). Scenario was NOT scored.",
+                suggestion="Verify evaluator model/API availability and retry evaluation.",
+            )
+            if state is not None:
+                state["leadership_evaluation"] = result
+                state["evaluation_result"] = result
+            return result
 
-    if raw_text is None or not raw_text.strip():
-        reason = local_err_reason or _extract_response_reason(response)
-        logger.warning(
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        reason = "empty_local_response" if local_active else _extract_response_reason(response)
+        logger.error(
             "evaluate_leadership_plan: LLM returned empty text (reason=%s, input_hash=%s).",
             reason,
             input_hash,
         )
-        if (
-            is_local_gemma_active()
-            or local_err_reason is not None
-            or str(reason).startswith("local_gemma")
-            or "Timeout" in str(reason)
-            or "timeout" in str(reason)
-            or "Deadline" in str(reason)
-            or "deadline" in str(reason)
-        ):
-            return await _fallback_to_heuristic()
-
         result = _empty_response_result(reason=reason, input_hash=input_hash)
-        if tool_context:
-            tool_context.state["leadership_evaluation"] = result
-            tool_context.state["evaluation_result"] = result  # Marathon compatibility
+        if state is not None:
+            state["leadership_evaluation"] = result
+            state["evaluation_result"] = result  # Marathon compatibility
         return result
 
     result_text = raw_text.strip()
 
     # Parse JSON response
+    raw_result: Any = None
+    parse_error: str | None = None
     try:
         raw_result = json.loads(result_text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         # Try extracting JSON from markdown code block
         if "```json" in result_text:
             try:
                 json_str = result_text.split("```json")[1].split("```")[0].strip()
                 raw_result = json.loads(json_str)
-            except (IndexError, json.JSONDecodeError):
-                return await _fallback_to_heuristic()
+            except (IndexError, json.JSONDecodeError) as fence_exc:
+                parse_error = f"invalid_fenced_json:{fence_exc}"
         elif "```" in result_text:
             try:
                 json_str = result_text.split("```")[1].split("```")[0].strip()
                 raw_result = json.loads(json_str)
-            except (IndexError, json.JSONDecodeError):
-                return await _fallback_to_heuristic()
+            except (IndexError, json.JSONDecodeError) as fence_exc:
+                parse_error = f"invalid_codeblock_json:{fence_exc}"
         else:
-            return await _fallback_to_heuristic()
+            parse_error = f"invalid_json:{exc}"
 
-    if not isinstance(raw_result, dict):
-        return await _fallback_to_heuristic()
+    if parse_error is not None or not isinstance(raw_result, dict):
+        reason = parse_error or f"non_dict_json:{type(raw_result).__name__}"
+        logger.error(
+            "evaluate_leadership_plan: invalid LLM JSON output (reason=%s, input_hash=%s).",
+            reason,
+            input_hash,
+        )
+        result = _error_result(
+            reason=reason,
+            eval_method="invalid_llm_json",
+            input_hash=input_hash,
+            title="LLM evaluator returned invalid JSON",
+            description=f"The LLM evaluator response could not be parsed as a JSON object ({reason}). Scenario was NOT scored.",
+            suggestion="Retry evaluation so the evaluator emits valid JSON matching the scoring schema.",
+        )
+        if state is not None:
+            state["leadership_evaluation"] = result
+            state["evaluation_result"] = result
+        return result
 
     # Extract scores and build proper result via _build_result
     raw_scores_obj = raw_result.get("scores")
-    llm_scores: dict[str, Any] = (
-        dict(raw_scores_obj) if isinstance(raw_scores_obj, dict) else {}
-    )
+    raw_scores: dict[str, Any] = raw_scores_obj if isinstance(raw_scores_obj, dict) else {}
+    llm_scores: dict[str, int] = {}
     llm_findings = raw_result.get("findings", [])
     llm_summary = raw_result.get("summary", "")
 
-    # Normalize and validate all criteria scores (Marathon pattern)
+    # Normalize and validate strictly against EVALUATION_CRITERIA (drop unexpected extra keys)
     for c in EVALUATION_CRITERIA:
-        if c in llm_scores:
-            llm_scores[c] = _normalize_score(llm_scores[c])
+        if c in raw_scores:
+            llm_scores[c] = _normalize_score(raw_scores[c])
         elif c in raw_result:
             llm_scores[c] = _normalize_score(raw_result[c])
         else:
@@ -926,16 +932,28 @@ async def evaluate_leadership_plan(
 
     details = {c: f"LLM score: {llm_scores.get(c, '?')}" for c in EVALUATION_CRITERIA}
 
+    # Extract inline suggestions when single-pass local evaluation already provided them
+    inline_suggestions: list[str] = []
+    raw_sugg_obj = raw_result.get("suggestions") or raw_result.get("improvement_suggestions")
+    if isinstance(raw_sugg_obj, str) and raw_sugg_obj.strip():
+        inline_suggestions.append(raw_sugg_obj.strip())
+    elif isinstance(raw_sugg_obj, list):
+        for item in raw_sugg_obj:
+            if isinstance(item, str) and item.strip():
+                inline_suggestions.append(item.strip())
+            elif isinstance(item, dict):
+                t = str(item.get("title") or "").strip()
+                d = str(item.get("description") or item.get("suggestion") or item.get("text") or "").strip()
+                if t and d:
+                    inline_suggestions.append(f"{t}: {d}")
+                elif d or t:
+                    inline_suggestions.append(d or t)
+
     # --- Generate actionable improvement suggestions ---
-    # Prefer LLM-generated feedback (richer, contextual) via
-    # _generate_feedback; fall back to deterministic extraction from
-    # findings when the LLM call fails or returns empty.
-    # When local_gemma is active and the judge already returned structured
-    # findings, extract suggestions deterministically from findings to avoid
-    # a redundant ~70s second Ollama round-trip.
-    suggestions = []
-    feedback_summary = ""
-    if not (is_local_gemma_active() and llm_findings):
+    if local_active and inline_suggestions and isinstance(llm_summary, str) and llm_summary.strip():
+        suggestions = inline_suggestions
+        feedback_summary = llm_summary.strip()
+    else:
         try:
             suggestions, feedback_summary = await _generate_feedback(
                 scores=llm_scores,
@@ -943,48 +961,52 @@ async def evaluate_leadership_plan(
                 user_intent=user_intent,
                 proposed_plan=proposed_plan,
             )
-        except Exception:
-            logger.info(
-                "evaluate_leadership_plan: _generate_feedback failed, "
-                "falling back to deterministic suggestions (input_hash=%s)",
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "evaluate_leadership_plan: _generate_feedback failed (input_hash=%s): %s",
                 input_hash,
+                exc,
+                exc_info=True,
             )
-
-    if not suggestions:
-        # Deterministic fallback: extract from findings first, then _DETERMINISTIC_SUGGESTIONS
-        if isinstance(llm_findings, list):
-            for f in llm_findings:
-                if isinstance(f, dict) and "title" in f and "description" in f:
-                    suggestions.append(f"{f['title']}: {f['description']}")
-
-    if not suggestions:
-        for criterion, score in llm_scores.items():
-            if score < 80 and criterion in _DETERMINISTIC_SUGGESTIONS:
-                suggestions.append(_DETERMINISTIC_SUGGESTIONS[criterion])
-
-    if not suggestions:
-        suggestions = ["No major improvements needed based on current evaluation."]
+            result = _error_result(
+                reason=(
+                    f"local_llm_feedback_{type(exc).__name__}"
+                    if local_active
+                    else f"llm_feedback_{type(exc).__name__}"
+                ),
+                eval_method="local_llm_feedback_error" if local_active else "llm_feedback_error",
+                input_hash=input_hash,
+                title="LLM feedback generation failed",
+                description=(
+                    f"{'Local' if local_active else 'Cloud'} LLM feedback generation failed "
+                    f"({type(exc).__name__}: {exc}). Scenario evaluation could not be completed."
+                ),
+                suggestion=(
+                    "Ensure local Ollama / Gemma service is running and retry evaluation."
+                    if local_active
+                    else "Verify evaluator model/API availability and retry evaluation."
+                ),
+            )
+            if state is not None:
+                state["leadership_evaluation"] = result
+                state["evaluation_result"] = result
+            return result
 
     result = _build_result(
         scores=llm_scores,
         details=details,
-        eval_method="llm_judge",
-        findings=llm_findings if llm_findings else None,
-        summary=feedback_summary or llm_summary or "Evaluation completed.",
+        eval_method="local_gemma_eval" if local_active else "llm_judge",
+        findings=llm_findings if isinstance(llm_findings, list) and llm_findings else None,
+        summary=feedback_summary or (llm_summary if isinstance(llm_summary, str) else "") or "Evaluation completed.",
         improvement_suggestions=suggestions,
     )
 
     # Store evaluation in session state for downstream tools
-    if tool_context:
-        tool_context.state["leadership_evaluation"] = result
-        tool_context.state["evaluation_result"] = result  # Marathon compatibility
-        if isinstance(tool_context.state.get("leadership_scenario"), dict):
-            try:
-                from agents.leadership_planner_with_memory.memory.tools import store_scenario
-
-                await store_scenario(tool_context)
-            except Exception:
-                logger.debug("evaluate_leadership_plan: auto store_scenario skipped/failed", exc_info=True)
+    if state is not None:
+        state["leadership_evaluation"] = result
+        state["evaluation_result"] = result  # Marathon compatibility
+        if isinstance(state.get("leadership_scenario"), dict):
+            await _auto_store_scenario_if_configured(tool_context)
 
     result["message"] = (
         'Evaluation complete and saved to state. NEXT STEP: Call validate_and_emit_a2ui(payload="dashboard")'

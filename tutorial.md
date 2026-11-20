@@ -7,8 +7,8 @@ session, so you don't need to install anything locally.
 Cost runs about $3 per day (~$91/month idle) with the default scale-to-zero
 sizing. You can tear it all down whenever with one command
 (`./scripts/teardown.sh`, instructions at the bottom). The
-[README cost table](README.md#open-source-and-paid-tools) has the full breakdown
-if you want to know where the money goes.
+[README prerequisites table](README.md#what-you-need) has the full tool list
+if you want to know what gets provisioned.
 
 ## Step 1: run the deploy script
 

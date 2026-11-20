@@ -178,7 +178,7 @@ WORKFLOW = """\
       progressive complexity, stakeholder motivation logic.
     - **Ethical Alignment**: boundary testing, policy compliance,
       fairness metrics, transparency requirements.
-15. STOP and wait for user feedback."""
+14. STOP and wait for user feedback."""
 # [END leadership_planner_workflow]
 
 # ---------------------------------------------------------------------------

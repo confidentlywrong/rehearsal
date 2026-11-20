@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate particle count and dimensions against negative/non-finite inputs and add SSR window guards.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,19 +50,23 @@ export function createAnimatedParticles(
   scaleMax       = 80,
   randomRotation = false,
 ): THREE.Points {
-  const positions  = new Float32Array(count * 3);
-  const scales     = new Float32Array(count);
-  const times      = new Float32Array(count);
-  const speeds     = new Float32Array(count);
-  const rotations  = new Float32Array(count);
+  const safeCount = Number.isFinite(count) && count > 0 ? Math.min(100000, Math.floor(count)) : 0;
+  const safeRadius = Number.isFinite(radius) && radius >= 0 ? radius : 100;
+  const safeScaleMin = Number.isFinite(scaleMin) ? scaleMin : 80;
+  const safeScaleMax = Number.isFinite(scaleMax) ? scaleMax : safeScaleMin;
+  const positions  = new Float32Array(safeCount * 3);
+  const scales     = new Float32Array(safeCount);
+  const times      = new Float32Array(safeCount);
+  const speeds     = new Float32Array(safeCount);
+  const rotations  = new Float32Array(safeCount);
 
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < safeCount; i++) {
     const angle = Math.random() * Math.PI * 2;
-    const r     = Math.sqrt(Math.random()) * radius;  // sqrt for uniform disk distribution
+    const r     = Math.sqrt(Math.random()) * safeRadius;  // sqrt for uniform disk distribution
     positions[i * 3]     = Math.cos(angle) * r;       // X
     positions[i * 3 + 1] = 0;                         // Y origin (rises in shader)
     positions[i * 3 + 2] = Math.sin(angle) * r;       // Z
-    scales[i]    = scaleMin + Math.random() * (scaleMax - scaleMin);
+    scales[i]    = safeScaleMin + Math.random() * (safeScaleMax - safeScaleMin);
     times[i]     = Math.random();                      // stagger phase
     speeds[i]    = 0.25 + Math.random() * 0.5;         // 0.25 – 0.75
     rotations[i] = randomRotation ? Math.PI + Math.random() * 1.5 - 0.75 : 0.0;
@@ -84,8 +90,8 @@ export function createAnimatedParticles(
     blending:    THREE.AdditiveBlending,
     uniforms: {
       uTime:       { value: 0.0 },
-      uSize:       { value: window.innerHeight * 0.1 },
-      uPixelRatio: { value: window.devicePixelRatio },
+      uSize:       { value: typeof window !== 'undefined' ? window.innerHeight * 0.1 : 80 },
+      uPixelRatio: { value: typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1 },
       uMap:        { value: map },
       uColor:      { value: new THREE.Color(color) },
       uHeight:     { value: 500.0 },

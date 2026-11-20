@@ -185,7 +185,7 @@
         </div>
 
         <!-- Change Enablement impact events -->
-        <div *ngIf="hasInfraEvents(item)" class="tick-feed__infra">
+        <div *ngIf="item.infrastructure && hasInfraEvents(item)" class="tick-feed__infra">
           <div *ngIf="item.infrastructure.medical_saves_this_tick > 0" class="tick-feed__infra-event tick-feed__infra-event--medical">
             {{ item.infrastructure.medical_saves_this_tick }} critical intervention{{ item.infrastructure.medical_saves_this_tick > 1 ? 's' : '' }}
           </div>

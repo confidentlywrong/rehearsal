@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # Modifications copyright 2026 Christian Haeussinger
-# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,7 +54,11 @@ def configure_project_env(agent_label: str) -> None:
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     os.environ["LITELLM_TELEMETRY"] = "False"
 
-    pid = os.environ.get("PROJECT_ID") or os.environ.get("VERTEXAI_PROJECT")
+    pid = (
+        os.environ.get("PROJECT_ID") or ""
+    ).strip() or (
+        os.environ.get("VERTEXAI_PROJECT") or ""
+    ).strip()
     if pid:
         os.environ["GOOGLE_CLOUD_PROJECT"] = pid
         os.environ["VERTEXAI_PROJECT"] = pid

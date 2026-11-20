@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +21,8 @@ from unittest import mock
 
 import pytest
 from google.genai import types
+
+from agents.utils.models import DEFAULT_PLANNER_MODEL
 
 
 class TestDefaultRetryOptions:
@@ -117,19 +121,19 @@ class TestResilientModel:
         from agents.utils.global_gemini import GlobalGemini
         from agents.utils.retry import resilient_model
 
-        model = resilient_model("gemini-3-flash-preview")
+        model = resilient_model(DEFAULT_PLANNER_MODEL)
         assert isinstance(model, GlobalGemini)
 
     def test_model_name_is_set(self):
         from agents.utils.retry import resilient_model
 
-        model = resilient_model("gemini-3-flash-preview")
-        assert model.model == "gemini-3-flash-preview"
+        model = resilient_model(DEFAULT_PLANNER_MODEL)
+        assert model.model == DEFAULT_PLANNER_MODEL
 
     def test_retry_options_are_applied(self):
         from agents.utils.retry import resilient_model
 
-        model = resilient_model("gemini-3-flash-preview")
+        model = resilient_model(DEFAULT_PLANNER_MODEL)
         assert model.retry_options is not None
         assert model.retry_options.attempts == 5
 
@@ -137,7 +141,7 @@ class TestResilientModel:
         from agents.utils.retry import resilient_model
 
         custom = types.HttpRetryOptions(attempts=3, initial_delay=0.5)
-        model = resilient_model("gemini-3-flash-preview", retry_options=custom)
+        model = resilient_model(DEFAULT_PLANNER_MODEL, retry_options=custom)
         assert model.retry_options is not None
         assert model.retry_options.attempts == 3
         assert model.retry_options.initial_delay == 0.5
@@ -145,7 +149,7 @@ class TestResilientModel:
     def test_default_location_is_global(self):
         from agents.utils.retry import resilient_model
 
-        model = resilient_model("gemini-3-flash-preview")
+        model = resilient_model(DEFAULT_PLANNER_MODEL)
         assert model.location == "global"
 
     def test_custom_location(self):

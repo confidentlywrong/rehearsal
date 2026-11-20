@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,10 +22,12 @@ from google.adk.agents import LlmAgent
 from google.adk.apps import App
 from a2a.types import TransportProtocol
 
+from agents.utils.models import DEFAULT_PLANNER_MODEL
+
 
 class TestCreateA2aDeployment:
     def test_card_has_correct_name(self):
-        agent = LlmAgent(name="test_agent", model="gemini-3-flash-preview")
+        agent = LlmAgent(name="test_agent", model=DEFAULT_PLANNER_MODEL)
         app = App(name="test_agent", root_agent=agent)
 
         with patch.dict("os.environ", {"TEST_AGENT_URL": "http://localhost:8200"}):
@@ -37,7 +41,7 @@ class TestCreateA2aDeployment:
         assert card.name == "test_agent"
 
     def test_card_transport_is_http_json(self):
-        agent = LlmAgent(name="test2", model="gemini-3-flash-preview")
+        agent = LlmAgent(name="test2", model=DEFAULT_PLANNER_MODEL)
         app = App(name="test2", root_agent=agent)
 
         with patch.dict("os.environ", {"TEST2_URL": "http://localhost:8200"}):

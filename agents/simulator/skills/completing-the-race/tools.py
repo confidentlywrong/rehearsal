@@ -23,12 +23,15 @@ These tools wrap up the simulation after the race phase completes:
 """
 
 import logging
+import math
+from typing import Any
 
 import redis.exceptions
 from google.adk.tools.tool_context import ToolContext
 
 from agents.simulator.collector import RaceCollector
-from agents.utils.simdata import store_simulation_data
+from agents.utils.communication import _ANONYMOUS_USER_IDS, resolve_tool_context_user_id
+from agents.utils.simdata import SimDataError, store_simulation_data
 from agents.utils.sim_defaults import DEFAULT_RACE_DISTANCE_MI
 from agents.simulator.longitudinal import (
     SimulationRunRecord,
@@ -39,6 +42,34 @@ from agents.simulator.longitudinal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    """Coerce numeric value to finite int, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(round(num)) if math.isfinite(num) else default
 
 
 async def compile_results(tool_context: ToolContext) -> dict:
@@ -59,16 +90,20 @@ async def compile_results(tool_context: ToolContext) -> dict:
         dict with status and aggregated race results.
     """
     state = tool_context.state
-    snapshots = state.get("tick_snapshots", [])
-    total_ticks = len(snapshots)
-    runner_count = state.get("runner_count", 0)
-    finished_ids = set(state.get("finished_runner_ids", []))
+    raw_snapshots = state.get("tick_snapshots")
+    snapshots = [s for s in raw_snapshots if isinstance(s, dict)] if isinstance(raw_snapshots, list) else []
+    snapshot_count = len(snapshots)
+    runner_count = max(0, _finite_int(state.get("runner_count"), 0))
+    raw_finished = state.get("finished_runner_ids")
+    finished_ids = set(raw_finished) if isinstance(raw_finished, (list, set, tuple)) else set()
     finished_count = len(finished_ids)
 
     # Prefer the untruncated vitals_trend_full accumulator (H3 fix) if
     # available.  Falls back to snapshot-based computation when it isn't.
-    vitals_trend: list[dict] = state.get("vitals_trend_full", [])
+    raw_vitals = state.get("vitals_trend_full")
+    vitals_trend: list[dict] = list(raw_vitals) if isinstance(raw_vitals, list) else []
     build_vitals_from_snapshots = not vitals_trend
+    total_ticks = max(snapshot_count, len(vitals_trend))
     final_status_counts: dict[str, int] = {}
     persona_status_counts: dict[str, dict[str, int]] = {}
     notable_events: list[str] = []
@@ -81,25 +116,29 @@ async def compile_results(tool_context: ToolContext) -> dict:
         if build_vitals_from_snapshots:
             vitals_trend.append(
                 {
-                    "tick": snap.get("tick", 0),
-                    "real_time_minutes": snap.get("real_time_minutes", 0.0),
-                    "avg_velocity": snap.get("avg_velocity", 0.0),
-                    "avg_water": snap.get("avg_water", 0.0),
-                    "avg_distance": snap.get("avg_distance", 0.0),
+                    "tick": _finite_int(snap.get("tick"), 0),
+                    "real_time_minutes": _finite_float(snap.get("real_time_minutes"), 0.0),
+                    "avg_velocity": _finite_float(snap.get("avg_velocity"), 0.0),
+                    "avg_water": _finite_float(snap.get("avg_water"), 0.0),
+                    "avg_distance": _finite_float(snap.get("avg_distance"), 0.0),
                 }
             )
 
         # Final status counts — use the last tick's snapshot, not cumulative.
         # Each tick's status_counts already sums to the number of reporting
         # runners. Summing across ticks inflates the total (N runners x T ticks).
-        final_status_counts = dict(snap.get("status_counts", {}))
-        persona_status_counts = dict(snap.get("persona_status_counts", {}))
+        raw_status_counts = snap.get("status_counts")
+        final_status_counts = dict(raw_status_counts) if isinstance(raw_status_counts, dict) else {}
+        raw_persona_counts = snap.get("persona_status_counts")
+        persona_status_counts = dict(raw_persona_counts) if isinstance(raw_persona_counts, dict) else {}
 
         # Collect notable events
-        notable_events.extend(snap.get("notable_events", []))
+        raw_notable = snap.get("notable_events")
+        if isinstance(raw_notable, list):
+            notable_events.extend(raw_notable)
 
         # Runner reporting stats
-        runners = snap.get("runners_reporting", 0)
+        runners = max(0, _finite_int(snap.get("runners_reporting"), 0))
         total_runners_reporting += runners
         if runners > 0:
             ticks_with_runners += 1
@@ -108,18 +147,26 @@ async def compile_results(tool_context: ToolContext) -> dict:
     # (more robust than trusting the final snapshot which may be missing data)
     global_states = state.get("global_runner_states")
     persona_avg_progress: dict[str, float] = {}
-    if global_states:
+    if isinstance(global_states, dict) and global_states:
         final_status_counts = {}
         persona_status_counts = {}
         # Also compute average alignment progress per persona
         persona_distance_sums: dict[str, float] = {}
         persona_distance_counts: dict[str, int] = {}
-        race_dist = (state.get("simulation_config") or {}).get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI)
+        sim_cfg = state.get("simulation_config") or {}
+        race_dist = _finite_float(
+            sim_cfg.get("race_distance_mi") if isinstance(sim_cfg, dict) else None,
+            DEFAULT_RACE_DISTANCE_MI,
+        )
+        if race_dist <= 0:
+            race_dist = DEFAULT_RACE_DISTANCE_MI
 
         for runner_id, info in global_states.items():
-            r_status = info.get("status", "unknown")
-            r_persona = info.get("persona", "unknown")
-            r_distance = info.get("distance", 0.0)
+            if not isinstance(info, dict):
+                continue
+            r_status = str(info.get("status") or "unknown")
+            r_persona = str(info.get("persona") or "unknown")
+            r_distance = _finite_float(info.get("distance"), 0.0)
 
             final_status_counts[r_status] = final_status_counts.get(r_status, 0) + 1
             if r_persona not in persona_status_counts:
@@ -131,15 +178,26 @@ async def compile_results(tool_context: ToolContext) -> dict:
 
         for p_name, p_sum in persona_distance_sums.items():
             p_count = persona_distance_counts.get(p_name, 1)
-            avg_dist = p_sum / p_count if p_count > 0 else 0.0
-            persona_avg_progress[p_name] = round(100.0 * avg_dist / race_dist, 1) if race_dist > 0 else 0.0
+            avg_dist = _finite_float(p_sum / p_count, 0.0) if p_count > 0 else 0.0
+            raw_progress = (100.0 * avg_dist / race_dist) if race_dist > 0 else 0.0
+            persona_avg_progress[p_name] = round(raw_progress, 1) if math.isfinite(raw_progress) else 0.0
     else:
         # Fallback: try last snapshot
         if snapshots:
-            persona_avg_progress = dict(snapshots[-1].get("persona_avg_progress", {}))
+            last_pap = snapshots[-1].get("persona_avg_progress")
+            if isinstance(last_pap, dict):
+                persona_avg_progress = {
+                    str(k): _finite_float(v, 0.0) for k, v in last_pap.items() if k is not None
+                }
 
-    avg_runners_reporting = total_runners_reporting / total_ticks if total_ticks > 0 else 0
-    sampling_quality = ticks_with_runners / total_ticks if total_ticks > 0 else 0
+    if snapshot_count > 0:
+        try:
+            avg_runners_reporting = total_runners_reporting / snapshot_count
+        except OverflowError:
+            avg_runners_reporting = 0.0
+    else:
+        avg_runners_reporting = 0
+    sampling_quality = ticks_with_runners / snapshot_count if snapshot_count > 0 else 0
     dnf_count = max(0, runner_count - finished_count) if runner_count > 0 else 0
 
     if total_ticks == 0:
@@ -181,33 +239,45 @@ async def compile_results(tool_context: ToolContext) -> dict:
         "persona_status_counts": persona_status_counts,
         "persona_avg_progress": persona_avg_progress,
         "notable_events": notable_events,
-        "echo_voice_log": state.get("echo_voice_log", []),
+        "echo_voice_log": state.get("echo_voice_log") or [],
         "avg_runners_reporting": avg_runners_reporting,
         "sampling_quality": round(sampling_quality, 2),
         "message": f"Aggregated {total_ticks} cycles: {finished_count} aligned, {dnf_count} disengaged",
-        "resources": state.get("resources", {}),
-        "decision_log": state.get("decision_log", []),
+        "resources": state.get("resources") or {},
+        "decision_log": state.get("decision_log") or [],
         "terminal_echo_ids": {
-            "aligned": state.get("aligned_echo_ids", []),
-            "defected": state.get("defected_echo_ids", []),
+            "aligned": state.get("aligned_echo_ids") or [],
+            "defected": state.get("defected_echo_ids") or [],
         },
     }
 
-    if "principles" in state:
-        result["contradiction_log"] = state.get("contradiction_log", [])
-        result["alert_history"] = state.get("alert_history", [])
-        result["triggered_black_swans"] = state.get("triggered_black_swans", [])
-
     # ------------------------------------------------------------------
     # C2 fix: Normalize raw principle_scores to 0-100 scale before
-    # longitudinal tracking.  Raw scores are cumulative (+1 per applied
-    # tick, -0.5 per neglected tick).  Normalize using max_ticks as the
-    # ceiling so a principle applied every tick → 100.
+    # ARI and longitudinal tracking.  Raw scores are cumulative (+1 per
+    # applied tick, -0.5 per neglected tick).  Normalize using total_ticks
+    # as the ceiling so a principle applied every tick → 100.
+    # Preserve _raw_principle_scores so repeated compile_results calls
+    # are idempotent instead of double-dividing already-normalized scores.
     # ------------------------------------------------------------------
-    raw_scores = state.get("principle_scores", [0.0] * 7)
+    if state.get("_principle_scores_normalized") and state.get("_raw_principle_scores") is not None:
+        raw_scores_val = state.get("_raw_principle_scores")
+        raw_scores = [_finite_float(s, 0.0) for s in raw_scores_val] if isinstance(raw_scores_val, (list, tuple)) else [0.0] * 7
+    else:
+        scores_val = state.get("principle_scores")
+        raw_scores = [_finite_float(s, 0.0) for s in scores_val] if isinstance(scores_val, (list, tuple)) else [0.0] * 7
+        state["_raw_principle_scores"] = raw_scores
     max_score_per_principle = max(total_ticks, 1)
     normalized_scores = [round(max(0.0, min(100.0, (s / max_score_per_principle) * 100.0)), 1) for s in raw_scores]
     state["principle_scores"] = normalized_scores
+    state["_principle_scores_normalized"] = True
+
+    if "principles" in state:
+        from agents.simulator.ari import compute_ari_dimensions
+
+        result["contradiction_log"] = state.get("contradiction_log") or []
+        result["alert_history"] = state.get("alert_history") or []
+        result["triggered_black_swans"] = state.get("triggered_black_swans") or []
+        result["ari"] = compute_ari_dimensions(state)
 
     # ------------------------------------------------------------------
     # Longitudinal tracking: save run, compute benchmarks, trajectory
@@ -216,6 +286,18 @@ async def compile_results(tool_context: ToolContext) -> dict:
         # ADK State defines neither keys() nor __iter__, so dict(state) would
         # index state[0] and raise KeyError: 0. Use its to_dict() snapshot.
         state_snapshot = state.to_dict() if hasattr(state, "to_dict") else dict(state)
+        resolved_uid = resolve_tool_context_user_id(tool_context, require_when_saas=False)
+        if resolved_uid:
+            if not state_snapshot.get("user_id"):
+                state_snapshot["user_id"] = resolved_uid
+            raw_pid = state_snapshot.get("participant_id")
+            if (
+                not isinstance(raw_pid, str)
+                or not raw_pid.strip()
+                or raw_pid.strip().lower() in _ANONYMOUS_USER_IDS
+                or raw_pid.strip().lower() == "local-dev"
+            ):
+                state_snapshot["participant_id"] = resolved_uid
         run_record = SimulationRunRecord.from_session_state(state_snapshot)
         store = SimulationRunStore()
         store.save_run(run_record)
@@ -249,7 +331,12 @@ async def compile_results(tool_context: ToolContext) -> dict:
             benchmarks["percentile"],
         )
     except Exception as e:
-        logger.warning("Longitudinal tracking failed (non-fatal): %s", e)
+        logger.error("compile_results: longitudinal tracking failed: %s", e, exc_info=True)
+        return {
+            "status": "error",
+            "simulation_id": state.get("simulation_id"),
+            "message": f"Longitudinal tracking failed: {e}",
+        }
 
     # Persist key aggregates to session state so downstream agents
     # (e.g. emit_sim_results_a2ui) can access them reliably.
@@ -261,24 +348,36 @@ async def compile_results(tool_context: ToolContext) -> dict:
     # A2A text boundary when the planner reads simulation results.
     simulation_id = state.get("simulation_id")
     if simulation_id:
-        await store_simulation_data(
-            simulation_id=simulation_id,
-            persona_status_counts=persona_status_counts,
-            persona_avg_progress=persona_avg_progress,
-            runner_count=runner_count,
-            echo_voice_log=state.get("echo_voice_log"),
-            decision_log=state.get("decision_log"),
-            contradiction_log=state.get("contradiction_log"),
-            route_friction_map=state.get("route_friction_map"),
-            terminal_echo_ids={
-                "aligned": state.get("aligned_echo_ids", []),
-                "defected": state.get("defected_echo_ids", []),
-            },
-            vitals_trend=vitals_trend,
-            alert_history=state.get("alert_history", []),
-            resources=state.get("resources", {}),
-            triggered_black_swans=state.get("triggered_black_swans", []),
-        )
+        try:
+            store_uid = resolve_tool_context_user_id(tool_context, require_when_saas=False)
+            store_kwargs: dict[str, Any] = {
+                "simulation_id": simulation_id,
+                "persona_status_counts": persona_status_counts,
+                "persona_avg_progress": persona_avg_progress,
+                "runner_count": runner_count,
+                "echo_voice_log": state.get("echo_voice_log"),
+                "decision_log": state.get("decision_log"),
+                "contradiction_log": state.get("contradiction_log"),
+                "route_friction_map": state.get("route_friction_map"),
+                "terminal_echo_ids": {
+                    "aligned": state.get("aligned_echo_ids", []),
+                    "defected": state.get("defected_echo_ids", []),
+                },
+                "vitals_trend": vitals_trend,
+                "alert_history": state.get("alert_history", []),
+                "resources": state.get("resources", {}),
+                "triggered_black_swans": state.get("triggered_black_swans", []),
+            }
+            if store_uid is not None:
+                store_kwargs["user_id"] = store_uid
+            await store_simulation_data(**store_kwargs)
+        except (SimDataError, ValueError) as e:
+            logger.error("compile_results: failed to persist simulation data: %s", e, exc_info=True)
+            return {
+                "status": "error",
+                "simulation_id": simulation_id,
+                "message": f"Failed to persist simulation data: {e}",
+            }
 
     return result
 
@@ -301,7 +400,7 @@ async def stop_race_collector(tool_context: ToolContext) -> dict:
     if collector is not None:
         try:
             await collector.stop()
-        except (redis.exceptions.ConnectionError, ConnectionError, OSError) as e:
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError, ConnectionError, TimeoutError, OSError) as e:
             # The Redis connection may have been closed by the server due to
             # idle timeout after the race completed.  This is benign — the
             # race data is already collected; we're just cleaning up.
@@ -312,18 +411,28 @@ async def stop_race_collector(tool_context: ToolContext) -> dict:
 
     # Publish end_simulation so dispatchers remove runner sessions.
     simulation_id = tool_context.state.get("simulation_id")
+    publish_error: Exception | None = None
     if simulation_id:
         try:
             from agents.simulator.broadcast import publish_end_simulation
 
             await publish_end_simulation(simulation_id)
         except Exception as e:
-            logger.warning("stop_race_collector: failed to publish end_simulation: %s", e)
+            logger.error("stop_race_collector: failed to publish end_simulation: %s", e, exc_info=True)
+            publish_error = e
 
     # Clear simulation flags to prevent the race engine from re-running
     # if the root LLM re-invokes simulation_pipeline after completion.
     tool_context.state["simulation_ready"] = False
     tool_context.state["simulation_in_progress"] = False
+
+    if publish_error is not None:
+        return {
+            "status": "error",
+            "simulation_id": simulation_id,
+            "session_id": session_id,
+            "message": f"Failed to publish end_simulation: {publish_error}",
+        }
 
     return {
         "status": "success",

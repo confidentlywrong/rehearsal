@@ -15,6 +15,7 @@
 """Utilities for extracting infrastructure indexes from routes."""
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +36,27 @@ def extract_station_index(route_geojson: dict) -> dict:
         return index
 
     features = route_geojson.get("features", [])
-    if not features:
+    if not isinstance(features, list) or not features:
         return index
 
     for feature in features:
-        props = feature.get("properties", {})
-        if not props:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties")
+        if not isinstance(props, dict) or not props:
             continue
 
         ftype = props.get("type", "")
         mi = props.get("mi")
 
-        if mi is None:
+        if mi is None or isinstance(mi, bool):
             continue
 
         try:
             mi_val = float(mi)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if not math.isfinite(mi_val):
             continue
 
         if ftype == "water_station":

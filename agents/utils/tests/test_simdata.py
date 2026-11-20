@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agents.utils.simdata import (
+    SimDataError,
     clear_simulation_data,
     load_simulation_data,
     store_simulation_data,
@@ -119,17 +120,30 @@ class TestStoreSimulationData:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_returns_false_on_redis_error(self):
-        """When r.hset raises Exception, function returns False (doesn't raise)."""
+    async def test_raises_simdata_error_on_redis_error(self):
+        """When Redis is configured and pipeline execution raises, raises SimDataError."""
         mock_redis, mock_pipe = self._mock_redis_with_pipeline()
         mock_pipe.execute.side_effect = Exception("connection refused")
         with patch("agents.utils.simdata.get_shared_redis_client", return_value=mock_redis):
-            result = await store_simulation_data(
-                simulation_id="sim-err",
-                route_geojson=SAMPLE_ROUTE,
-            )
+            with pytest.raises(SimDataError, match="sim-err"):
+                await store_simulation_data(
+                    simulation_id="sim-err",
+                    route_geojson=SAMPLE_ROUTE,
+                )
 
-        assert result is False
+    @pytest.mark.asyncio
+    async def test_raises_simdata_error_on_serialization_error(self):
+        """When json.dumps raises even with default=str, raises SimDataError."""
+        mock_redis, _ = self._mock_redis_with_pipeline()
+        with (
+            patch("agents.utils.simdata.get_shared_redis_client", return_value=mock_redis),
+            patch("agents.utils.simdata.json.dumps", side_effect=TypeError("unserializable")),
+        ):
+            with pytest.raises(SimDataError, match="serialize"):
+                await store_simulation_data(
+                    simulation_id="sim-ser",
+                    route_geojson=SAMPLE_ROUTE,
+                )
 
     @pytest.mark.asyncio
     async def test_skips_none_fields(self):
@@ -185,14 +199,33 @@ class TestLoadSimulationData:
         assert result == {}
 
     @pytest.mark.asyncio
-    async def test_returns_empty_dict_on_redis_error(self):
-        """When r.hgetall raises, returns {}."""
+    async def test_raises_simdata_error_on_redis_error(self):
+        """When Redis is configured and hgetall raises, raises SimDataError."""
         mock_redis = AsyncMock()
         mock_redis.hgetall.side_effect = Exception("timeout")
         with patch("agents.utils.simdata.get_shared_redis_client", return_value=mock_redis):
-            result = await load_simulation_data("sim-err")
+            with pytest.raises(SimDataError, match="sim-err"):
+                await load_simulation_data("sim-err")
 
-        assert result == {}
+    @pytest.mark.asyncio
+    async def test_corrupted_field_logs_error_and_isolates_field(self, caplog):
+        """Corrupted JSON in one field logs ERROR and isolates that field to None."""
+        import logging
+
+        mock_redis = AsyncMock()
+        mock_redis.hgetall.return_value = {
+            b"route_geojson": b"{not-valid-json",
+            b"runner_count": b"42",
+        }
+        with (
+            patch("agents.utils.simdata.get_shared_redis_client", return_value=mock_redis),
+            caplog.at_level(logging.ERROR, logger="agents.utils.simdata"),
+        ):
+            result = await load_simulation_data("sim-corrupt")
+
+        assert result["route_geojson"] is None
+        assert result["runner_count"] == 42
+        assert any("malformed JSON in field route_geojson" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_returns_none_for_missing_fields(self):
@@ -239,6 +272,14 @@ class TestClearSimulationData:
             result = await clear_simulation_data("sim-nope")
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_clear_raises_simdata_error_on_redis_error(self):
+        mock_redis = AsyncMock()
+        mock_redis.delete.side_effect = ConnectionError("redis down")
+        with patch("agents.utils.simdata.get_shared_redis_client", return_value=mock_redis):
+            with pytest.raises(SimDataError, match="sim-err"):
+                await clear_simulation_data("sim-err")
 
 
 class TestSimulationIsolation:

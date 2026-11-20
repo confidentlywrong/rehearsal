@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,19 +36,33 @@ class SimulationNetworkPlugin(BasePlugin):
         """Sets the Runner instance for the dispatcher and starts the background listener."""
         if self.dispatcher:
             logger.error(f"ORCHESTRATION_LIFECYCLE: Resetting existing dispatcher for {self.name}")
-            self.dispatcher.stop()
+            old_dispatcher = self.dispatcher
+            self.dispatcher = None
+            try:
+                old_dispatcher.stop()
+            except Exception:
+                logger.exception("ORCHESTRATION_LIFECYCLE: Failed stopping existing dispatcher for %s", self.name)
 
         self.runner = runner
         dispatch_mode = os.getenv("DISPATCH_MODE", "subscriber")
-        self.dispatcher = RedisOrchestratorDispatcher(
+        dispatcher = RedisOrchestratorDispatcher(
             runner=runner,
             dispatch_mode=dispatch_mode,
             suppress_gateway_emission=self._suppress_gateway_emission,
         )
-        self.dispatcher.start()
+        dispatcher.start()
+        self.dispatcher = dispatcher
 
     async def close(self):
         """Stops the background listener when the plugin is closed."""
-        if self.dispatcher:
-            self.dispatcher.stop()
-        await super().close()
+        dispatcher = self.dispatcher
+        self.dispatcher = None
+        self.runner = None
+        try:
+            if dispatcher is not None:
+                try:
+                    dispatcher.stop()
+                except Exception:
+                    logger.exception("ORCHESTRATION_LIFECYCLE: Error stopping dispatcher for %s", self.name)
+        finally:
+            await super().close()

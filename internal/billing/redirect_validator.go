@@ -37,34 +37,72 @@ var ErrRedirectURLNotAllowed = errors.New("billing: redirect URL not allowed")
 // host + port as allowedBase. Both arguments must be absolute http
 // or https URLs.
 //
-// If allowedBase is the empty string the function returns nil — the
-// real Stripe creator only arms when STRIPE_RETURN_BASE_URL is
-// configured, so an empty allowedBase indicates the stub creator
-// path (no real redirect happens) and we don't want to block test
-// suites that pass localhost URLs.
+// Fails closed when allowedBase is empty (STRIPE_RETURN_BASE_URL not
+// configured). Rejects control characters, opaque URLs, userinfo,
+// backslashes in host/authority, and missing hostnames on both inputs.
 //
 // Comparison is case-insensitive on host (per RFC 3986) and
 // case-sensitive on scheme. Port comparison is exact, with the
 // scheme defaults applied (so https://example.com and
 // https://example.com:443 are considered equivalent).
 func ValidateRedirectURL(candidate, allowedBase string) error {
+	if hasControlChar(candidate) {
+		return fmt.Errorf("%w: control characters in redirect url are not allowed", ErrRedirectURLNotAllowed)
+	}
+	if hasControlChar(allowedBase) {
+		return fmt.Errorf("%w: control characters in allowed_base are not allowed", ErrRedirectURLNotAllowed)
+	}
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return fmt.Errorf("%w: empty url", ErrRedirectURLNotAllowed)
 	}
+	allowedBase = strings.TrimSpace(allowedBase)
 	if allowedBase == "" {
-		return nil
+		return fmt.Errorf("%w: allowed_base not configured", ErrRedirectURLNotAllowed)
+	}
+	if authorityHasBackslash(candidate) {
+		return fmt.Errorf("%w: backslash in redirect url authority is not allowed", ErrRedirectURLNotAllowed)
+	}
+	if authorityHasBackslash(allowedBase) {
+		return fmt.Errorf("%w: backslash in allowed_base authority is not allowed", ErrRedirectURLNotAllowed)
 	}
 	cu, err := url.Parse(candidate)
 	if err != nil {
 		return fmt.Errorf("%w: parse candidate: %v", ErrRedirectURLNotAllowed, err)
 	}
+	if cu.Opaque != "" {
+		return fmt.Errorf("%w: opaque redirect url is not allowed", ErrRedirectURLNotAllowed)
+	}
+	if cu.User != nil {
+		return fmt.Errorf("%w: userinfo in redirect url is not allowed", ErrRedirectURLNotAllowed)
+	}
+	if cu.Scheme != "http" && cu.Scheme != "https" {
+		return fmt.Errorf("%w: scheme must be http or https, got %q", ErrRedirectURLNotAllowed, cu.Scheme)
+	}
+	if cu.Hostname() == "" {
+		return fmt.Errorf("%w: candidate must specify a hostname", ErrRedirectURLNotAllowed)
+	}
+	if strings.Contains(cu.Host, "\\") {
+		return fmt.Errorf("%w: backslash in redirect url host is not allowed", ErrRedirectURLNotAllowed)
+	}
 	au, err := url.Parse(allowedBase)
 	if err != nil {
 		return fmt.Errorf("%w: parse allowed_base: %v", ErrRedirectURLNotAllowed, err)
 	}
-	if cu.Scheme != "http" && cu.Scheme != "https" {
-		return fmt.Errorf("%w: scheme must be http or https, got %q", ErrRedirectURLNotAllowed, cu.Scheme)
+	if au.Opaque != "" {
+		return fmt.Errorf("%w: opaque allowed_base is not allowed", ErrRedirectURLNotAllowed)
+	}
+	if au.User != nil {
+		return fmt.Errorf("%w: userinfo in allowed_base is not allowed", ErrRedirectURLNotAllowed)
+	}
+	if au.Scheme != "http" && au.Scheme != "https" {
+		return fmt.Errorf("%w: allowed_base scheme must be http or https, got %q", ErrRedirectURLNotAllowed, au.Scheme)
+	}
+	if au.Hostname() == "" {
+		return fmt.Errorf("%w: allowed_base must specify a hostname", ErrRedirectURLNotAllowed)
+	}
+	if strings.Contains(au.Host, "\\") {
+		return fmt.Errorf("%w: backslash in allowed_base host is not allowed", ErrRedirectURLNotAllowed)
 	}
 	if cu.Scheme != au.Scheme {
 		return fmt.Errorf("%w: scheme mismatch (want %q, got %q)", ErrRedirectURLNotAllowed, au.Scheme, cu.Scheme)
@@ -76,6 +114,27 @@ func ValidateRedirectURL(candidate, allowedBase string) error {
 		return fmt.Errorf("%w: port mismatch (want %q, got %q)", ErrRedirectURLNotAllowed, defaultPort(au), defaultPort(cu))
 	}
 	return nil
+}
+
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func authorityHasBackslash(raw string) bool {
+	idx := strings.Index(raw, "://")
+	if idx < 0 {
+		return false
+	}
+	rest := raw[idx+3:]
+	if cut := strings.IndexAny(rest, "/?#"); cut >= 0 {
+		rest = rest[:cut]
+	}
+	return strings.Contains(rest, "\\")
 }
 
 // defaultPort returns the explicit port on u, or the scheme's

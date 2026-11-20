@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,14 +13,13 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: return dispatch status to avoid stuck loading buttons, resolve non-empty planner session targets across live/cached flows, and remove static cached route bundles and synthetic Las Vegas fallback for 100% SSOT.
  */
 
 import { inject, Injectable } from '@angular/core';
 import { GatewayService } from '../../gateway.service';
 import { AGENT_SCREEN_HOST, type AgentScreenHost } from '../ChatNavPanel/screens/AgentScreen/agent-screen-host.model';
-import cacheRoute01 from '../../../../cached_routes/cache-1.json';
-import cacheRoute02 from '../../../../cached_routes/cache-2.json';
-import cacheRoute03 from '../../../../cached_routes/cache-3.json';
 import type { A2uiActionPayload } from './a2ui-surface.model';
 
 export interface A2uiActionDispatchContext {
@@ -28,20 +28,6 @@ export interface A2uiActionDispatchContext {
   /** Scenario IDs the user checked in the Organizer sidebar context picker. */
   selectedContextScenarioIds?: string[];
 }
-
-const CACHED_ROUTE_KEYS = [
-  'dd82048d-914d-4bbc-99f8-d44c33c9834c',
-  'seed-0003-east-side-explorer-i9j0k1l2',
-  'seed-0004-grand-loop-m3n4o5p6',
-] as const;
-
-type CachedRouteSeed = (typeof CACHED_ROUTE_KEYS)[number];
-
-const CACHED_ROUTES: Record<CachedRouteSeed, unknown> = {
-  'dd82048d-914d-4bbc-99f8-d44c33c9834c': cacheRoute01,
-  'seed-0003-east-side-explorer-i9j0k1l2': cacheRoute02,
-  'seed-0004-grand-loop-m3n4o5p6': cacheRoute03,
-};
 
 export type A2uiRegisteredActionName =
   | 'run_simulation'
@@ -83,11 +69,9 @@ export class A2uiActionsService {
     name: A2uiRegisteredActionName,
     payload: A2uiActionPayload,
     ctx: A2uiActionDispatchContext,
-  ): void {
+  ): boolean {
     const handler = this.handlers(ctx)[name];
-    if (handler) {
-      handler(payload);
-    }
+    return handler ? handler(payload) : false;
   }
 
   isRegisteredAction(name: string): name is A2uiRegisteredActionName {
@@ -98,124 +82,121 @@ export class A2uiActionsService {
     return (A2UI_VIEW_ACTION_NAMES as readonly string[]).includes(name);
   }
 
-  private handlers(ctx: A2uiActionDispatchContext): Record<A2uiRegisteredActionName, (p: A2uiActionPayload) => void> {
+  private resolvePlannerTarget(ctx: A2uiActionDispatchContext): string | undefined {
+    const explicit = typeof ctx.plannerAgentGuid === 'string' ? ctx.plannerAgentGuid.trim() : '';
+    if (explicit) return explicit;
+    const currentSession = this.agentScreen.currentAgent?.sessionId?.trim();
+    if (currentSession) return currentSession;
+    const agentType = this.agentScreen.currentAgent?.agentType;
+    const mapped = agentType ? this.agentScreen.agents?.[agentType]?.trim() : '';
+    return mapped || undefined;
+  }
+
+  private handlers(ctx: A2uiActionDispatchContext): Record<A2uiRegisteredActionName, (p: A2uiActionPayload) => boolean> {
     return {
       run_simulation: () => {
-        this.agentScreen.isAgentWorking = true;
-
         if (this.agentScreen.runCachedMessages) {
+          this.agentScreen.isAgentWorking = true;
           this.agentScreen.runCachedDataStream();
-          return;
+          return true;
         }
-        // Live mode: `currentAgent` is only ever populated by the demo
-        // session service (agent-demo-session.service.ts L99). In the live
-        // gateway flow the Organizer spawns a planner and exposes its guid
-        // via `ctx.plannerAgentGuid`, so prefer that when available.
-        // Without this fallback the Re-run button silently no-ops because
-        // currentAgent is null, leaving the button stuck in its loading
-        // state.
-        const target = ctx.plannerAgentGuid ?? this.agentScreen.currentAgent?.sessionId;
+        const target = this.resolvePlannerTarget(ctx);
         if (!target) {
           console.warn('run_simulation: no planner target available (currentAgent and plannerAgentGuid both unset); aborting Re-run.');
           this.agentScreen.isAgentWorking = false;
-          return;
+          return false;
         }
-        const isLeadership =
-          this.agentScreen.currentAgent?.agentType?.includes('leadership') ?? true;
+        this.agentScreen.isAgentWorking = true;
         // Embed user-selected past scenario IDs when present so the
         // planner's get_selected_scenarios tool can retrieve them.
         const contextIds = ctx.selectedContextScenarioIds ?? [];
         const contextSuffix = contextIds.length > 0
           ? ` using context from scenarios ${contextIds.join(', ')}`
           : '';
-        const prompt = isLeadership
-          ? `Run the simulation for the leadership scenario with 10,000 stakeholders${contextSuffix}`
-          : 'Run the simulation for a marathon in Las Vegas for 10,000 runners';
-        this.gateway.sendBroadcast(prompt, [target], true);
+        const prompt = `Run the simulation for the leadership scenario with 10,000 stakeholders${contextSuffix}`;
+        void this.gateway.sendBroadcast(prompt, [target], true).catch((err) => {
+          console.error('run_simulation broadcast failed:', err);
+          this.agentScreen.isAgentWorking = false;
+        });
+        return true;
       },
       run_simulation_with_llm_runners: () => {
-        this.agentScreen.isAgentWorking = true;
-
         if (this.agentScreen.runCachedMessages) {
+          this.agentScreen.isAgentWorking = true;
           this.agentScreen.runCachedDataStream();
-          return;
+          return true;
         }
-        const target = ctx.plannerAgentGuid ?? this.agentScreen.currentAgent?.sessionId;
+        const target = this.resolvePlannerTarget(ctx);
         if (!target) {
           console.warn('run_simulation_with_llm_runners: no planner target available; aborting.');
           this.agentScreen.isAgentWorking = false;
-          return;
+          return false;
         }
-        this.gateway.sendBroadcast(
+        this.agentScreen.isAgentWorking = true;
+        void this.gateway.sendBroadcast(
           'Simulate your best plan with 10 LLM stakeholders on GKE',
           [target],
           true,
-        );
+        ).catch((err) => {
+          console.error('run_simulation_with_llm_runners broadcast failed:', err);
+          this.agentScreen.isAgentWorking = false;
+        });
+        return true;
       },
       run_simulation_with_route_data: () => {
-        const target = ctx.plannerAgentGuid ?? this.agentScreen.currentAgent?.sessionId;
+        if (this.agentScreen.runCachedMessages) {
+          this.agentScreen.isAgentWorking = true;
+          this.agentScreen.runCachedDataStream();
+          return true;
+        }
+        const target = this.resolvePlannerTarget(ctx);
         if (!target) {
           console.warn('run_simulation_with_route_data: no planner target available; aborting.');
-          return;
+          this.agentScreen.isAgentWorking = false;
+          return false;
         }
-        this.gateway.sendBroadcast(
-          `Run simulation with the best route available`,
+        this.agentScreen.isAgentWorking = true;
+        void this.gateway.sendBroadcast(
+          'Run simulation with the best route available',
           [target],
           true,
-        );
+        ).catch((err) => {
+          console.error('run_simulation_with_route_data broadcast failed:', err);
+          this.agentScreen.isAgentWorking = false;
+        });
+        return true;
       },
-      stop_simulation: () => undefined,
+      stop_simulation: () => false,
       show_route: (payload) => {
-        // Update the 3D map in BOTH cached and live modes so the map
-        // tracks the selected scenario immediately (pre-2026-07-17
-        // bug: live mode never dispatched, so the map stayed stuck on
-        // demo-config.placeholderRoutes forever).
-        //
-        // Route resolution — HONEST, no fabricated data:
-        //   * Marathon seed with a real cached Vegas polyline → use it.
-        //   * Leadership scenario (seed-leadership-* or UUID) → dispatch
-        //     `undefined` to CLEAR the map. Leadership scenarios have
-        //     no geographic route; showing an arbitrary marathon
-        //     polyline would be fake data. When a leadership scenario
-        //     has real simulation data (stakeholder_reactions,
-        //     simulation_timeline), that surfaces in the sidebar
-        //     Organizer detail card via emit_scenario_detail_a2ui —
-        //     the 3D map stays empty because leadership isn't
-        //     geographic.
-        //   * Unknown seed → also `undefined` (clear).
-        const seed = (payload as { seed?: string } | undefined)?.seed;
-        let geojson: unknown = undefined;
-        if (seed && this.isCachedRouteSeed(seed)) {
-          geojson = CACHED_ROUTES[seed];
-        }
+        const rawSeed = (payload as { seed?: unknown } | undefined)?.seed;
+        const unwrappedSeed =
+          rawSeed && typeof rawSeed === 'object' && 'literalString' in (rawSeed as Record<string, unknown>)
+            ? (rawSeed as { literalString?: unknown }).literalString
+            : rawSeed;
+        const seed = typeof unwrappedSeed === 'string' ? unwrappedSeed.trim() : undefined;
+        // Clear any stale route on the viewport until the gateway delivers live data.
         window.dispatchEvent(
           new CustomEvent('gateway:routeGeojson', {
-            detail: { geojson },
+            detail: { geojson: undefined },
           }),
         );
 
-        if (ctx.runCached) return;
+        if (ctx.runCached) return false;
 
-        // Live mode: also poke the agent so the sidebar Organizer
-        // renders the scenario detail card (stakeholder graph,
-        // ScoreBars, findings, real simulation report when
-        // available). The `__list__` sentinel is a UI-only Back
-        // button — the agent's classifier maps it to
-        // emit_scenario_list_a2ui, no map action needed.
-        if (!ctx.plannerAgentGuid) {
-          console.warn('show_route: plannerAgentGuid not yet available, skipping agent broadcast.');
-          return;
+        const targetGuid = typeof ctx.plannerAgentGuid === 'string' ? ctx.plannerAgentGuid.trim() : '';
+        if (!targetGuid || !seed) {
+          console.warn('show_route: plannerAgentGuid or seed not available, skipping agent broadcast.');
+          return false;
         }
-        this.gateway.sendBroadcast(
-          `Get the route for the seed ${(payload as { seed?: unknown } | undefined)?.seed}`,
-          [ctx.plannerAgentGuid],
+        void this.gateway.sendBroadcast(
+          `Get the route for the seed ${seed}`,
+          [targetGuid],
           true,
-        );
+        ).catch((err) => {
+          console.error('show_route broadcast failed:', err);
+        });
+        return false;
       },
     };
-  }
-
-  private isCachedRouteSeed(seed: string): seed is CachedRouteSeed {
-    return (CACHED_ROUTE_KEYS as readonly string[]).includes(seed);
   }
 }

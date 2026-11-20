@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard zero-dimension scene setup, invalid pan speeds, non-finite follow deltas, zero-duration camera intro/pan transitions, and degenerate window light-up intervals.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,8 +32,8 @@ export function initScene(ctx: Context, canvas: HTMLCanvasElement): void {
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
     navigator.userAgent,
   );
-  const w = window.innerWidth,
-    h = window.innerHeight;
+  const w = Math.max(1, window.innerWidth),
+    h = Math.max(1, window.innerHeight);
 
   ctx.renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
   ctx.renderer.setPixelRatio(isMobile ? 1 : window.devicePixelRatio);
@@ -500,9 +502,10 @@ export function completeCameraIntroImmediately(ctx: Context): boolean {
 export function tickCameraIntro(ctx: Context, delta: number): void {
   if (!ctx.cameraIntro?.active) return;
   if (ctx.cameraIntro.movementHeld) return;
+  if (!Number.isFinite(delta) || delta < 0) return;
 
   ctx.cameraIntro.elapsed = Math.min(ctx.cameraIntro.elapsed + delta, ctx.cameraIntro.duration);
-  const t = ctx.cameraIntro.elapsed / ctx.cameraIntro.duration;
+  const t = ctx.cameraIntro.duration > 0 ? ctx.cameraIntro.elapsed / ctx.cameraIntro.duration : 1;
   const easedT = t * t * (3 - 2 * t); // smoothstep — ease in and out
   // Move camera along spline.
   ctx.camera.position.copy(ctx.cameraIntro.spline.getPoint(easedT));
@@ -518,7 +521,8 @@ export function tickCameraIntro(ctx: Context, delta: number): void {
   // Window light-up sweep — advance sorted pointer, set litTarget on triggered entries.
   const { windowLightStartT, windowLightEndT, windowMinZ, windowMaxZ } = ctx.cameraIntro;
   if (t >= windowLightStartT && ctx.windowMeshes.length > 0) {
-    const wt = Math.min((t - windowLightStartT) / (windowLightEndT - windowLightStartT), 1.0);
+    const spanT = windowLightEndT - windowLightStartT;
+    const wt = spanT > 0 ? Math.min((t - windowLightStartT) / spanT, 1.0) : 1.0;
     const zThreshold = windowMinZ + wt * (windowMaxZ - windowMinZ);
 
     while (
@@ -592,9 +596,11 @@ export function panCameraTo(
       done();
     }
 
-    const unitsPerSecond = options?.speed ?? PAN_UNITS_PER_SECOND;
-    const minDur = options?.minDuration ?? PAN_MIN_DURATION;
-    const maxDur = options?.maxDuration ?? PAN_MAX_DURATION;
+    const rawSpeed = options?.speed ?? PAN_UNITS_PER_SECOND;
+    const unitsPerSecond =
+      Number.isFinite(rawSpeed) && rawSpeed > 0 ? rawSpeed : PAN_UNITS_PER_SECOND;
+    const minDur = Number.isFinite(options?.minDuration) ? (options!.minDuration as number) : PAN_MIN_DURATION;
+    const maxDur = Number.isFinite(options?.maxDuration) ? Math.max(minDur, options!.maxDuration as number) : Math.max(minDur, PAN_MAX_DURATION);
     const toPosition = targetPosition.clone().add(cameraOffset);
     const distance = ctx.controls.target.distanceTo(targetPosition);
     const duration = THREE.MathUtils.clamp(distance / unitsPerSecond, minDur, maxDur);
@@ -640,9 +646,10 @@ export function snapOrbitCameraTo(
 /** Called every frame from the animate loop. */
 export function tickCameraPan(ctx: Context, delta: number): void {
   if (!ctx.cameraPan?.active) return;
+  if (!Number.isFinite(delta) || delta < 0) return;
 
   ctx.cameraPan.elapsed = Math.min(ctx.cameraPan.elapsed + delta, ctx.cameraPan.duration);
-  const t = ctx.cameraPan.elapsed / ctx.cameraPan.duration;
+  const t = ctx.cameraPan.duration > 0 ? ctx.cameraPan.elapsed / ctx.cameraPan.duration : 1;
 
   // Smoothstep — ease in and ease out
   const easedT = t * t * (3 - 2 * t);
@@ -774,7 +781,7 @@ function _posFromSpherical(
 const _followTargetScratch = new THREE.Vector3();
 
 export function tickCameraFollow(ctx: Context, delta: number): void {
-  if (!ctx.cameraFollow) return;
+  if (!ctx.cameraFollow || !Number.isFinite(delta) || delta < 0) return;
   const targetPos = ctx.cameraFollow.mesh.position;
   const damping = ctx.cameraFollow.damping ?? 2;
   const targetSmooth = 1 - Math.exp(-damping * delta);

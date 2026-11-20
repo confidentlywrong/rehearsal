@@ -41,8 +41,31 @@ logger = logging.getLogger(__name__)
 # on the running loop — the client may still be in use, but the choice
 # is between (a) eventual OOM and (b) closing what's almost certainly
 # a leaked entry.
-_MAX_CLIENTS = max(1, int(os.environ.get("COMMUNICATION_PLUGIN_MAX_CLIENTS", "4096")))
+def _parse_max_clients() -> int:
+    raw = os.environ.get("COMMUNICATION_PLUGIN_MAX_CLIENTS", "4096").strip()
+    if not raw:
+        return 4096
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "A2A_PLUGIN: invalid COMMUNICATION_PLUGIN_MAX_CLIENTS=%r; using default 4096",
+            raw,
+        )
+        return 4096
+    if parsed < 1:
+        logger.warning(
+            "A2A_PLUGIN: non-positive COMMUNICATION_PLUGIN_MAX_CLIENTS=%d; clamping to 1",
+            parsed,
+        )
+        return 1
+    return parsed
+
+
+_MAX_CLIENTS = _parse_max_clients()
 _clients: "OrderedDict[str, SimulationA2AClient]" = OrderedDict()
+_client_loops: dict[str, asyncio.AbstractEventLoop | None] = {}
+_background_close_tasks: set[asyncio.Task[None]] = set()
 
 
 def _evict_oldest_if_full() -> None:
@@ -56,6 +79,7 @@ def _evict_oldest_if_full() -> None:
     if len(_clients) < _MAX_CLIENTS:
         return
     stale_iid, stale_client = _clients.popitem(last=False)
+    _client_loops.pop(stale_iid, None)
     logger.warning(
         "A2A_PLUGIN: evicted client for invocation %s (registry hit cap=%d); "
         "after_agent_callback likely never ran for this invocation. "
@@ -69,7 +93,9 @@ def _evict_oldest_if_full() -> None:
         # No running loop — best-effort close gives up; the httpx
         # destructor will reclaim sockets when the client is GC'd.
         return
-    loop.create_task(_safe_close(stale_iid, stale_client))
+    task = loop.create_task(_safe_close(stale_iid, stale_client))
+    _background_close_tasks.add(task)
+    task.add_done_callback(_background_close_tasks.discard)
 
 
 async def _safe_close(iid: str, client: SimulationA2AClient) -> None:
@@ -81,10 +107,28 @@ async def _safe_close(iid: str, client: SimulationA2AClient) -> None:
 
 def get_client(invocation_id: str) -> SimulationA2AClient:
     """Helper to retrieve the A2A client for a specific invocation."""
+    try:
+        cur_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        cur_loop = None
+
+    if invocation_id in _clients and _client_loops.get(invocation_id) not in (None, cur_loop):
+        if cur_loop is not None:
+            logger.warning(
+                "A2A_PLUGIN: replacing client for invocation %s bound to a different event loop",
+                invocation_id,
+            )
+            stale_client = _clients.pop(invocation_id)
+            _client_loops.pop(invocation_id, None)
+            task = cur_loop.create_task(_safe_close(invocation_id, stale_client))
+            _background_close_tasks.add(task)
+            task.add_done_callback(_background_close_tasks.discard)
+
     if invocation_id not in _clients:
         logger.debug(f"A2A_PLUGIN: Initializing new client for invocation {invocation_id}")
         _evict_oldest_if_full()
         _clients[invocation_id] = SimulationA2AClient()
+        _client_loops[invocation_id] = cur_loop
     return _clients[invocation_id]
 
 
@@ -103,6 +147,7 @@ class SimulationCommunicationPlugin(BasePlugin):
         """Cleanup client after the agent run is complete."""
         iid = callback_context.invocation_id
         client = _clients.pop(iid, None)
+        _client_loops.pop(iid, None)
         if client:
             logger.debug(f"A2A_PLUGIN: Closing client for invocation {iid}")
             await client.close()

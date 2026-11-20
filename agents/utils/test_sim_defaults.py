@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -147,3 +149,21 @@ class TestEnvOverrides:
         """Restore module defaults after each test."""
         yield
         _reload_clean()
+
+
+def test_invalid_and_non_positive_env_logs_warning(monkeypatch, caplog):
+    """Invalid/non-positive env vars and divisor adjustments emit warnings."""
+    import logging
+    from agents.utils.sim_defaults import _nearest_divisor, _safe_positive_int_env
+
+    monkeypatch.setenv("SIM_DEFAULT_DURATION_SECONDS", "bad")
+    monkeypatch.setenv("SIM_DEFAULT_TICK_INTERVAL_SECONDS", "-3")
+    with caplog.at_level(logging.WARNING, logger="agents.utils.sim_defaults"):
+        assert _safe_positive_int_env("SIM_DEFAULT_DURATION_SECONDS", 120) == 120
+        assert _safe_positive_int_env("SIM_DEFAULT_TICK_INTERVAL_SECONDS", 10) == 10
+        assert _nearest_divisor(60, 7) == 6
+
+    messages = [r.message for r in caplog.records]
+    assert any("SIM_DEFAULT_DURATION_SECONDS" in m for m in messages)
+    assert any("SIM_DEFAULT_TICK_INTERVAL_SECONDS" in m for m in messages)
+    assert any("adjusted tick_interval" in m for m in messages)

@@ -43,6 +43,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -103,24 +104,29 @@ type Config struct {
 // ConfigFromEnv builds a Config from environment variables. It is
 // the single source of truth for tracing knobs:
 //
-//   OTEL_EXPORTER          ""|stdout|gcp     default ""
-//   OTEL_SAMPLE_RATIO      float in [0,1]    default 0.1
-//   OTEL_SERVICE_NAME      string            default = serviceName arg
-//   OTEL_SERVICE_VERSION   string            default "unknown"
-//   OTEL_ENVIRONMENT       string            default ""
-//   GOOGLE_CLOUD_PROJECT   project id        used when exporter=gcp
+//	OTEL_EXPORTER          ""|stdout|gcp     default ""
+//	OTEL_SAMPLE_RATIO      float in [0,1]    default 0.1
+//	OTEL_SERVICE_NAME      string            default = serviceName arg
+//	OTEL_SERVICE_VERSION   string            default "unknown"
+//	OTEL_ENVIRONMENT       string            default ""
+//	GOOGLE_CLOUD_PROJECT   project id        used when exporter=gcp
 func ConfigFromEnv(serviceName string) Config {
 	cfg := Config{
 		ServiceName:    envOr("OTEL_SERVICE_NAME", serviceName),
 		ServiceVersion: envOr("OTEL_SERVICE_VERSION", "unknown"),
-		Environment:    os.Getenv("OTEL_ENVIRONMENT"),
+		Environment:    strings.TrimSpace(os.Getenv("OTEL_ENVIRONMENT")),
 		Exporter:       Exporter(strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER")))),
-		GCPProject:     os.Getenv("GOOGLE_CLOUD_PROJECT"),
+		GCPProject:     strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_PROJECT")),
 		SampleRatio:    0.1,
 	}
 	if v := strings.TrimSpace(os.Getenv("OTEL_SAMPLE_RATIO")); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.SampleRatio = f
+		} else {
+			slog.Default().Warn("tracing: invalid OTEL_SAMPLE_RATIO; using default",
+				slog.String("value", v),
+				slog.Any("error", err),
+			)
 		}
 	}
 	return cfg
@@ -143,6 +149,9 @@ type Shutdown func(context.Context) error
 // abort startup; tracing failures generally should NOT take down the
 // service since logs + structured metrics still work.
 func Setup(ctx context.Context, cfg Config) (Shutdown, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Always install the W3C tracecontext + baggage propagator so
 	// inbound traceparent headers are honored even when the local
 	// exporter is None — a downstream service with tracing enabled
@@ -164,6 +173,9 @@ func Setup(ctx context.Context, cfg Config) (Shutdown, error) {
 
 	res, err := buildResource(ctx, cfg)
 	if err != nil {
+		cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_ = exp.Shutdown(cleanCtx)
+		cleanCancel()
 		return noopShutdown, fmt.Errorf("tracing: build resource: %w", err)
 	}
 
@@ -184,12 +196,23 @@ func Setup(ctx context.Context, cfg Config) (Shutdown, error) {
 		slog.Float64("sample_ratio", clampSampleRatio(cfg.SampleRatio)),
 	)
 
+	var (
+		shutdownOnce sync.Once
+		shutdownErr  error
+	)
 	return func(shutdownCtx context.Context) error {
-		// Bound shutdown to keep main()'s defer fast even when the
-		// exporter is stuck.
-		bounded, cancel := context.WithTimeout(shutdownCtx, 5*time.Second)
-		defer cancel()
-		return tp.Shutdown(bounded)
+		shutdownOnce.Do(func() {
+			if shutdownCtx == nil {
+				shutdownCtx = context.Background()
+			}
+			// Detach from caller cancellation so defer shutdown(ctx) still
+			// flushes buffered spans after SIGTERM cancels ctx, while keeping
+			// a strict 5s upper bound.
+			bounded, cancel := context.WithTimeout(context.WithoutCancel(shutdownCtx), 5*time.Second)
+			defer cancel()
+			shutdownErr = tp.Shutdown(bounded)
+		})
+		return shutdownErr
 	}, nil
 }
 

@@ -16,6 +16,9 @@ package middleware
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
@@ -56,34 +59,53 @@ const tracerName = "github.com/GoogleCloudPlatform/race-condition/internal/middl
 // and this middleware adds zero overhead beyond a context lookup.
 func RequestTracing(serviceName string) gin.HandlerFunc {
 	tracer := otel.Tracer(tracerName)
-	propagator := otel.GetTextMapPropagator()
 
 	return func(c *gin.Context) {
+		if c == nil || c.Request == nil {
+			if c != nil {
+				c.Next()
+			}
+			return
+		}
 		// Extract upstream context from inbound headers (W3C
-		// tracecontext + baggage). When no headers are present this
-		// returns the unchanged ctx, so a fresh trace is started.
+		// tracecontext + baggage). Fetch the propagator per-request so
+		// callers/tests installing it after router construction still take effect.
+		propagator := otel.GetTextMapPropagator()
 		parentCtx := propagator.Extract(c.Request.Context(),
 			propagation.HeaderCarrier(c.Request.Header))
 
-		spanName := "HTTP " + c.Request.Method
+		spanName := "HTTP " + sanitizeSpanAttr(c.Request.Method)
 		ctx, span := tracer.Start(parentCtx, spanName, trace.WithSpanKind(trace.SpanKindServer))
+		if span == nil {
+			c.Request = c.Request.WithContext(ctx)
+			c.Next()
+			return
+		}
 		// Always end the span — even on panic, deferred runs.
 		defer span.End()
 
 		// Initial attrs (request-shape data we know up front).
-		attrs := []attribute.KeyValue{
-			attribute.String("http.request.method", c.Request.Method),
-			attribute.String("url.path", c.Request.URL.Path),
-			attribute.String("http.client_ip", c.ClientIP()),
-			attribute.String("service.name", serviceName),
+		if span.IsRecording() {
+			urlPath := ""
+			rawQuery := ""
+			if c.Request.URL != nil {
+				urlPath = c.Request.URL.Path
+				rawQuery = c.Request.URL.RawQuery
+			}
+			attrs := []attribute.KeyValue{
+				attribute.String("http.request.method", sanitizeSpanAttr(c.Request.Method)),
+				attribute.String("url.path", sanitizeSpanAttr(urlPath)),
+				attribute.String("http.client_ip", sanitizeSpanAttr(c.ClientIP())),
+				attribute.String("service.name", sanitizeSpanAttr(serviceName)),
+			}
+			if rawQuery != "" {
+				attrs = append(attrs, attribute.String("url.query", sanitizeQuery(rawQuery)))
+			}
+			if rid := logging.RequestID(c.Request.Context()); rid != "" {
+				attrs = append(attrs, attribute.String("request.id", sanitizeSpanAttr(rid)))
+			}
+			span.SetAttributes(attrs...)
 		}
-		if q := c.Request.URL.RawQuery; q != "" {
-			attrs = append(attrs, attribute.String("url.query", q))
-		}
-		if rid := logging.RequestID(c.Request.Context()); rid != "" {
-			attrs = append(attrs, attribute.String("request.id", rid))
-		}
-		span.SetAttributes(attrs...)
 
 		// Propagate the new ctx (containing the active span) so
 		// downstream handlers' OTel calls + logging.FromContext
@@ -92,15 +114,19 @@ func RequestTracing(serviceName string) gin.HandlerFunc {
 
 		c.Next()
 
+		if !span.IsRecording() {
+			return
+		}
+
 		// Post-handler attrs: status + tenant fields that other
 		// middleware injected during the request.
 		status := c.Writer.Status()
 		span.SetAttributes(attribute.Int("http.response.status_code", status))
 
 		if uc := account.FromContext(c.Request.Context()); uc.UserID != "" {
-			span.SetAttributes(attribute.String("user.id", uc.UserID))
+			span.SetAttributes(attribute.String("user.id", sanitizeSpanAttr(uc.UserID)))
 			if uc.Email != "" {
-				span.SetAttributes(attribute.String("user.email", uc.Email))
+				span.SetAttributes(attribute.String("user.email_hash", logging.HashEmail(uc.Email)))
 			}
 			if uc.IsSuperadmin {
 				span.SetAttributes(attribute.Bool("user.superadmin", true))
@@ -118,7 +144,101 @@ func RequestTracing(serviceName string) gin.HandlerFunc {
 
 		// Surface gin-aggregated errors as a span event.
 		if len(c.Errors) > 0 {
-			span.SetAttributes(attribute.String("error.message", c.Errors.String()))
+			span.SetAttributes(attribute.String("error.message", sanitizeSpanAttr(c.Errors.String())))
 		}
 	}
+}
+
+const maxSpanAttrBytes = 1024
+
+var sensitiveQueryKeys = map[string]struct{}{
+	"token":         {},
+	"id_token":      {},
+	"access_token":  {},
+	"refresh_token": {},
+	"auth":          {},
+	"authorization": {},
+	"api_key":       {},
+	"apikey":        {},
+	"key":           {},
+	"secret":        {},
+	"client_secret": {},
+	"password":      {},
+	"passwd":        {},
+	"session":       {},
+	"ticket":        {},
+}
+
+// sanitizeQuery redacts values of credential-bearing query parameters while
+// preserving order and leaving benign parameters unchanged.
+func sanitizeQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	changed := false
+	for i, seg := range parts {
+		k, _, hasEq := strings.Cut(seg, "=")
+		if !hasEq {
+			continue
+		}
+		decoded, err := url.QueryUnescape(k)
+		if err != nil {
+			decoded = k
+		}
+		norm := strings.ToLower(strings.TrimSpace(decoded))
+		if _, sensitive := sensitiveQueryKeys[norm]; sensitive {
+			parts[i] = k + "=REDACTED"
+			changed = true
+		}
+	}
+	if !changed {
+		return sanitizeSpanAttr(raw)
+	}
+	return sanitizeSpanAttr(strings.Join(parts, "&"))
+}
+
+// sanitizeSpanAttr strips control/CR/LF bytes, repairs invalid UTF-8, and clips
+// long strings on a valid UTF-8 rune boundary.
+func sanitizeSpanAttr(s string) string {
+	if s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
+	var b strings.Builder
+	hasCtrl := false
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r < 0x20 || r == 0x7f {
+			if !hasCtrl {
+				b.Grow(len(s))
+				b.WriteString(s[:i])
+				hasCtrl = true
+			}
+			b.WriteByte(' ')
+		} else if hasCtrl {
+			b.WriteRune(r)
+		}
+		i += size
+	}
+	if hasCtrl {
+		s = b.String()
+	}
+	return truncateUTF8Bytes(s, maxSpanAttrBytes)
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }

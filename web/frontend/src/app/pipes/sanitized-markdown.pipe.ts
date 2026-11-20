@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard non-string markdown inputs and handle parser errors safely.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,17 +57,22 @@ export class SanitizedMarkdownPipe implements PipeTransform {
   private readonly markdownService = inject(MarkdownService);
 
   async transform(value: string | null | undefined): Promise<SafeHtml> {
-    if (value == null || value === '') {
+    if (typeof value !== 'string' || value === '') {
       return '';
     }
-    // Step 1: markdown → raw HTML (via marked).
-    const rawHtml = await this.markdownService.parse(value);
+    try {
+      // Step 1: markdown → raw HTML (via marked).
+      const rawHtml = await this.markdownService.parse(value);
 
-    // Step 2: explicit sanitisation — strips dangerous elements/attributes.
-    const clean = this.domSanitizer.sanitize(SecurityContext.HTML, rawHtml) ?? '';
+      // Step 2: explicit sanitisation — strips dangerous elements/attributes.
+      const clean = this.domSanitizer.sanitize(SecurityContext.HTML, rawHtml) ?? '';
 
-    // Step 3: mark as trusted so [innerHTML] renders it without
-    // Angular's automatic (and now redundant) re-sanitisation.
-    return this.domSanitizer.bypassSecurityTrustHtml(clean);
+      // Step 3: mark as trusted so [innerHTML] renders it without
+      // Angular's automatic (and now redundant) re-sanitisation.
+      return this.domSanitizer.bypassSecurityTrustHtml(clean);
+    } catch {
+      const clean = this.domSanitizer.sanitize(SecurityContext.HTML, value) ?? '';
+      return this.domSanitizer.bypassSecurityTrustHtml(clean);
+    }
   }
 }

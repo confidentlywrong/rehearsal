@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,6 +77,13 @@ type auditRecorder interface {
 var dbPingerForHealthz func(ctx context.Context) error
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("BILLING: %v", err)
+	}
+}
+
+func run() error {
+	config.Load()
 	logging.Setup()
 
 	tracingShutdown, err := tracing.SetupFromEnv(context.Background(), "race-billing")
@@ -84,28 +92,27 @@ func main() {
 	}
 	defer func() { _ = tracingShutdown(context.Background()) }()
 
-	port := config.Optional("PORT", "9122")
+	port := config.Optional("PORT", config.Optional("BILLING_PORT", config.DefaultBillingPort))
 	if err := config.ValidatePort(port); err != nil {
-		log.Fatalf("❌ Invalid PORT: %v", err)
+		return fmt.Errorf("invalid PORT: %w", err)
 	}
 
 	provider, err := providerFromEnv()
 	if err != nil {
-		log.Fatalf("BILLING: provider init: %v", err)
+		return fmt.Errorf("provider init: %w", err)
 	}
 	log.Printf("BILLING: provider=%s", provider.Name())
 
 	priceMap, err := billing.LoadPriceMapFromEnv(os.Getenv("STRIPE_PRICE_MAP"))
 	if err != nil {
-		log.Fatalf("BILLING: STRIPE_PRICE_MAP: %v", err)
+		return fmt.Errorf("STRIPE_PRICE_MAP: %w", err)
 	}
 	log.Printf("BILLING: price map entries=%d", len(priceMap))
 
 	store, pool, closeFn, err := openAccountStore()
 	if err != nil {
 		log.Printf("BILLING: account store unavailable (%v); serving /healthz only", err)
-		runHealthOnly(port, provider, priceMap)
-		return
+		return runHealthOnly(port, provider, priceMap)
 	}
 	defer closeFn()
 
@@ -119,7 +126,7 @@ func main() {
 	// which gives an operator time to repair the DB.
 	pgDedup, pgErr := billing.NewPostgresEventDedup(pool)
 	if pgErr != nil {
-		log.Fatalf("BILLING: postgres dedup required; refusing to start with in-memory fallback: %v", pgErr)
+		return fmt.Errorf("postgres dedup required; refusing to start with in-memory fallback: %w", pgErr)
 	}
 	log.Printf("BILLING: dedup=postgres (table=processed_webhook_events)")
 	var dedup billing.EventDedup = pgDedup
@@ -135,22 +142,28 @@ func main() {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("BILLING: listening on :%s", port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("BILLING: serve: %v", err)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	select {
+	case err := <-serverErr:
+		return fmt.Errorf("serve: %w", err)
+	case <-quit:
+	}
 	log.Println("BILLING: shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("BILLING: forced shutdown: %v", err)
 	}
+	return nil
 }
 
 func providerFromEnv() (billing.Provider, error) {
@@ -211,7 +224,7 @@ func openAccountStore() (*account.Store, *pgxpool.Pool, func(), error) {
 }
 
 func buildDBConnStr() string {
-	if v := os.Getenv("DATABASE_URL"); v != "" {
+	if v := strings.TrimSpace(os.Getenv("DATABASE_URL")); v != "" {
 		return v
 	}
 	host := os.Getenv("ALLOYDB_HOST")
@@ -231,23 +244,54 @@ func buildDBConnStr() string {
 	return u.String()
 }
 
-// runHealthOnly serves just /healthz so the supervisor sees a live
-// process even without a DB. Used as a degraded fallback.
-func runHealthOnly(port string, provider billing.Provider, priceMap billing.PriceTierMap) {
+func configureTrustedProxies(r *gin.Engine) error {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return r.SetTrustedProxies(nil)
+	}
+	var proxies []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			proxies = append(proxies, trimmed)
+		}
+	}
+	if len(proxies) == 0 {
+		return r.SetTrustedProxies(nil)
+	}
+	return r.SetTrustedProxies(proxies)
+}
+
+func newHealthOnlyRouter(provider billing.Provider, priceMap billing.PriceTierMap) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	if err := configureTrustedProxies(r); err != nil {
+		log.Printf("BILLING: invalid TRUSTED_PROXIES (%v); disabling trusted proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestLogger())
 	r.Use(middleware.RequestTracing("race-billing"))
 	r.Use(middleware.SecurityHeaders(middleware.SecurityHeadersFromEnv()))
 	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":        "ok",
+		providerName := ""
+		if provider != nil {
+			providerName = provider.Name()
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status":        "unhealthy",
 			"mode":          "degraded",
-			"provider":      provider.Name(),
+			"reason":        "postgres unavailable",
+			"provider":      providerName,
 			"mapped_prices": len(priceMap),
 		})
 	})
+	return r
+}
+
+// runHealthOnly serves just /healthz so the supervisor sees a live
+// process even without a DB. Used as a degraded fallback.
+func runHealthOnly(port string, provider billing.Provider, priceMap billing.PriceTierMap) error {
+	r := newHealthOnlyRouter(provider, priceMap)
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           r,
@@ -257,17 +301,22 @@ func runHealthOnly(port string, provider billing.Provider, priceMap billing.Pric
 		IdleTimeout:       60 * time.Second,
 	}
 	serverErr := make(chan error, 1)
-	go func() { serverErr <- srv.ListenAndServe() }()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case err := <-serverErr:
-		log.Fatalf("BILLING: HTTP server failed: %v", err)
+		return fmt.Errorf("HTTP server failed: %w", err)
 	case <-quit:
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	return nil
 }
 
 // newRouter wires the webhook + healthz endpoints.
@@ -280,13 +329,24 @@ func newRouter(
 	clock func() time.Time,
 	auditor auditRecorder,
 ) *gin.Engine {
+	if clock == nil {
+		clock = time.Now
+	}
 	r := gin.New()
+	if err := configureTrustedProxies(r); err != nil {
+		log.Printf("BILLING: invalid TRUSTED_PROXIES (%v); disabling trusted proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestLogger())
 	r.Use(middleware.RequestTracing("race-billing"))
 	r.Use(middleware.SecurityHeaders(middleware.SecurityHeadersFromEnv()))
 
 	r.GET("/healthz", func(c *gin.Context) {
+		providerName := ""
+		if provider != nil {
+			providerName = provider.Name()
+		}
 		if dbPingerForHealthz != nil {
 			ctx, cancel := context.WithTimeout(c.Request.Context(), 1*time.Second)
 			defer cancel()
@@ -294,7 +354,7 @@ func newRouter(
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"status":        "unhealthy",
 					"reason":        "postgres unreachable",
-					"provider":      provider.Name(),
+					"provider":      providerName,
 					"mapped_prices": len(priceMap),
 				})
 				return
@@ -302,7 +362,7 @@ func newRouter(
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"status":        "ok",
-			"provider":      provider.Name(),
+			"provider":      providerName,
 			"mapped_prices": len(priceMap),
 		})
 	})
@@ -320,7 +380,14 @@ func webhookHandler(
 	clock func() time.Time,
 	auditor auditRecorder,
 ) gin.HandlerFunc {
+	if clock == nil {
+		clock = time.Now
+	}
 	return func(c *gin.Context) {
+		if c.Request.Body == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
 		// Cap Stripe webhook payload size. Real Stripe events are well under
 		// 100 KB; a 1 MB cap is generous while still preventing an unbounded
 		// io.ReadAll() from holding multi-GB requests in memory before the
@@ -332,6 +399,11 @@ func webhookHandler(
 		if err != nil {
 			log.Printf("read body: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+
+		if provider == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "billing provider unavailable"})
 			return
 		}
 
@@ -353,7 +425,27 @@ func webhookHandler(
 			})
 			return
 		}
-		if dedup.SeenOrMark(ev.ID) {
+		if dedup == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"event_id": ev.ID,
+				"error":    "dedup service unavailable",
+			})
+			return
+		}
+		seen, dedupErr := dedup.SeenOrMark(ev.ID)
+		if dedupErr != nil {
+			logging.FromContext(c.Request.Context()).Error("billing.dedup_failed",
+				slog.String("event_id", ev.ID),
+				slog.String("error", dedupErr.Error()),
+			)
+			log.Printf("BILLING: dedup SeenOrMark failed event_id=%s err=%v", ev.ID, dedupErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"event_id": ev.ID,
+				"error":    "dedup service unavailable",
+			})
+			return
+		}
+		if seen {
 			c.JSON(http.StatusOK, gin.H{"event_id": ev.ID, "status": "deduped"})
 			return
 		}
@@ -469,11 +561,14 @@ func handleCheckoutCompleted(
 			})
 			return
 		case lerr != nil && !errors.Is(lerr, account.ErrNotFound):
-			logging.FromContext(ctx).Warn("billing.checkout.customer_lookup_failed",
+			logging.FromContext(ctx).Error("billing.checkout.customer_lookup_failed",
 				slog.String("event_id", ev.ID),
 				slog.String("customer_id", cc.Customer),
 				slog.String("error", lerr.Error()),
 			)
+			log.Printf("handler error: %v", lerr)
+			c.JSON(http.StatusInternalServerError, gin.H{"event_id": ev.ID, "error": "internal server error"})
+			return
 		}
 	}
 	if !applyPlan(c, ctx, ev, cc.UserID, tier, store, users) {
@@ -855,6 +950,13 @@ func applyPlan(
 			})
 			return false
 		}
+	}
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"event_id": ev.ID,
+			"error":    "account store unavailable",
+		})
+		return false
 	}
 	if err := store.SetPlan(ctx, userID, tier); err != nil {
 		switch {

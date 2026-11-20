@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard zero viewport/canvas dimensions and non-finite water values, and reset cursor on dispose.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -82,7 +84,8 @@ const TEXTURE_CACHE_MAX = 200;
 
 /** Round a water level to the nearest 5% bucket to limit unique texture variants. */
 function waterBucket(water: number): number {
-  return Math.round(water / 5) * 5;
+  if (!Number.isFinite(water)) return 0;
+  return Math.max(0, Math.min(100, Math.round(water / 5) * 5));
 }
 
 /** Build the cache key that uniquely identifies a label's visual state. */
@@ -271,8 +274,9 @@ function drawLabel(
     ctx.fill();
 
     // Filled portion
-    const fillW = Math.max(BAR_H, barW * (waterLevel / 100));
-    const barColor = waterLevel > 50 ? '#4dabf7' : waterLevel > 20 ? '#ffd43b' : '#ff6b6b';
+    const safeWater = Number.isFinite(waterLevel) ? Math.max(0, Math.min(100, waterLevel)) : 0;
+    const fillW = Math.max(BAR_H, barW * (safeWater / 100));
+    const barColor = safeWater > 50 ? '#4dabf7' : safeWater > 20 ? '#ffd43b' : '#ff6b6b';
     ctx.beginPath();
     ctx.roundRect(barX, BAR_Y, fillW, BAR_H, barR);
     ctx.fillStyle = barColor;
@@ -350,8 +354,9 @@ export class LabelOverlay {
     const sprite = new THREE.Sprite(mat);
     const cw = (tex.image as HTMLCanvasElement).width;
     const ch = (tex.image as HTMLCanvasElement).height;
-    const aspect = cw / ch;
-    const h = SPRITE_PIXEL_H / window.innerHeight;
+    const aspect = ch > 0 ? cw / ch : 1;
+    const vh = window.innerHeight > 0 ? window.innerHeight : 1;
+    const h = SPRITE_PIXEL_H / vh;
     sprite.scale.set(h * aspect, h, 1);
     sprite.position.copy(pos);
     sprite.renderOrder = 20;
@@ -449,8 +454,9 @@ export class LabelOverlay {
       // Update sprite scale for potentially changed canvas size
       const cw = (mat.map!.image as HTMLCanvasElement).width;
       const ch = (mat.map!.image as HTMLCanvasElement).height;
-      const h = SPRITE_PIXEL_H / window.innerHeight;
-      state.sprite.scale.set(h * (cw / ch), h, 1);
+      const vh = window.innerHeight > 0 ? window.innerHeight : 1;
+      const h = SPRITE_PIXEL_H / vh;
+      state.sprite.scale.set(h * (ch > 0 ? cw / ch : 1), h, 1);
     }
   }
 
@@ -463,6 +469,7 @@ export class LabelOverlay {
     this.landmarkLabels = [];
 
     const LANDMARK_PIXEL_H = 18;
+    const vh = window.innerHeight > 0 ? window.innerHeight : 1;
     for (const entry of entries) {
       const tex = drawLandmarkLabel(entry.name);
       const spritePos = entry.position.clone();
@@ -476,8 +483,8 @@ export class LabelOverlay {
       const sprite = new THREE.Sprite(mat);
       const cw = (tex.image as HTMLCanvasElement).width;
       const ch = (tex.image as HTMLCanvasElement).height;
-      const h = LANDMARK_PIXEL_H / window.innerHeight;
-      sprite.scale.set(h * (cw / ch), h, 1);
+      const h = LANDMARK_PIXEL_H / vh;
+      sprite.scale.set(h * (ch > 0 ? cw / ch : 1), h, 1);
       sprite.position.copy(spritePos);
       sprite.renderOrder = 20;
       this.scene.add(sprite);
@@ -546,6 +553,7 @@ export class LabelOverlay {
 
   private onMouseMove = (e: MouseEvent): void => {
     const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     this.mouse.set(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
       -((e.clientY - rect.top) / rect.height) * 2 + 1,
@@ -567,6 +575,7 @@ export class LabelOverlay {
     if (this.wasDrag(e)) return;
 
     const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     const m = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
       -((e.clientY - rect.top) / rect.height) * 2 + 1,
@@ -601,11 +610,13 @@ export class LabelOverlay {
   };
 
   refreshScale(): void {
+    if (window.innerHeight <= 0) return;
     const invH = 1 / window.innerHeight;
     for (const state of this.labels.values()) {
       const mat = state.sprite.material as THREE.SpriteMaterial;
       const cw = (mat.map!.image as HTMLCanvasElement).width;
       const ch = (mat.map!.image as HTMLCanvasElement).height;
+      if (ch <= 0) continue;
       const h = SPRITE_PIXEL_H * invH;
       state.sprite.scale.set(h * (cw / ch), h, 1);
     }
@@ -613,6 +624,7 @@ export class LabelOverlay {
       const mat = state.sprite.material as THREE.SpriteMaterial;
       const cw = (mat.map!.image as HTMLCanvasElement).width;
       const ch = (mat.map!.image as HTMLCanvasElement).height;
+      if (ch <= 0) continue;
       const h = SPRITE_PIXEL_H * invH;
       state.sprite.scale.set(h * (cw / ch), h, 1);
     }
@@ -621,6 +633,7 @@ export class LabelOverlay {
       const mat = state.sprite.material as THREE.SpriteMaterial;
       const cw = (mat.map!.image as HTMLCanvasElement).width;
       const ch = (mat.map!.image as HTMLCanvasElement).height;
+      if (ch <= 0) continue;
       const h = LANDMARK_PIXEL_H * invH;
       state.sprite.scale.set(h * (cw / ch), h, 1);
     }
@@ -630,6 +643,7 @@ export class LabelOverlay {
     this.canvas.removeEventListener('mousemove', this.onMouseMove);
     this.canvas.removeEventListener('pointerdown', this.onPointerDown);
     this.canvas.removeEventListener('click', this.onClick);
+    this.canvas.style.cursor = '';
     for (const [id, state] of this.labels) this.removePathState(id, state);
     for (const [guid, state] of this.runnerLabels) this.removeRunnerState(guid, state);
     for (const state of this.landmarkLabels) {

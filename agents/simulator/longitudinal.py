@@ -15,23 +15,60 @@
 """Longitudinal tracking, what-if replay, and peer benchmarking.
 
 Provides cross-simulation tracking for leadership development.
-Uses file-based NDJSON storage as a portable default (no DB dependency),
-with optional PostgreSQL/AlloyDB support when ``USE_ALLOYDB=true``.
+Uses file-based NDJSON storage as a portable local store (no DB dependency).
 
 No LLM dependency — pure Python data operations.
 """
 
+from collections.abc import Mapping
+import fcntl
 import inspect
 import json
 import logging
+import math
+from pathlib import Path
+from typing import Any
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-import fcntl
 
+from agents.utils import simulation_registry
+from agents.utils import tenant_keys
 from agents.utils import tenant_paths
 
 logger = logging.getLogger(__name__)
+
+_ANONYMOUS_USER_IDS = frozenset(
+    {"anonymous", "default", "local-dev", "user", "simulation", "simulation_user", ""}
+)
+
+
+def _resolve_participant_id(state: Any) -> str:
+    """Resolve non-anonymous participant/user ID from session state or user_scope."""
+    saas_on = tenant_keys._saas_mode_enabled()
+    candidates: list[object] = [
+        state.get("participant_id"),
+        state.get("user_id"),
+        state.get("acting_user_id"),
+    ]
+    tenant = state.get("tenant")
+    if isinstance(tenant, Mapping):
+        candidates.append(tenant.get("user_id"))
+    candidates.append(simulation_registry.get_current_user_id())
+
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            continue
+        if saas_on:
+            tenant_paths._validate_single_segment(cleaned, "participant_id")
+            tenant_keys._validate_component(cleaned, "participant_id")
+        return cleaned
+
+    if saas_on:
+        raise ValueError("Authenticated participant_id/user_id is required when SAAS_MODE=on")
+    return "anonymous"
 
 # Default storage directory relative to repo root.
 # Kept as a module-level constant for backward compatibility with code
@@ -45,6 +82,36 @@ DEFAULT_RUNS_DIR = _REPO_ROOT / "data" / "simulation_runs"
 # ---------------------------------------------------------------------------
 # 5A: Simulation Run Record
 # ---------------------------------------------------------------------------
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def _strict_json_dumps(obj: object, **kwargs: Any) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON, replacing non-finite floats with null."""
+    try:
+        return json.dumps(obj, allow_nan=False, **kwargs)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, **kwargs)
 
 
 class SimulationRunRecord:
@@ -117,34 +184,62 @@ class SimulationRunRecord:
     @classmethod
     def from_session_state(cls, state: dict) -> "SimulationRunRecord":
         """Build a run record from ADK session state after simulation completes."""
-        principle_scores = state.get("principle_scores", [0.0] * 7)
-        overall_score = sum(principle_scores) / len(principle_scores) if principle_scores else 0.0
+        raw_scores = state.get("principle_scores")
+        principle_scores = (
+            [_finite_float(s, 0.0) for s in raw_scores]
+            if isinstance(raw_scores, (list, tuple)) and raw_scores
+            else [0.0] * 7
+        )
+        raw_overall = sum(principle_scores) / len(principle_scores) if principle_scores else 0.0
+        overall_score = round(raw_overall, 2) if math.isfinite(raw_overall) else 0.0
 
         final_resources = {}
-        for name, pool in state.get("resources", {}).items():
-            final_resources[name] = pool.get("current", 0)
+        resources = state.get("resources") or {}
+        if isinstance(resources, dict):
+            for name, pool in resources.items():
+                if isinstance(pool, dict):
+                    final_resources[name] = _finite_float(pool.get("current"), 0.0)
+
+        contradictions = state.get("contradiction_log") or []
+        defected = state.get("defected_echo_ids") or []
+        aligned = state.get("aligned_echo_ids") or []
+        echoes = state.get("echo_configs") or []
+        snapshots = state.get("tick_snapshots") or []
+        vitals = state.get("vitals_trend_full") or []
 
         return cls(
-            run_id=state.get("simulation_id", str(uuid.uuid4())),
-            participant_id=state.get("participant_id", "anonymous"),
-            quest_id=state.get("quest_id", ""),
-            quest_name=state.get("quest_name", ""),
-            difficulty=state.get("quest_difficulty", "intermediate"),
+            run_id=state.get("simulation_id") or str(uuid.uuid4()),
+            participant_id=_resolve_participant_id(state),
+            quest_id=state.get("quest_id") or "",
+            quest_name=state.get("quest_name") or "",
+            difficulty=state.get("quest_difficulty") or "intermediate",
             principle_scores=principle_scores,
-            overall_score=round(overall_score, 2),
-            contradiction_count=len(state.get("contradiction_log", [])),
-            defected_count=len(state.get("defected_echo_ids", [])),
-            aligned_count=len(state.get("aligned_echo_ids", [])),
-            total_echoes=len(state.get("echo_configs", [])),
-            total_ticks=len(state.get("tick_snapshots", [])),
+            overall_score=overall_score,
+            contradiction_count=len(contradictions) if isinstance(contradictions, list) else 0,
+            defected_count=len(defected) if isinstance(defected, list) else 0,
+            aligned_count=len(aligned) if isinstance(aligned, list) else 0,
+            total_echoes=len(echoes) if isinstance(echoes, list) else 0,
+            total_ticks=max(
+                len(snapshots) if isinstance(snapshots, list) else 0,
+                len(vitals) if isinstance(vitals, list) else 0,
+            ),
             final_resources=final_resources,
-            tick_snapshots=state.get("tick_snapshots"),
+            tick_snapshots=snapshots if isinstance(snapshots, list) else None,
         )
 
 
 # ---------------------------------------------------------------------------
 # 5A: File-Based Storage
 # ---------------------------------------------------------------------------
+
+
+def _sanitize_path_segment(raw: object, default: str) -> str:
+    """Normalize *raw* into a safe single filesystem path segment."""
+    cleaned = str(raw if raw is not None else "").replace("\\", "/").replace("\x00", "")
+    name = Path(cleaned).name.strip()
+    if not name or name in (".", ".."):
+        return default
+    return name
 
 
 class SimulationRunStore:
@@ -197,7 +292,8 @@ class SimulationRunStore:
                         dispatcher's tripwire policy.
         """
         tenant_id = tenant_paths.resolve_tenant_id(fallback=record.participant_id)
-        return self.base_dir / tenant_id
+        safe_tenant = _sanitize_path_segment(tenant_id, "anonymous")
+        return self.base_dir / safe_tenant
 
     def _subdir_for_participant(self, participant_id: str) -> Path:
         """Pick the on-disk subdirectory for a read.
@@ -207,7 +303,8 @@ class SimulationRunStore:
         the legacy ``participant_id`` subdirectory.
         """
         tenant_id = tenant_paths.resolve_tenant_id(fallback=participant_id)
-        return self.base_dir / tenant_id
+        safe_tenant = _sanitize_path_segment(tenant_id, "anonymous")
+        return self.base_dir / safe_tenant
 
     def save_run(self, record: SimulationRunRecord) -> Path:
         """Save a simulation run record.
@@ -226,15 +323,16 @@ class SimulationRunStore:
         with open(summary_path, "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
-                f.write(json.dumps(record.to_dict()) + "\n")
+                f.write(_strict_json_dumps(record.to_dict()) + "\n")
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
 
-        # Save full tick snapshots for replay
+        # Save full tick snapshots for replay (sanitize run_id against path traversal)
         if record.tick_snapshots:
-            replay_path = target_dir / f"{record.run_id}.json"
+            safe_run_id = _sanitize_path_segment(record.run_id, "unknown")
+            replay_path = target_dir / f"{safe_run_id}.json"
             with open(replay_path, "w") as f:
-                json.dump(record.to_full_dict(), f, indent=2)
+                f.write(_strict_json_dumps(record.to_full_dict(), indent=2))
 
         logger.info(
             "Saved simulation run %s for participant %s under %s (quest=%s, score=%.1f)",
@@ -280,7 +378,8 @@ class SimulationRunStore:
         Returns:
             Full run dict including tick_snapshots, or None.
         """
-        replay_path = self._subdir_for_participant(participant_id) / f"{run_id}.json"
+        safe_run_id = _sanitize_path_segment(run_id, "unknown")
+        replay_path = self._subdir_for_participant(participant_id) / f"{safe_run_id}.json"
         if not replay_path.exists():
             return None
         with open(replay_path) as f:
@@ -360,24 +459,26 @@ def replay_from_tick(
         apply_resource_impacts,
     )
 
-    if fork_tick < 0 or fork_tick >= len(tick_snapshots):
+    if not isinstance(tick_snapshots, list) or not tick_snapshots:
+        return {"error": "Invalid tick_snapshots: expected non-empty list"}
+    if isinstance(fork_tick, bool) or not isinstance(fork_tick, int) or fork_tick < 0 or fork_tick >= len(tick_snapshots):
         return {"error": f"Invalid fork_tick: {fork_tick}, must be 0-{len(tick_snapshots) - 1}"}
 
     # Get the resource state at the fork point
-    fork_snapshot = tick_snapshots[fork_tick]
-    org_state = fork_snapshot.get("organizational_state", {})
-    resources = org_state.get("resources", {})
+    fork_snapshot = tick_snapshots[fork_tick] if isinstance(tick_snapshots[fork_tick], dict) else {}
+    org_state = fork_snapshot.get("organizational_state") or {}
+    resources = org_state.get("resources") or {} if isinstance(org_state, dict) else {}
 
     # Deep copy resources for the what-if branch
     import copy
 
-    forked_resources = copy.deepcopy(resources)
+    forked_resources = copy.deepcopy(resources) if isinstance(resources, dict) else {}
 
     # Apply modified decision at fork point
-    if modified_decision_tags:
+    if isinstance(modified_decision_tags, dict) and modified_decision_tags:
         apply_resource_impacts(
             forked_resources,
-            modified_decision_tags.get("resource_impact_suggestion", {}),
+            modified_decision_tags.get("resource_impact_suggestion") or {},
         )
 
     # Replay remaining ticks with the original tick data but forked resources
@@ -385,29 +486,46 @@ def replay_from_tick(
     forked_trajectory: list[dict] = []
 
     for i, snap in enumerate(tick_snapshots):
-        original_resources = snap.get("organizational_state", {}).get("resources", {})
+        if not isinstance(snap, dict):
+            snap = {}
+        snap_org = snap.get("organizational_state") or {}
+        original_resources = snap_org.get("resources") or {} if isinstance(snap_org, dict) else {}
         original_trajectory.append(
             {
                 "tick": snap.get("tick", i),
-                "resources": {k: v.get("current", 0) for k, v in original_resources.items()},
+                "resources": {
+                    k: _finite_float(v.get("current"), 0.0)
+                    for k, v in original_resources.items()
+                    if isinstance(v, dict)
+                },
             }
         )
 
     for i in range(fork_tick, len(tick_snapshots)):
+        snap_i = tick_snapshots[i] if isinstance(tick_snapshots[i], dict) else {}
         forked_trajectory.append(
             {
-                "tick": tick_snapshots[i].get("tick", i),
-                "resources": {k: v.get("current", 0) for k, v in forked_resources.items()},
+                "tick": snap_i.get("tick", i),
+                "resources": {
+                    k: _finite_float(v.get("current"), 0.0)
+                    for k, v in forked_resources.items()
+                    if isinstance(v, dict)
+                },
             }
         )
 
         # Apply regen for next tick (simulating the ongoing decay/regen)
         if i < len(tick_snapshots) - 1:
             for name, pool in forked_resources.items():
-                regen = pool.get("regen_per_tick", 0)
-                current = pool.get("current", 0)
-                initial = pool.get("initial", 100)
-                pool["current"] = max(0, min(initial, round(current + regen, 1)))
+                if not isinstance(pool, dict):
+                    continue
+                regen = _finite_float(pool.get("regen_per_tick"), 0.0)
+                current = _finite_float(pool.get("current"), 0.0)
+                initial = _finite_float(pool.get("initial"), 100.0)
+                raw_next = current + regen
+                rounded_next = round(raw_next, 1) if math.isfinite(raw_next) else raw_next
+                clamped_next = max(0, min(initial, rounded_next))
+                pool["current"] = clamped_next if math.isfinite(clamped_next) else 0.0
 
     return {
         "fork_tick": fork_tick,
@@ -435,9 +553,10 @@ def _compute_trajectory_comparison(
 
     deltas = {}
     for resource in orig_final:
-        orig_val = orig_final.get(resource, 0)
-        fork_val = fork_final.get(resource, 0)
-        deltas[resource] = round(fork_val - orig_val, 1)
+        orig_val = _finite_float(orig_final.get(resource, 0), 0.0)
+        fork_val = _finite_float(fork_final.get(resource, 0), 0.0)
+        raw_delta = fork_val - orig_val
+        deltas[resource] = round(raw_delta, 1) if math.isfinite(raw_delta) else 0.0
 
     return {
         "resource_deltas": deltas,
@@ -485,19 +604,25 @@ def compute_peer_benchmarks(
 
         principles = LEADERSHIP_PRINCIPLES
 
+    safe_current = [_finite_float(s, 0.0) for s in (current_scores or [0.0] * 7)]
+
     if not all_runs:
         return {
-            "participant_scores": current_scores,
-            "average_scores": current_scores,
-            "p90_scores": current_scores,
+            "participant_scores": safe_current,
+            "average_scores": safe_current,
+            "p90_scores": safe_current,
             "total_runs": 0,
             "rank": 1,
             "rank_total": 1,
             "percentile": 100.0,
         }
 
-    # Collect all principle scores
-    all_scores = [r.get("principle_scores", [0.0] * 7) for r in all_runs]
+    # Collect all principle scores (guard explicit None and non-numeric values)
+    all_scores = [
+        [_finite_float(v, 0.0) for v in (r.get("principle_scores") or [0.0] * 7)]
+        for r in all_runs
+        if isinstance(r, dict)
+    ]
 
     # Compute per-principle averages and p90
     avg_scores = []
@@ -505,22 +630,24 @@ def compute_peer_benchmarks(
     for i in range(7):
         values = sorted([s[i] for s in all_scores if len(s) > i])
         if values:
-            avg_scores.append(round(sum(values) / len(values), 2))
+            raw_avg = sum(values) / len(values)
+            avg_scores.append(round(raw_avg, 2) if math.isfinite(raw_avg) else 0.0)
             p90_idx = min(int(len(values) * 0.9), len(values) - 1)
-            p90_scores.append(round(values[p90_idx], 2))
+            p90_val = values[p90_idx]
+            p90_scores.append(round(p90_val, 2) if math.isfinite(p90_val) else 0.0)
         else:
             avg_scores.append(0.0)
             p90_scores.append(0.0)
 
     # Compute overall ranking
-    current_overall = sum(current_scores) / len(current_scores) if current_scores else 0
-    all_overalls = sorted([sum(s) / len(s) for s in all_scores if s])
+    current_overall = _finite_float(sum(safe_current) / len(safe_current), 0.0) if safe_current else 0.0
+    all_overalls = sorted([_finite_float(sum(s) / len(s), 0.0) for s in all_scores if s])
 
     rank = sum(1 for o in all_overalls if o > current_overall) + 1
     total = len(all_overalls) + 1  # Include current run
 
     return {
-        "participant_scores": [round(s, 2) for s in current_scores],
+        "participant_scores": [round(s, 2) for s in safe_current],
         "average_scores": avg_scores,
         "p90_scores": p90_scores,
         "total_runs": len(all_runs),
@@ -541,7 +668,8 @@ def compute_learning_trajectory(runs: list[dict]) -> dict:
         Trajectory dict with per-simulation scores, trends, and
         growth recommendations.
     """
-    if not runs:
+    valid_runs = [r for r in (runs or []) if isinstance(r, dict)]
+    if not valid_runs:
         return {
             "simulations": [],
             "growth_areas": [],
@@ -553,27 +681,32 @@ def compute_learning_trajectory(runs: list[dict]) -> dict:
     from agents.simulator.quest_loader import LEADERSHIP_PRINCIPLES
 
     trajectory = []
-    for run in runs:
-        scores = run.get("principle_scores", [0.0] * 7)
+    for run in valid_runs:
+        raw_scores = run.get("principle_scores") or [0.0] * 7
+        scores = [_finite_float(v, 0.0) for v in raw_scores] if isinstance(raw_scores, (list, tuple)) else [0.0] * 7
         trajectory.append(
             {
                 "quest_id": run.get("quest_id"),
                 "quest_name": run.get("quest_name"),
-                "overall_score": run.get("overall_score", 0),
+                "overall_score": _finite_float(run.get("overall_score"), 0.0),
                 "principle_scores": scores,
-                "contradiction_count": run.get("contradiction_count", 0),
+                "contradiction_count": run.get("contradiction_count") or 0,
                 "completed_at": run.get("completed_at"),
             }
         )
 
     # Identify growth areas (weakest principles across last 3 runs)
-    recent = runs[-3:] if len(runs) >= 3 else runs
-    recent_scores = [r.get("principle_scores", [0.0] * 7) for r in recent]
+    recent = valid_runs[-3:] if len(valid_runs) >= 3 else valid_runs
+    recent_scores = [
+        [_finite_float(v, 0.0) for v in (r.get("principle_scores") or [0.0] * 7)]
+        for r in recent
+    ]
 
     avg_per_principle = []
     for i in range(7):
         vals = [s[i] for s in recent_scores if len(s) > i]
-        avg_per_principle.append(sum(vals) / len(vals) if vals else 0)
+        raw_avg = sum(vals) / len(vals) if vals else 0.0
+        avg_per_principle.append(raw_avg if math.isfinite(raw_avg) else 0.0)
 
     # Sort by score ascending to find weakest
     indexed = list(enumerate(avg_per_principle))
@@ -590,9 +723,9 @@ def compute_learning_trajectory(runs: list[dict]) -> dict:
     ]
 
     # Compute trend (is the participant improving?)
-    if len(runs) >= 2:
-        first_overall = runs[0].get("overall_score", 0)
-        last_overall = runs[-1].get("overall_score", 0)
+    if len(valid_runs) >= 2:
+        first_overall = _finite_float(valid_runs[0].get("overall_score"), 0.0)
+        last_overall = _finite_float(valid_runs[-1].get("overall_score"), 0.0)
         trend = (
             "improving" if last_overall > first_overall else ("declining" if last_overall < first_overall else "stable")
         )
@@ -604,7 +737,7 @@ def compute_learning_trajectory(runs: list[dict]) -> dict:
         "growth_areas": growth_areas,
         "strengths": strengths,
         "trend": trend,
-        "total_simulations": len(runs),
+        "total_simulations": len(valid_runs),
     }
 
 
@@ -612,7 +745,7 @@ def compute_learning_trajectory(runs: list[dict]) -> dict:
 # Quest Recommendation
 # ---------------------------------------------------------------------------
 
-# Maps each principle to the quest that best exercises it
+# Maps each principle to the shipped quest ID (configs/quests/*.yaml) that best exercises it
 QUEST_PRINCIPLE_MAP = {
     "Strategic Foresight & Vision Cascading": "ai_powered_disruptor",
     "Adaptive Decision-Making & Agility": "scaling_hypergrowth_2028",
@@ -657,7 +790,8 @@ def recommend_next_quest(runs: list[dict]) -> dict:
     # Don't recommend the same quest they just completed
     last_quest = runs[-1].get("quest_id", "")
     if quest_id == last_quest and len(growth_areas) > 1:
-        target_principle = growth_areas[1]["principle"]
+        weakest = growth_areas[1]
+        target_principle = weakest["principle"]
         quest_id = QUEST_PRINCIPLE_MAP.get(target_principle, "ai_powered_disruptor")
 
     return {

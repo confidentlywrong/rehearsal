@@ -23,10 +23,53 @@ messages. The simulator constructs them via serialize_runner_event().
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
+
+from agents.utils.sim_defaults import DEFAULT_RACE_DISTANCE_MI
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, rejecting None, bool, NaN, and Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    """Coerce numeric value to float-range int, rejecting None, bool, NaN, Inf, and OverflowError."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(round(num)) if math.isfinite(num) else default
+
+
+def _strip_nonfinite(obj: Any) -> Any:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
 
 
 class RunnerEventType(str, Enum):
@@ -69,7 +112,7 @@ def parse_runner_event(text: str) -> RunnerEvent:
     data = {k: v for k, v in obj.items() if k != "event"}
     try:
         event_type = RunnerEventType(event_str)
-    except ValueError:
+    except (ValueError, TypeError):
         return RunnerEvent(event=RunnerEventType.UNKNOWN, data=data)
 
     return RunnerEvent(event=event_type, data=data)
@@ -79,7 +122,7 @@ def build_tick_event(
     tick: int,
     max_ticks: int,
     total_race_hours: float,
-    race_distance_mi: float = 26.2188,
+    race_distance_mi: float = DEFAULT_RACE_DISTANCE_MI,
     collector_buffer_key: str = "",
     runner_count: int | None = None,
     persona: str | None = None,
@@ -95,29 +138,50 @@ def build_tick_event(
             runners RPUSH their process_tick results directly to this key,
             enabling direct-write aggregation for faster tick processing.
     """
-    minutes_per_tick = (total_race_hours * 60) / max_ticks if max_ticks > 0 else 0
+    safe_tick = _finite_int(tick, 0)
+    safe_max_ticks = _finite_int(max_ticks, 0)
+    safe_total_hours = _finite_float(total_race_hours, 0.0)
+    safe_distance_mi = _finite_float(race_distance_mi, DEFAULT_RACE_DISTANCE_MI)
+
+    try:
+        raw_mpt = (safe_total_hours * 60.0) / safe_max_ticks if safe_max_ticks > 0 else 0.0
+    except OverflowError:
+        raw_mpt = 0.0
+    minutes_per_tick = raw_mpt if math.isfinite(raw_mpt) else 0.0
+
     # Tick 0 is the initialization tick: no simulated time passes.
-    tick_minutes = 0.0 if tick == 0 else minutes_per_tick
+    raw_tick_minutes = 0.0 if safe_tick == 0 else minutes_per_tick
+    tick_minutes = raw_tick_minutes if math.isfinite(raw_tick_minutes) else 0.0
+
+    try:
+        raw_elapsed = safe_tick * minutes_per_tick
+    except OverflowError:
+        raw_elapsed = 0.0
+    elapsed_minutes = raw_elapsed if math.isfinite(raw_elapsed) else 0.0
+
     data: dict = {
-        "tick": tick,
-        "max_ticks": max_ticks,
+        "tick": safe_tick,
+        "max_ticks": safe_max_ticks,
         "minutes_per_tick": tick_minutes,
-        "elapsed_minutes": tick * minutes_per_tick,
-        "race_distance_mi": race_distance_mi,
+        "elapsed_minutes": elapsed_minutes,
+        "race_distance_mi": safe_distance_mi,
     }
     if collector_buffer_key:
         data["collector_buffer_key"] = collector_buffer_key
     if runner_count is not None:
-        data["runner_count"] = runner_count
+        data["runner_count"] = _finite_int(runner_count, 0)
     if persona is not None:
         data["persona"] = persona
     return RunnerEvent(event=RunnerEventType.TICK, data=data)
 
 
 def serialize_runner_event(event: RunnerEvent) -> str:
-    """Serialize a RunnerEvent to a JSON string for transmission."""
+    """Serialize a RunnerEvent to a strict RFC 8259 JSON string for transmission."""
     obj = {"event": event.event.value, **event.data}
-    return json.dumps(obj)
+    try:
+        return json.dumps(obj, allow_nan=False)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False)
 
 
 def build_decision_round_event(
@@ -131,8 +195,8 @@ def build_decision_round_event(
 ) -> RunnerEvent:
     """Build a DECISION_ROUND RunnerEvent for AI Echoes."""
     data: dict = {
-        "tick": tick,
-        "max_ticks": max_ticks,
+        "tick": _finite_int(tick, 0),
+        "max_ticks": _finite_int(max_ticks, 0),
         "decision_text": decision_text,
         "decision_tags": decision_tags,
         "resource_state": resource_state,

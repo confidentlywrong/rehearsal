@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: update default gateway port to 9101 and guard zero duration throughput division.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +40,7 @@ async def benchmark_a2a(count: int, concurrency: int = 10):
     client = SimulationA2AClient()
 
     print(f"🚀 Starting A2A Stress Test: {count} total calls, max {concurrency} concurrent.")
-    print(f"📡 Registry: {os.getenv('GATEWAY_URL', 'http://localhost:8101')}")
+    print(f"📡 Registry: {os.getenv('GATEWAY_URL', 'http://localhost:9101')}")
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -73,7 +75,7 @@ async def benchmark_a2a(count: int, concurrency: int = 10):
     print("=" * 40)
     print(f"Total Calls:      {count}")
     print(f"Total Duration:   {overall_duration:.2f}s")
-    print(f"Throughput:       {count / overall_duration:.2f} calls/sec")
+    print(f"Throughput:       {(count / overall_duration) if overall_duration > 0 else 0.0:.2f} calls/sec")
     print(f"Success Count:    {len(success_latencies)}")
     print(f"Error Count:      {len(errors)}")
 

@@ -30,6 +30,7 @@ from agents.leadership_runner.constants import (
     LOGNORMAL_SIGMA,
     MAX_FINISH_MIN,
     MIN_FINISH_MIN,
+    PERSONA_PROFILES,
     get_persona_profile,
     stakeholder_seed,
 )
@@ -64,8 +65,13 @@ def initialize_leadership_stakeholder(
     # available profiles using the session_id seed.  This mirrors
     # Marathon's approach of per-session statistical variance but
     # applies it through distinct physics profiles.
-    persona = state.get("persona")
-    if not persona:
+    raw_persona = state.get("persona")
+    persona = (
+        raw_persona.strip().lower()
+        if isinstance(raw_persona, str) and raw_persona.strip()
+        else ""
+    )
+    if not persona or persona not in PERSONA_PROFILES:
         persona_rng = random.Random(stakeholder_seed(session_id, salt=999))
         persona = persona_rng.choice(ALL_PERSONAS)
     state["persona"] = persona
@@ -79,7 +85,8 @@ def initialize_leadership_stakeholder(
 
     # Derive initial momentum (= velocity state key)
     target_rate = CONSENSUS_DISTANCE / (target_finish / 60.0)
-    initial_momentum = target_rate / profile["momentum_scale"]
+    momentum_scale = max(float(profile.get("momentum_scale", 4.0) or 4.0), 1e-6)
+    initial_momentum = target_rate / momentum_scale
 
     # Resistance cliff parameters (replaces marathon "wall")
     will_hit_cliff = rng.random() < profile["resistance_cliff_prob"]
@@ -105,8 +112,13 @@ def initialize_leadership_stakeholder(
 
     # Wave start: assign corral by alignment speed (faster stakeholders start first)
     ability_pct = (target_finish - MIN_FINISH_MIN) / (MAX_FINISH_MIN - MIN_FINISH_MIN)
-    runner_index = int(ability_pct * max(runner_count - 1, 0))
-    wave_number, start_delay_minutes = compute_wave(runner_index, runner_count)
+    safe_runner_count = (
+        runner_count
+        if isinstance(runner_count, int) and not isinstance(runner_count, bool) and runner_count > 0
+        else 1
+    )
+    runner_index = int(ability_pct * max(safe_runner_count - 1, 0))
+    wave_number, start_delay_minutes = compute_wave(runner_index, safe_runner_count)
 
     # Starting political capital: 85–100% (leaders start with capital to spend)
     base_capital = 100.0 - 10.0 * max(0.0, ability_ratio - 0.5)

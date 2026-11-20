@@ -4,6 +4,7 @@ package billing
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -74,8 +75,9 @@ var ErrPlanNotFound = errors.New("billing: plan tier not found")
 var ErrUserNotFound = errors.New("billing: user not found")
 
 // GetUserPlan looks up the plan tier that applies to one user and
-// returns the full row from the `plans` table. A single JOIN keeps
-// the round-trip cost flat.
+// returns the full row from the `plans` table. A single LEFT JOIN
+// keeps the round-trip cost flat while distinguishing a missing user
+// (ErrUserNotFound) from a missing plan tier (ErrPlanNotFound).
 func (s *Store) GetUserPlan(ctx context.Context, userID string) (Plan, error) {
 	if s == nil || s.db == nil {
 		return Plan{}, errors.New("billing: DB not connected")
@@ -87,23 +89,30 @@ func (s *Store) GetUserPlan(ctx context.Context, userID string) (Plan, error) {
 		SELECT p.tier, p.monthly_token_cap, p.max_concurrent_runs,
 		       COALESCE(p.description, '')
 		FROM users u
-		JOIN plans p ON p.tier = u.plan_tier
+		LEFT JOIN plans p ON p.tier = u.plan_tier
 		WHERE u.id = $1 AND u.deleted_at IS NULL
 	`, userID)
-	var p Plan
-	if err := row.Scan(&p.Tier, &p.MonthlyTokenCap, &p.MaxConcurrentRuns,
-		&p.Description); err != nil {
+	var (
+		tier    sql.NullString
+		capVal  sql.NullInt64
+		maxRuns sql.NullInt64
+		desc    string
+	)
+	if err := row.Scan(&tier, &capVal, &maxRuns, &desc); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// We can't distinguish here whether the user is missing
-			// or the plan tier is missing without a second query.
-			// Return the less-alarming "plan not found" — the user's
-			// existence is already implied by the surrounding account
-			// middleware.
-			return Plan{}, ErrPlanNotFound
+			return Plan{}, ErrUserNotFound
 		}
 		return Plan{}, fmt.Errorf("billing: get user plan: %w", err)
 	}
-	return p, nil
+	if !tier.Valid || !capVal.Valid || !maxRuns.Valid {
+		return Plan{}, ErrPlanNotFound
+	}
+	return Plan{
+		Tier:              tier.String,
+		MonthlyTokenCap:   capVal.Int64,
+		MaxConcurrentRuns: int(maxRuns.Int64),
+		Description:       desc,
+	}, nil
 }
 
 // CheckQuota runs the pre-flight gate for one user, returning a
@@ -115,8 +124,8 @@ func (s *Store) GetUserPlan(ctx context.Context, userID string) (Plan, error) {
 //     PercentUsed=0 (cosmetically; dashboard renders "unlimited"
 //     based on TokensCap=-1).
 //   - Missing rollup row → treated as 0 used (NOT an error).
-//   - Missing plan / missing user → returns ErrPlanNotFound. Caller
-//     should fail-open and log.
+//   - Missing user → returns ErrUserNotFound; missing plan row →
+//     returns ErrPlanNotFound.
 //   - DB errors propagate.
 func (s *Store) CheckQuota(ctx context.Context, userID string) (QuotaState, error) {
 	if s == nil || s.db == nil {
@@ -166,6 +175,9 @@ func (s *Store) CheckQuota(ctx context.Context, userID string) (QuotaState, erro
 // last. Used by GET /api/v1/plans so the SPA can render the upgrade
 // catalog without hardcoding tier names.
 func (s *Store) ListPlans(ctx context.Context) ([]Plan, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("billing: DB not connected")
+	}
 	rows, err := s.db.Query(ctx, `
 		SELECT tier, monthly_token_cap, max_concurrent_runs,
 		       COALESCE(description, '')

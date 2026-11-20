@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8101")
+GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:9101")
 GATEWAY_WS_URL = os.getenv(
     "GATEWAY_WS_URL",
     GATEWAY_HTTP_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws",
@@ -148,10 +148,12 @@ def get_iap_token() -> str | None:
             check=True,
             timeout=30,
         )
-        token = result.stdout.strip()
-        return token if token else None
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Failed to obtain IAP identity token for {IAP_CLIENT_ID}: {exc}") from exc
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError(f"gcloud returned empty IAP identity token for {IAP_CLIENT_ID}")
+    return token
 
 
 def auth_headers(token: str | None) -> dict[str, str]:
@@ -1055,7 +1057,7 @@ def main() -> None:
     # Print banner
     print()
     print("=" * 72)
-    print("  N26 Simulation Gateway — Performance Diagnostic")
+    print("  The Rehearsal Gateway — Performance Diagnostic")
     print("=" * 72)
     print(f"  Gateway:           {GATEWAY_HTTP_URL}")
     print(f"  WebSocket:         {GATEWAY_WS_URL}")

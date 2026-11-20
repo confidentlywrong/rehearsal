@@ -128,8 +128,8 @@ below read them from state.  You only ever pass small scalars
 Always display `route_id` to user after storing.
 
 ## Pre-seeded Plans
-4 seed routes pre-loaded (Strip Classic, Entertainment Circuit, Diagonal Traverse,
-North-South Express). Use `recall_routes()` to list or `get_best_route()` for top.
+4 seed routes pre-loaded (Strip Classic, Entertainment Circuit, East Side Explorer,
+Grand Loop). Use `recall_routes()` to list or `get_best_route()` for top.
 
 ## Recall Workflow
 For general route inquiries (e.g. "show me my routes"), use `recall_routes()` or `get_best_route()`.

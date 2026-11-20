@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: clear tooltip/flash timers and RunnerManager buffers on reset/teardown, dispose Points/Line/shared resources, guard zero-dimension resize/mouse/route imports, remove synthetic thought/runner fallbacks, and prevent interval leaks.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,6 +70,7 @@ import {
   drawRouteSuppressSegmentToTexture,
   drawTrafficjamSegmentToTexture,
   setError,
+  disposeSharedRouteResources,
 } from './route/route';
 import {
   getWarning,
@@ -85,6 +88,7 @@ import {
   AffectedIntersection,
   getTrafficZones,
   lngLatToWorld,
+  disposeSharedIconResources,
 } from './route/icons';
 import { initTweakpane, TweakpaneDebugApi } from './debug/tweakpane';
 import { PerfMonitor } from './debug/perf-monitor';
@@ -98,11 +102,9 @@ import { Runner } from '../runner';
 import { SimpleStationZone, StationZone } from '../water-station';
 import { visualizeRoutePlan } from './viewport-utils';
 import {
-  EXTERNAL_THOUGHTS,
   roadSpline1,
   roadSpline2,
   roadSpline3,
-  SWITCH_RUNNER_THOUGHTS_MS,
 } from '../../constants';
 import { DemoService } from '../components/DemoOverlay/demo.service';
 
@@ -133,12 +135,12 @@ function perfMeasure(name: string): void {
         <div class="runner-label-main" [class.hasThoughts]="runnersHaveThoughts">
           <div class="stats">
             <div class="stat-row">
-              <p class="runner-position">Position #123</p>
-              <p class="runner-id">Position #123</p>
+              <p class="runner-position">—</p>
+              <p class="runner-id">ID: —</p>
             </div>
             <div class="stat-row">
-              <p class="runner-pace">Pace: XX</p>
-              <p class="runner-energy">Pace: XX</p>
+              <p class="runner-pace">Pace: —</p>
+              <p class="runner-energy">Energy: —</p>
             </div>
           </div>
           <h3 class="runner-thought" [hidden]="!runnersHaveThoughts"></h3>
@@ -172,6 +174,12 @@ export class ViewportComponent implements OnInit, OnDestroy {
   private readonly triggerErrorHandler = (): void => this.setError(true);
   private readonly fixErrorHandler = (): void => this.setError(false);
   private readonly playIntroHandler = (): void => this.handleCtrlIIntro();
+  private readonly contextLostHandler = (e: Event): void => {
+    e.preventDefault();
+  };
+  private readonly contextRestoredHandler = (): void => {
+    this.onResize();
+  };
 
   private _destroyed = false;
   /** City GLB and window meshes are ready — used with demo intro sync. */
@@ -274,43 +282,14 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
   protected runnersHaveThoughts: boolean = false;
 
-  private currentExternalThought = '';
-  private uniqueExternalThoughts = new Set(EXTERNAL_THOUGHTS);
-  private cycleThroughThoughtsInterval: number | null = null;
-
-  cycleThoughts = () => {
-    if (this.currentExternalThought) {
-      this.uniqueExternalThoughts.delete(this.currentExternalThought);
-    }
-    if (this.uniqueExternalThoughts.size === 0) {
-      this.uniqueExternalThoughts = new Set(EXTERNAL_THOUGHTS);
-    }
-    const pool = [...this.uniqueExternalThoughts];
-    this.currentExternalThought = pool[Math.floor(Math.random() * pool.length)] ?? '';
-  };
-
-  /** New thought immediately and restart the rotation timer (e.g. after following a different runner). */
-  private resetExternalThoughtCycle(): void {
-    if (!this.runnersHaveThoughts) return;
-    this.cycleThoughts();
-    if (this.cycleThroughThoughtsInterval !== null) {
-      clearInterval(this.cycleThroughThoughtsInterval);
-    }
-    this.cycleThroughThoughtsInterval = setInterval(this.cycleThoughts, SWITCH_RUNNER_THOUGHTS_MS);
-    this.cdr.markForCheck();
-  }
-
   /** Window events are not template-triggered; OnPush needs an explicit mark so `[hidden]` / class bindings update. */
   private readonly onGiveRunnersThoughts = (): void => {
     this.runnersHaveThoughts = true;
-
-    this.cycleThroughThoughtsInterval = setInterval(this.cycleThoughts, SWITCH_RUNNER_THOUGHTS_MS);
     this.cdr.markForCheck();
   };
 
   private readonly onRemoveRunnersThoughts = (): void => {
     this.runnersHaveThoughts = false;
-    if (this.cycleThroughThoughtsInterval) clearInterval(this.cycleThroughThoughtsInterval);
     this.cdr.markForCheck();
   };
 
@@ -349,8 +328,10 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
     initParticles(this.ctx);
 
-    initModel(this.ctx).then(async () => {
-      initPostProcessing(this.ctx);
+    initModel(this.ctx)
+      .then(async () => {
+        if (this._destroyed) return;
+        initPostProcessing(this.ctx);
 
       if (this.ctx.debug) {
         this.debugSplines = [roadSpline1, roadSpline2, roadSpline3];
@@ -415,12 +396,22 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
       this._modelReady = true;
       this.syncDemoIntroState();
-    });
+    })
+      .catch((err) => {
+        if (!this._destroyed) {
+          console.error('[Viewport] initModel failed:', err);
+        }
+      });
 
     this.canvasRef.nativeElement.addEventListener('pointerdown', this.pointerDownHandler);
     this.canvasRef.nativeElement.addEventListener('pointerup', this.pointerUpHandler);
     this.canvasRef.nativeElement.addEventListener('wheel', this.wheelHandler, { passive: false });
     this.canvasRef.nativeElement.addEventListener('mousemove', this.mouseMoveHandler);
+    this.canvasRef.nativeElement.addEventListener('webglcontextlost', this.contextLostHandler);
+    this.canvasRef.nativeElement.addEventListener('webglcontextrestored', this.contextRestoredHandler);
+    if (typeof document !== 'undefined') {
+      this.ctx.timer.connect(document);
+    }
     window.addEventListener('resize', this.resizeHandler);
     window.addEventListener('hud:removeAllPaths', this.onRemoveAllPaths);
     window.addEventListener('hud:remove', this.onRemovePath);
@@ -454,12 +445,6 @@ export class ViewportComponent implements OnInit, OnDestroy {
     this._destroyed = true;
     this._runnerLabelDom = null;
 
-    // Bug #29: Clear the thought-cycling interval to prevent leak
-    if (this.cycleThroughThoughtsInterval !== null) {
-      clearInterval(this.cycleThroughThoughtsInterval);
-      this.cycleThroughThoughtsInterval = null;
-    }
-
     // Stop render loop
     cancelAnimationFrame(this.ctx.animFrameId);
 
@@ -470,7 +455,13 @@ export class ViewportComponent implements OnInit, OnDestroy {
     this.canvasRef.nativeElement.removeEventListener('pointerup', this.pointerUpHandler);
     this.canvasRef.nativeElement.removeEventListener('wheel', this.wheelHandler);
     this.canvasRef.nativeElement.removeEventListener('mousemove', this.mouseMoveHandler);
+    this.canvasRef.nativeElement.removeEventListener('webglcontextlost', this.contextLostHandler);
+    this.canvasRef.nativeElement.removeEventListener('webglcontextrestored', this.contextRestoredHandler);
+    this.ctx.timer.disconnect();
     if (this._autoRotateResumeTimer) clearTimeout(this._autoRotateResumeTimer);
+    this.clearTooltipTimers();
+    this.clearEventFlashTimers();
+    this.cancelPostFinishSequence();
     window.removeEventListener('resize', this.resizeHandler);
     window.removeEventListener('hud:importPath', this.onImportPath);
     window.removeEventListener('gateway:routeGeojson', this.onRouteGeojson);
@@ -502,10 +493,14 @@ export class ViewportComponent implements OnInit, OnDestroy {
       (this.pickPlane.material as THREE.Material).dispose();
     }
 
+    this.runnerManager?.dispose();
+
     // Dispose post-processing passes individually
     this.ctx.ssaoPass?.dispose();
     this.ctx.bloomPass?.dispose();
+    (this.ctx.lutPass?.lut as THREE.Texture | undefined)?.dispose();
     this.ctx.lutPass?.dispose();
+    (this.ctx as { lutPass: unknown }).lutPass = null;
     this.ctx.depthOutlinePass?.dispose();
     this.ctx.vignettePass?.dispose();
     this.ctx.fxaaPass?.dispose();
@@ -516,11 +511,20 @@ export class ViewportComponent implements OnInit, OnDestroy {
     // Catches all dynamic objects: route tubes, icons, warnings, GLB meshes,
     // sky cylinder, mountains, ground, drawSplineToTexture CanvasTexture, etc.
     this.ctx.scene?.traverse((object) => {
-      if (!(object instanceof THREE.Mesh) && !(object instanceof THREE.Sprite)) return;
+      if (
+        !(object instanceof THREE.Mesh) &&
+        !(object instanceof THREE.Sprite) &&
+        !(object instanceof THREE.Points) &&
+        !(object instanceof THREE.Line)
+      ) {
+        return;
+      }
       (object as THREE.Mesh).geometry?.dispose();
-      const mats = Array.isArray(object.material)
-        ? (object.material as THREE.Material[])
-        : [object.material as THREE.Material];
+      const rawMaterial = (object as THREE.Mesh).material;
+      if (!rawMaterial) return;
+      const mats = Array.isArray(rawMaterial)
+        ? (rawMaterial as THREE.Material[])
+        : [rawMaterial as THREE.Material];
       for (const mat of mats) {
         if (!mat) continue;
         for (const val of Object.values(mat as unknown as Record<string, unknown>)) {
@@ -530,6 +534,9 @@ export class ViewportComponent implements OnInit, OnDestroy {
       }
     });
     this.ctx.scene?.clear();
+    this.ctx.zones = [];
+    this.ctx.iconPickMeshes = [];
+    this.ctx.startZoneAnimations = [];
 
     // Dispose route meshes that may have been scene.remove()'d and are
     // no longer reachable by the traversal above
@@ -552,21 +559,36 @@ export class ViewportComponent implements OnInit, OnDestroy {
       this.ctx.heightFogMaterial?.uniforms?.['emissiveMap']?.value as THREE.Texture | undefined
     )?.dispose();
     this.ctx.heightFogMaterial?.dispose();
+    this.ctx.heightFogLightUpMaterial?.dispose();
     for (const mat of this.ctx.windowMaterialArray) mat?.dispose();
+    for (const mat of this.ctx.zonesMaterialArray) mat?.dispose();
+    this.ctx.zonesMaterialArray = [];
     this.ctx.skyMaterial?.dispose();
     this.ctx.mountainMaterial?.dispose();
     this.ctx.foilageMaterial?.dispose();
     this.ctx.roadsMaterial?.dispose();
     this.ctx.roadsGlowMaterial?.dispose();
+    this.ctx.causticsParticleMaterial?.dispose();
+    this.ctx.medicalParticleMaterial?.dispose();
+    this.ctx.sphereMaterial?.dispose();
+    this.ctx.causticsCylinderMaterial?.dispose();
+    this.ctx.medicalCylinderMaterial?.dispose();
+    this.ctx.toiletCylinderMaterial?.dispose();
+    this.ctx.crowdParticleMaterial?.dispose();
+    disposeSharedIconResources();
+    disposeSharedRouteResources();
 
     // Dispose explicit texture fields
     this.ctx.routeStripeTexture?.dispose();
     this.ctx.routeCanvasTexture?.dispose();
+    this.ctx.routeRunnerTexture?.dispose();
+    this.ctx.routeCompleteTexture?.dispose();
+    this.ctx.trafficjamCanvasTexture?.dispose();
     this.ctx.iconLineTexture?.dispose();
     this.ctx.iconCircleTexture?.dispose();
     this.ctx.iconCircleFilledTexture?.dispose();
+    this.ctx.iconDiamondTexture?.dispose();
     this.ctx.warningTexture?.dispose();
-    (this.ctx.lutPass?.lut as THREE.Texture | undefined)?.dispose();
 
     // Dispose directional light shadow map
     this.ctx.dirLight?.shadow?.map?.dispose();
@@ -621,24 +643,43 @@ export class ViewportComponent implements OnInit, OnDestroy {
     if (!dom) return;
 
     const runner = this.runnerManager.getRunner(activeGuid!);
-    const runnerThought = runner?.getThought() || this.currentExternalThought;
-    const water = runner?.getWater() ?? 100;
-    const pace = runner?.getPace() ?? '3:30';
-    const place = runner?.getPlace([...this.runnerManager.getRunners().values()]) || '1000';
+    const runnerThought = runner?.getThought() ?? '';
+    const water = runner?.getWater();
+    const pace = runner?.getPace();
+    const place = runner?.getPlace([...this.runnerManager.getRunners().values()]);
 
     dom.emoji.textContent =
-      place === 1 ? '🥇' : place === 2 ? '🥈' : place === 3 ? '🥉' : `${runner?.getEmoji()}`;
+      place === 1 ? '🥇' : place === 2 ? '🥈' : place === 3 ? '🥉' : `${runner?.getEmoji() ?? ''}`;
 
-    dom.position.textContent = `#${place}`; // '#8888'; //
-    dom.id.textContent = `ID: ${activeGuid?.split('-')?.[1]?.slice(0, 6) ?? activeGuid?.slice(0, 6) ?? 'unknown'}`; // 'ID: 888888'; //
-    dom.pace.textContent = `Pace: ${pace}`; //'Pace: 88:88'; //
-    dom.energy.textContent = `Energy: ${water}%`; //'Energy: 88.88%'; //
+    dom.position.textContent = place !== undefined ? `#${place}` : '—';
+    dom.id.textContent = `ID: ${activeGuid?.split('-')?.[1]?.slice(0, 6) ?? activeGuid?.slice(0, 6) ?? '—'}`;
+    dom.pace.textContent = pace ? `Pace: ${pace}` : 'Pace: —';
+    dom.energy.textContent = water !== undefined ? `Energy: ${water}%` : 'Energy: —';
     dom.thought.textContent = this.runnersHaveThoughts ? runnerThought : '';
   }
 
   private _prevHoveredIcon: THREE.Mesh | null = null;
   private _tooltipHideTimer?: ReturnType<typeof setTimeout>;
   private _tooltipExpandTimer?: ReturnType<typeof setTimeout>;
+  private _eventFlashTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  private clearTooltipTimers(): void {
+    if (this._tooltipHideTimer) {
+      clearTimeout(this._tooltipHideTimer);
+      this._tooltipHideTimer = undefined;
+    }
+    if (this._tooltipExpandTimer) {
+      clearTimeout(this._tooltipExpandTimer);
+      this._tooltipExpandTimer = undefined;
+    }
+  }
+
+  private clearEventFlashTimers(): void {
+    for (const t of this._eventFlashTimers) {
+      clearTimeout(t);
+    }
+    this._eventFlashTimers.clear();
+  }
 
   private async tickIconTooltip(): Promise<void> {
     const el = this.iconTooltipRef.nativeElement;
@@ -720,9 +761,11 @@ export class ViewportComponent implements OnInit, OnDestroy {
   }
 
   private animate(): void {
+    if (this._destroyed) return;
     this.ctx.animFrameId = requestAnimationFrame(() => this.animate());
     this.ctx.timer.update();
-    const delta = this.ctx.timer.getDelta();
+    const rawDelta = this.ctx.timer.getDelta();
+    const delta = Number.isFinite(rawDelta) && rawDelta >= 0 ? Math.min(rawDelta, 0.1) : 0;
 
     this.ctx.controls.update();
 
@@ -1026,9 +1069,10 @@ export class ViewportComponent implements OnInit, OnDestroy {
   }
 
   private onMouseMove(e: MouseEvent): void {
-    this.mouseDirty = true;
     const canvas = this.canvasRef.nativeElement;
     const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    this.mouseDirty = true;
     this.mouse.set(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
       -((e.clientY - rect.top) / rect.height) * 2 + 1,
@@ -1075,6 +1119,7 @@ export class ViewportComponent implements OnInit, OnDestroy {
   private onResize(): void {
     const w = window.innerWidth,
       h = window.innerHeight;
+    if (w <= 0 || h <= 0) return;
     this.ctx.camera.aspect = w / h;
     this.ctx.camera.updateProjectionMatrix();
     this.ctx.renderer.setSize(w, h);
@@ -1111,12 +1156,16 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
   /** Convert lon/lat to the same world-space used by the GLB model. */
   private geoToWorld(lon: number, lat: number): THREE.Vector3 {
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+      return new THREE.Vector3(0, 0, 0);
+    }
+    const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, lat));
     const R = 6378137;
     const cx = ((MAP_CENTER_LON * Math.PI) / 180) * R;
     const cy = Math.log(Math.tan(Math.PI / 4 + (MAP_CENTER_LAT * Math.PI) / 180 / 2)) * R;
     const S = GLB_TRANSFORM.scale * 10;
     const mx = ((lon * Math.PI) / 180) * R;
-    const my = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 180 / 2)) * R;
+    const my = Math.log(Math.tan(Math.PI / 4 + (clampedLat * Math.PI) / 180 / 2)) * R;
     return new THREE.Vector3(
       (mx - cx) * S + GLB_TRANSFORM.offsetX,
       0,
@@ -1126,6 +1175,7 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
   /** Resample a polyline to N evenly-spaced points by arc length. */
   private resamplePath(pts: THREE.Vector3[], count: number): THREE.Vector3[] {
+    if (pts.length === 0 || count < 2) return pts;
     // Build cumulative distances
     const dists = [0];
     for (let i = 1; i < pts.length; i++) {
@@ -1177,8 +1227,9 @@ export class ViewportComponent implements OnInit, OnDestroy {
     const demo = this.demoService.activeDemo();
     if (demo === '3') return;
 
-    const { affectedIntersections, affectedSegments, closedSegments } = (e as CustomEvent)
-      .detail as {
+    const detail = (e as CustomEvent)?.detail;
+    if (!detail || typeof detail !== 'object') return;
+    const { affectedIntersections, affectedSegments, closedSegments } = detail as {
         affectedIntersections: AffectedIntersection[];
         affectedSegments: Array<{
           geometry?: {
@@ -1209,25 +1260,40 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
   private onImportPath = async (e: Event): Promise<void> => {
     const detail = (e as CustomEvent).detail as {
-      coords: [number, number][];
-      name: string;
+      coords?: [number, number][];
+      name?: string;
       waterStations?: { id: number; mi: number; coords: [number, number] }[];
       medicalTents?: { id: number; mi: number; coords: [number, number] }[];
       crowdZones?: { id: number; mi: number; coords: [number, number] }[];
       portableToilets?: { id: number; mi: number; coords: [number, number] }[];
       showOldRoute?: boolean;
-    };
+    } | null;
+
+    if (!detail || !Array.isArray(detail.coords)) {
+      this._skipNextRouteImportPans = false;
+      return;
+    }
+
+    const validCoords = detail.coords.filter(
+      (c): c is [number, number] =>
+        Array.isArray(c) && c.length >= 2 && Number.isFinite(c[0]) && Number.isFinite(c[1]),
+    );
+    if (validCoords.length < 2) {
+      this._skipNextRouteImportPans = false;
+      return;
+    }
 
     this.disposeRoutes();
     this.importedPaths = [];
 
+    const routeName = detail.name || 'Route';
     simLog.log(
       'PATH',
-      detail.name,
-      `coords=${detail.coords.length} waterStations=${detail.waterStations?.length ?? 0} medicalTents=${detail.medicalTents?.length ?? 0} crowdZones=${detail.crowdZones?.length ?? 0} portableToilets=${detail.portableToilets?.length ?? 0}`,
+      routeName,
+      `coords=${validCoords.length} waterStations=${detail.waterStations?.length ?? 0} medicalTents=${detail.medicalTents?.length ?? 0} crowdZones=${detail.crowdZones?.length ?? 0} portableToilets=${detail.portableToilets?.length ?? 0}`,
     );
 
-    const rawPoints = detail.coords.map(([lon, lat]) => this.geoToWorld(lon, lat));
+    const rawPoints = validCoords.map(([lon, lat]) => this.geoToWorld(lon, lat));
     if (rawPoints.length < 2) {
       this._skipNextRouteImportPans = false;
       return;
@@ -1239,17 +1305,29 @@ export class ViewportComponent implements OnInit, OnDestroy {
     // Tension near 1.0 keeps the spline tight to control points (no overshoot).
     const spline = new THREE.CatmullRomCurve3(points, false, 'catmullrom', 0.5);
 
-    const rawWaterStationPoints = detail.waterStations?.map(({ coords: [lon, lat] }) =>
+    const isValidStationCoord = (s: { coords?: [number, number] } | null | undefined): s is { coords: [number, number]; mi?: number } =>
+      !!s &&
+      Array.isArray(s.coords) &&
+      s.coords.length >= 2 &&
+      Number.isFinite(s.coords[0]) &&
+      Number.isFinite(s.coords[1]);
+
+    const validWater = detail.waterStations?.filter(isValidStationCoord);
+    const validMedical = detail.medicalTents?.filter(isValidStationCoord);
+    const validCrowd = detail.crowdZones?.filter(isValidStationCoord);
+    const validToilets = detail.portableToilets?.filter(isValidStationCoord);
+
+    const rawWaterStationPoints = validWater?.map(({ coords: [lon, lat] }) =>
       this.geoToWorld(lon, lat),
     );
-    const rawMedicalTentsPoints = detail.medicalTents?.map(({ coords: [lon, lat] }) =>
+    const rawMedicalTentsPoints = validMedical?.map(({ coords: [lon, lat] }) =>
       this.geoToWorld(lon, lat),
     );
-    const rawCrowdZonesPoints = detail.crowdZones?.map(({ coords: [lon, lat] }) =>
+    const rawCrowdZonesPoints = validCrowd?.map(({ coords: [lon, lat] }) =>
       this.geoToWorld(lon, lat),
     );
 
-    const rawPortableToiletPoints = detail.portableToilets?.map(({ coords: [lon, lat] }) =>
+    const rawPortableToiletPoints = validToilets?.map(({ coords: [lon, lat] }) =>
       this.geoToWorld(lon, lat),
     );
 
@@ -1257,8 +1335,8 @@ export class ViewportComponent implements OnInit, OnDestroy {
     const LOOKDEV_STATION_RADIUS = 75;
     this.importedStations = [];
     let stationIdx = 0;
-    if (detail.waterStations) {
-      for (const s of detail.waterStations) {
+    if (validWater) {
+      for (const s of validWater) {
         this.importedStations.push(
           new SimpleStationZone(
             stationIdx++,
@@ -1270,8 +1348,8 @@ export class ViewportComponent implements OnInit, OnDestroy {
         );
       }
     }
-    if (detail.medicalTents) {
-      for (const s of detail.medicalTents) {
+    if (validMedical) {
+      for (const s of validMedical) {
         this.importedStations.push(
           new SimpleStationZone(
             stationIdx++,
@@ -1283,8 +1361,8 @@ export class ViewportComponent implements OnInit, OnDestroy {
         );
       }
     }
-    if (detail.crowdZones) {
-      for (const s of detail.crowdZones) {
+    if (validCrowd) {
+      for (const s of validCrowd) {
         this.importedStations.push(
           new SimpleStationZone(
             stationIdx++,
@@ -1296,8 +1374,8 @@ export class ViewportComponent implements OnInit, OnDestroy {
         );
       }
     }
-    if (detail.portableToilets) {
-      for (const s of detail.portableToilets) {
+    if (validToilets) {
+      for (const s of validToilets) {
         this.importedStations.push(
           new SimpleStationZone(
             stationIdx++,
@@ -1377,16 +1455,21 @@ export class ViewportComponent implements OnInit, OnDestroy {
     // Compute geodesic distance in miles
     const R_MI = 3958.8;
     let lengthMi = 0;
-    for (let i = 1; i < detail.coords.length; i++) {
-      const [lon1, lat1] = detail.coords[i - 1];
-      const [lon2, lat2] = detail.coords[i];
+    for (let i = 1; i < validCoords.length; i++) {
+      const [lon1, lat1] = validCoords[i - 1];
+      const [lon2, lat2] = validCoords[i];
       const dLat = ((lat2 - lat1) * Math.PI) / 180;
       const dLon = ((lon2 - lon1) * Math.PI) / 180;
-      const a =
-        Math.sin(dLat / 2) ** 2 +
-        Math.cos((lat1 * Math.PI) / 180) *
-        Math.cos((lat2 * Math.PI) / 180) *
-        Math.sin(dLon / 2) ** 2;
+      const a = Math.min(
+        1,
+        Math.max(
+          0,
+          Math.sin(dLat / 2) ** 2 +
+            Math.cos((lat1 * Math.PI) / 180) *
+              Math.cos((lat2 * Math.PI) / 180) *
+              Math.sin(dLon / 2) ** 2,
+        ),
+      );
       lengthMi += 2 * R_MI * Math.asin(Math.sqrt(a));
     }
 
@@ -1497,8 +1580,8 @@ export class ViewportComponent implements OnInit, OnDestroy {
         if (ri !== -1) this.ctx.runners.splice(ri, 1);
       }
       this._simRunnerMeshes = [];
-      this.runnerManager.dispose();
-      this.runnerManager = new RunnerManager(this.ctx.scene);
+      this.clearEventFlashTimers();
+      this.runnerManager.clearRunners();
       removeRunnerRoute(this.ctx);
       this.lookdevPath = null;
     }
@@ -1665,9 +1748,12 @@ export class ViewportComponent implements OnInit, OnDestroy {
     }
 
     // Restore emissive color after a brief flash
-    setTimeout(() => {
+    const flashTimer = setTimeout(() => {
+      this._eventFlashTimers.delete(flashTimer);
+      if (this._destroyed) return;
       mat.emissive.set(0x000000);
     }, 600);
+    this._eventFlashTimers.add(flashTimer);
   };
 
   private onFocusSimRunner = (e: Event): void => {
@@ -1774,8 +1860,9 @@ export class ViewportComponent implements OnInit, OnDestroy {
 
   private onSimComplete = (): void => {
     this._pendingGatewaySimUpdates.clear();
-    this.runnerManager.dispose();
-    this.runnerManager = new RunnerManager(this.ctx.scene);
+    this.clearEventFlashTimers();
+    this.runnerManager.clearRunners();
+    this.runnerManager.simTargetGuid = null;
     this._simRunnerMeshes = [];
 
     this.followGuid = null;
@@ -1794,8 +1881,11 @@ export class ViewportComponent implements OnInit, OnDestroy {
     this._simGeneration++;
     import('../debug-race').then((m) => m.stopDebugRace());
     this._pendingGatewaySimUpdates.clear();
-    this.runnerManager.dispose();
-    this.runnerManager = new RunnerManager(this.ctx.scene);
+    this.clearTooltipTimers();
+    this.clearEventFlashTimers();
+    this.cancelPostFinishSequence();
+    this.runnerManager.clearRunners();
+    this.runnerManager.simTargetGuid = null;
     this._simRunnerMeshes = [];
     this._simSpeedCalibrated = false;
     this.simSpeedMultiplier = ViewportComponent.SIM_SPEED / 3600;
@@ -2013,7 +2103,6 @@ export class ViewportComponent implements OnInit, OnDestroy {
     this._followLeaderActive = false;
     this.followGuid = chosen.guid;
     followMesh(this.ctx, runner.getMesh(), FOLLOW_RUNNER_OFFSET, this._autoPanning);
-    this.resetExternalThoughtCycle();
   }
 
   private onFilterChanged = (e: Event): void => {
@@ -2301,16 +2390,21 @@ export class ViewportComponent implements OnInit, OnDestroy {
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       window.dispatchEvent(new CustomEvent('countdown:show', { detail: 3 }));
       await sleep(1000);
+      if (this._destroyed) return;
       window.dispatchEvent(new CustomEvent('countdown:show', { detail: 2 }));
       await sleep(1000);
+      if (this._destroyed) return;
       window.dispatchEvent(new CustomEvent('countdown:show', { detail: 1 }));
       await sleep(1000);
+      if (this._destroyed) return;
       window.dispatchEvent(new CustomEvent('countdown:show', { detail: 0 }));
 
       await panPromise;
+      if (this._destroyed) return;
 
       const transitionPromise = this.transitionToOverview(4.5);
       await sleep(800);
+      if (this._destroyed) return;
       window.dispatchEvent(new Event('countdown:hide'));
       await transitionPromise;
     } finally {
@@ -2435,22 +2529,33 @@ export class ViewportComponent implements OnInit, OnDestroy {
       this.ctx.controls.update();
 
       await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (this._destroyed) return;
 
       // add the start zone
       const startZone = await getStartZone(this.ctx);
+      if (this._destroyed) {
+        startZone.geometry?.dispose();
+        (startZone.material as THREE.Material)?.dispose();
+        return;
+      }
       startZone.position.copy(start);
       this.ctx.scene.add(startZone);
 
       triggerStartZoneAnimation(this.ctx, startZone, 3, 0.8, 1.5, async () => {
         this.ctx.scene.remove(startZone);
+        startZone.geometry?.dispose();
+        (startZone.material as THREE.Material)?.dispose();
+        if (this._destroyed) return;
         this.ctx.raceStartState = true;
 
         // start the race here, debug for now
-        const { startDebugRace, isDebugRaceRunning } = await import('../debug-race');
+        const { startDebugRace } = await import('../debug-race');
+        if (this._destroyed) return;
         startDebugRace(10);
 
         // wait and then allow the camera switch to follow a camera
         await new Promise((resolve) => setTimeout(resolve, 2000));
+        if (this._destroyed) return;
         this.ctx.raceStartState = false;
         this._followLeaderActive = true;
       });

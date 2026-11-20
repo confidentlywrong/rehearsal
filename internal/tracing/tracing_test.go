@@ -171,6 +171,13 @@ func TestSetup_UnknownExporterErrors(t *testing.T) {
 }
 
 func TestSetup_StdoutBuilds(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
 	cleanup, err := Setup(context.Background(), Config{
 		Exporter:       ExporterStdout,
 		ServiceName:    "test-svc",
@@ -187,6 +194,21 @@ func TestSetup_StdoutBuilds(t *testing.T) {
 	// Shutdown the provider so subsequent tests get a fresh global.
 	if err := cleanup(context.Background()); err != nil {
 		t.Errorf("cleanup error: %v", err)
+	}
+}
+
+func TestConfigFromEnv_TrimsWhitespace(t *testing.T) {
+	t.Setenv("OTEL_ENVIRONMENT", "  staging  ")
+	t.Setenv("GOOGLE_CLOUD_PROJECT", "   ")
+	cfg := ConfigFromEnv("svc")
+	if cfg.Environment != "staging" {
+		t.Errorf("Environment: want staging, got %q", cfg.Environment)
+	}
+	if cfg.GCPProject != "" {
+		t.Errorf("GCPProject: want empty after trim, got %q", cfg.GCPProject)
+	}
+	if err := validateGCPConfig(cfg); err == nil {
+		t.Fatal("expected whitespace-only GOOGLE_CLOUD_PROJECT to fail validateGCPConfig")
 	}
 }
 

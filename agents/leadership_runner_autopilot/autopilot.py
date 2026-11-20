@@ -26,6 +26,7 @@ This module is pure logic — independently testable with mock state dicts.
 """
 
 import logging
+import math
 from collections.abc import Callable
 from enum import Enum
 from typing import Any
@@ -176,12 +177,44 @@ def detect_phase(llm_request: LlmRequest) -> Phase:
     return Phase.DECIDE
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
 def extract_last_user_text(llm_request: LlmRequest) -> str:
     """Extract the text from the last user message in the request.
 
     Walks backwards through contents to find the last content with role='user'
     that has text parts, skipping model responses and function_response entries.
     """
+    if not llm_request.contents:
+        return ""
     for content in reversed(llm_request.contents):
         if content.role != "user":
             continue
@@ -224,9 +257,11 @@ def _text_response(text: str) -> LlmResponse:
 
 def _pick_inner_thought(state: StateLike, tick: int) -> str:
     """Pick a deterministic inner thought based on persona and tick."""
-    persona = state.get("persona", "pragmatist")
+    raw_persona = state.get("persona", "pragmatist")
+    persona = raw_persona.strip().lower() if isinstance(raw_persona, str) else ""
     thoughts = _INNER_THOUGHTS.get(persona, _DEFAULT_THOUGHTS)
-    return thoughts[tick % len(thoughts)]
+    safe_tick = _finite_int(tick, 0)
+    return thoughts[safe_tick % len(thoughts)]
 
 
 def handle_start_gun(state: StateLike, data: dict) -> LlmResponse:
@@ -240,8 +275,8 @@ def handle_start_gun(state: StateLike, data: dict) -> LlmResponse:
 
 def handle_crowd_boost(state: StateLike, data: dict) -> LlmResponse:
     """Coalition zone boost. Accelerate with provided or default intensity."""
-    intensity = data.get("intensity", 0.5)
-    return _function_call_response("accelerate", {"intensity": float(intensity)})
+    intensity = max(0.0, min(1.0, _finite_float(data.get("intensity"), 0.5)))
+    return _function_call_response("accelerate", {"intensity": intensity})
 
 
 def handle_distance_update(state: StateLike, data: dict) -> LlmResponse:
@@ -270,28 +305,60 @@ def handle_tick(state: StateLike, data: dict) -> LlmResponse:
     """
     # Initialize on first tick if not yet done.
     if state.get("velocity") is None:
-        session_id = data.get("_session_id", "default")
+        session_id = data.get("_session_id") or "default"
         runner_count = data.get("runner_count")
         if runner_count is None:
-            raise ValueError("CRITICAL: runner_count is missing from autopilot state data. Cannot safely spawn.")
+            runner_count = state.get("runner_count")
+        if (
+            not isinstance(runner_count, int)
+            or isinstance(runner_count, bool)
+            or runner_count <= 0
+        ):
+            logger.warning("CRITICAL: runner_count is missing/invalid from autopilot state data. Defaulting to 1 to avoid stall.")
+            runner_count = 1
         # NOTE: persona is NOT extracted from tick broadcast data.
         # Each runner self-assigns via seeded random in
         # initialize_leadership_stakeholder(), ensuring a diverse persona mix.
         initialize_leadership_stakeholder(state, session_id, runner_count=runner_count)
 
-    tick = data.get("tick", 0)
+    tick = max(0, _finite_int(data.get("tick"), 0))
+    minutes_per_tick = max(0.0, _finite_float(data.get("minutes_per_tick"), 15.0))
+    elapsed_minutes = max(0.0, _finite_float(data.get("elapsed_minutes"), 0.0))
+    race_distance_mi = _finite_float(data.get("race_distance_mi"), DEFAULT_RACE_DISTANCE_MI)
+    if race_distance_mi <= 0.0:
+        race_distance_mi = DEFAULT_RACE_DISTANCE_MI
+    raw_cbk = data.get("collector_buffer_key")
+    collector_key = raw_cbk if isinstance(raw_cbk, str) else ""
+    raw_rfm = data.get("route_friction_map")
+    route_friction_map = raw_rfm if isinstance(raw_rfm, dict) else {}
+    raw_grm = data.get("gatekeeper_route_map")
+    gatekeeper_route_map = raw_grm if isinstance(raw_grm, dict) else {}
+    raw_stations = data.get("station_index")
+    raw_sim_id = data.get("simulation_id")
     inner_thought = _pick_inner_thought(state, tick)
 
+    state["_tick_params"] = {
+        "tick": tick,
+        "minutes_per_tick": minutes_per_tick,
+        "elapsed_minutes": elapsed_minutes,
+        "race_distance_mi": race_distance_mi,
+        "collector_buffer_key": collector_key,
+        "station_index": raw_stations if isinstance(raw_stations, dict) else {},
+        "weather_modifier": data.get("weather_modifier", 1.0),
+        "route_friction_map": route_friction_map,
+        "gatekeeper_route_map": gatekeeper_route_map,
+        "simulation_id": raw_sim_id if isinstance(raw_sim_id, str) else "",
+    }
+
     args: dict = {
-        "minutes_per_tick": data.get("minutes_per_tick", 15.0),
-        "elapsed_minutes": data.get("elapsed_minutes", 0.0),
-        "race_distance_mi": data.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
+        "minutes_per_tick": minutes_per_tick,
+        "elapsed_minutes": elapsed_minutes,
+        "race_distance_mi": race_distance_mi,
         "tick": tick,
         "inner_thought": inner_thought,
-        "route_friction_map": data.get("route_friction_map", {}),
-        "gatekeeper_route_map": data.get("gatekeeper_route_map", {}),
+        "route_friction_map": route_friction_map,
+        "gatekeeper_route_map": gatekeeper_route_map,
     }
-    collector_key = data.get("collector_buffer_key", "")
     if collector_key:
         args["collector_buffer_key"] = collector_key
     return _function_call_response("process_leadership_tick", args)
@@ -299,9 +366,9 @@ def handle_tick(state: StateLike, data: dict) -> LlmResponse:
 
 def build_summary(state: StateLike) -> LlmResponse:
     """Build a one-sentence summary after tool execution."""
-    momentum = state.get("velocity", 0.0)
-    capital = state.get("water", 100)
-    progress = state.get("distance", 0.0)
+    momentum = _finite_float(state.get("velocity", 0.0), 0.0)
+    capital = _finite_float(state.get("water", 100), 100.0)
+    progress = _finite_float(state.get("distance", 0.0), 0.0)
     stalled = state.get("exhausted", False)
     aligned = state.get("finished", False)
     deadlocked = state.get("collapsed", False)
@@ -329,10 +396,9 @@ HANDLERS: dict[RunnerEventType, Callable[[StateLike, dict], LlmResponse]] = {
 
 # Also handle HYDRATION_STATION as a no-op (political capital refill is
 # handled internally by process_leadership_tick's checkpoint logic)
-if hasattr(RunnerEventType, "HYDRATION_STATION"):
-    HANDLERS[RunnerEventType.HYDRATION_STATION] = lambda state, data: _text_response(
-        "Capital checkpoint handled by process_leadership_tick."
-    )
+HANDLERS[RunnerEventType.HYDRATION_STATION] = lambda state, data: _text_response(
+    "Capital checkpoint handled by process_leadership_tick."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +436,6 @@ def autopilot_leadership_callback(
     # Inject session_id for handlers that need it (START_GUN for ack,
     # TICK for initialize_leadership_stakeholder on tick 0).
     if event.event in (RunnerEventType.START_GUN, RunnerEventType.TICK):
-        event.data["_session_id"] = getattr(getattr(callback_context, "session", None), "id", "default")
+        event.data["_session_id"] = getattr(getattr(callback_context, "session", None), "id", None) or "default"
 
     return handler(state, event.data)

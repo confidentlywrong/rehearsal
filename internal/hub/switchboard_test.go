@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/GoogleCloudPlatform/race-condition/gen_proto/gateway"
+	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/agent"
 	"github.com/GoogleCloudPlatform/race-condition/internal/session"
 	"github.com/redis/go-redis/v9"
@@ -991,7 +992,7 @@ func TestSwitchboard_PokeOrchestrationEndpoint_Success(t *testing.T) {
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 	}
 
-	sb.pokeOrchestrationEndpoint(agentServer.URL, "test-agent", []byte(`{"type":"spawn"}`))
+	sb.pokeOrchestrationEndpoint(context.Background(), agentServer.URL, "test-agent", []byte(`{"type":"spawn"}`))
 
 	assert.Equal(t, "/orchestration", receivedPath)
 	assert.Contains(t, string(receivedBody), `"type":"spawn"`)
@@ -1018,7 +1019,7 @@ func TestSwitchboard_PokeOrchestrationEndpoint_PlainHTTP(t *testing.T) {
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 	}
 
-	sb.pokeOrchestrationEndpoint(agentServer.URL, "test-agent", []byte(`{}`))
+	sb.pokeOrchestrationEndpoint(context.Background(), agentServer.URL, "test-agent", []byte(`{}`))
 
 	assert.Equal(t, "/orchestration", receivedPath)
 }
@@ -1638,4 +1639,196 @@ func TestSpawnQueueName_DefaultShards(t *testing.T) {
 
 	nameNeg := SpawnQueueName("runner_autopilot", "session-1", -1)
 	assert.Equal(t, name, nameNeg, "Negative numShards should behave like 0 (use default)")
+}
+
+func TestSwitchboard_DispatchCallable_AE_PropagatesUserIDFromContext(t *testing.T) {
+	var receivedBody []byte
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer agentServer.Close()
+
+	s := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+
+	sb := &RedisSwitchboard{
+		client:         rdb,
+		gatewayID:      "test-gw",
+		localHub:       NewHub(),
+		channel:        "gateway:broadcast",
+		callableClient: &http.Client{Timeout: 5 * time.Second},
+		gcpClient:      &http.Client{Timeout: 5 * time.Second},
+	}
+
+	aeURL := agentServer.URL + "/aiplatform.googleapis.com/reasoningEngines/123"
+	event := map[string]interface{}{
+		"type": "broadcast",
+		"payload": map[string]interface{}{
+			"data":    `{"text":"Run simulation"}`,
+			"targets": []interface{}{"target-sess-user"},
+			"userId":  "spoofed-payload-user",
+		},
+	}
+	eventData, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	ctx := account.WithContext(context.Background(), account.UserContext{UserID: "user-alice"})
+	sb.dispatchCallable(ctx, aeURL, "planner_ae", eventData)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(receivedBody, &body))
+	req, ok := body["request"].(map[string]interface{})
+	require.True(t, ok, "request field missing")
+	meta, ok := req["metadata"].(map[string]interface{})
+	require.True(t, ok, "request.metadata must be populated when UserContext is present")
+	assert.Equal(t, "user-alice", meta["user_id"], "authenticated UserContext must take precedence over payload")
+}
+
+func TestSwitchboard_DispatchCallable_AE_PropagatesUserIDFromEventPayload(t *testing.T) {
+	var receivedBody []byte
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer agentServer.Close()
+
+	s := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+
+	sb := &RedisSwitchboard{
+		client:         rdb,
+		gatewayID:      "test-gw",
+		localHub:       NewHub(),
+		channel:        "gateway:broadcast",
+		callableClient: &http.Client{Timeout: 5 * time.Second},
+		gcpClient:      &http.Client{Timeout: 5 * time.Second},
+	}
+
+	aeURL := agentServer.URL + "/aiplatform.googleapis.com/reasoningEngines/456"
+	event := map[string]interface{}{
+		"type":      "spawn_agent",
+		"sessionId": "spawn-sess-1",
+		"payload": map[string]interface{}{
+			"agentType":      "planner_ae",
+			"simulation_id":  "sim-1",
+			"userId":         "user-bob",
+			"acting_user_id": "user-bob",
+		},
+	}
+	eventData, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	sb.dispatchCallable(context.Background(), aeURL, "planner_ae", eventData)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(receivedBody, &body))
+	req, ok := body["request"].(map[string]interface{})
+	require.True(t, ok)
+	meta, ok := req["metadata"].(map[string]interface{})
+	require.True(t, ok, "request.metadata must be populated from event payload acting_user_id/userId")
+	assert.Equal(t, "user-bob", meta["user_id"])
+}
+
+func TestSwitchboard_DispatchCallable_CloudRun_PropagatesUserIDMetadata(t *testing.T) {
+	var bodies [][]byte
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"result":"ok"}`))
+	}))
+	defer agentServer.Close()
+
+	s := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer rdb.Close()
+
+	sb := &RedisSwitchboard{
+		client:         rdb,
+		gatewayID:      "test-gw",
+		localHub:       NewHub(),
+		channel:        "gateway:broadcast",
+		callableClient: &http.Client{Timeout: 5 * time.Second},
+	}
+
+	// 1. With UserContext on ctx
+	ctx := account.WithContext(context.Background(), account.UserContext{UserID: "user-carol"})
+	sb.dispatchCallable(ctx, agentServer.URL, "test-agent", []byte(`{"type":"broadcast","sessionId":"s1"}`))
+
+	// 2. Without UserContext or payload user_id -> metadata omitted
+	sb.dispatchCallable(context.Background(), agentServer.URL, "test-agent", []byte(`{"type":"broadcast","sessionId":"s2"}`))
+
+	require.Len(t, bodies, 2)
+
+	var withUser map[string]interface{}
+	require.NoError(t, json.Unmarshal(bodies[0], &withUser))
+	msg0 := withUser["params"].(map[string]interface{})["message"].(map[string]interface{})
+	meta0, ok := msg0["metadata"].(map[string]interface{})
+	require.True(t, ok, "Cloud Run A2A message must carry metadata.user_id when UserContext is present")
+	assert.Equal(t, "user-carol", meta0["user_id"])
+
+	var withoutUser map[string]interface{}
+	require.NoError(t, json.Unmarshal(bodies[1], &withoutUser))
+	msg1 := withoutUser["params"].(map[string]interface{})["message"].(map[string]interface{})
+	_, hasMeta1 := msg1["metadata"]
+	assert.False(t, hasMeta1, "metadata should be omitted when no user_id is present")
+}
+
+func TestSwitchboard_DispatchToAgent_AE_PreservesUserContextAcrossAsyncDispatch(t *testing.T) {
+	bodyCh := make(chan []byte, 1)
+	var agentSrv *httptest.Server
+	agentSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/agent-card.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"name":    "simulator",
+				"url":     agentSrv.URL + "/aiplatform.googleapis.com/reasoningEngines/777",
+				"version": "1.0.0",
+			})
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		bodyCh <- b
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer agentSrv.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	catalog := agent.NewCatalog([]string{agentSrv.URL})
+	sb := NewSwitchboardWithRegistry(rdb, "gw-async-uid", NewHub(), catalog, nil).(*RedisSwitchboard)
+	sb.gcpClient = &http.Client{Timeout: 5 * time.Second}
+
+	callerCtx, callerCancel := context.WithCancel(account.WithContext(context.Background(), account.UserContext{UserID: "user-dave"}))
+	err := sb.DispatchToAgent(callerCtx, "simulator", map[string]interface{}{
+		"type": "broadcast",
+		"payload": map[string]interface{}{
+			"data":    `{"text":"advance tick"}`,
+			"targets": []string{"sess-dave-1"},
+		},
+	})
+	require.NoError(t, err)
+	callerCancel()
+
+	select {
+	case raw := <-bodyCh:
+		var body map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &body))
+		req := body["request"].(map[string]interface{})
+		meta, ok := req["metadata"].(map[string]interface{})
+		require.True(t, ok, "request.metadata must preserve UserContext across beginAsyncDispatch")
+		assert.Equal(t, "user-dave", meta["user_id"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for async AE dispatch")
+	}
+	sb.Wait()
 }

@@ -52,6 +52,17 @@ VALUES
    '{"overall_score": 80, "scores": {"stakeholder_alignment": 78, "decision_quality": 82, "resource_stewardship": 75, "crisis_readiness": 80, "strategic_coherence": 84, "ethical_alignment": 81}}',
    '__seed__')
 
-ON CONFLICT (scenario_id) DO NOTHING;
+ON CONFLICT (scenario_id) DO UPDATE SET
+    owner_id = COALESCE(leadership_scenarios.owner_id, EXCLUDED.owner_id);
+
+UPDATE leadership_stakeholder_artifacts
+SET owner_id = '__seed__'
+WHERE scenario_id IN (
+    'seed-leadership-001',
+    'seed-leadership-002',
+    'seed-leadership-003',
+    'seed-leadership-004'
+)
+  AND owner_id IS NULL;
 
 

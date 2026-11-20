@@ -18,11 +18,14 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // EventDedup tracks processed webhook event IDs so a re-delivery
@@ -32,11 +35,11 @@ import (
 // Postgres-backed implementation can drop in for multi-replica
 // deployments without touching the handler.
 type EventDedup interface {
-	// SeenOrMark returns true if the event was previously seen,
-	// and false (after recording it) on first sight. The two-state
-	// return matches sync.Map.LoadOrStore so the handler can branch
-	// on "already processed" cleanly.
-	SeenOrMark(eventID string) bool
+	// SeenOrMark returns (true, nil) if the event was previously seen,
+	// and (false, nil) after recording it on first sight. Backend
+	// failures return (false, err) so callers fail closed (e.g. HTTP 503)
+	// and Stripe retries cleanly rather than double-applying events.
+	SeenOrMark(eventID string) (bool, error)
 
 	// Forget removes the given event ID from the dedup record.
 	// Intended to be called by the webhook handler when the
@@ -76,17 +79,23 @@ func NewInMemoryEventDedup(capacity int) *InMemoryEventDedup {
 }
 
 // SeenOrMark implements EventDedup.
-func (d *InMemoryEventDedup) SeenOrMark(eventID string) bool {
-	if eventID == "" {
-		// Never dedup empty strings; the handler should already
-		// reject events without an ID.
-		return false
+func (d *InMemoryEventDedup) SeenOrMark(eventID string) (bool, error) {
+	if d == nil {
+		return false, ErrDedupUnavailable
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.order == nil || d.index == nil {
+		return false, ErrDedupUnavailable
+	}
+	if eventID == "" {
+		// Never dedup empty strings; the handler should already
+		// reject events without an ID.
+		return false, nil
+	}
 	if el, ok := d.index[eventID]; ok {
 		d.order.MoveToFront(el)
-		return true
+		return true, nil
 	}
 	el := d.order.PushFront(eventID)
 	d.index[eventID] = el
@@ -97,14 +106,20 @@ func (d *InMemoryEventDedup) SeenOrMark(eventID string) bool {
 			delete(d.index, oldest.Value.(string))
 		}
 	}
-	return false
+	return false, nil
 }
 
 // Len reports the current number of tracked event IDs. Exposed for
 // tests; not part of the EventDedup interface.
 func (d *InMemoryEventDedup) Len() int {
+	if d == nil {
+		return 0
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.order == nil {
+		return 0
+	}
 	return d.order.Len()
 }
 
@@ -113,11 +128,14 @@ func (d *InMemoryEventDedup) Len() int {
 // dispatched event handler returned 5xx so the next Stripe retry is
 // not silently deduped.
 func (d *InMemoryEventDedup) Forget(eventID string) {
-	if eventID == "" {
+	if d == nil || eventID == "" {
 		return
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.order == nil || d.index == nil {
+		return
+	}
 	if el, ok := d.index[eventID]; ok {
 		d.order.Remove(el)
 		delete(d.index, eventID)
@@ -148,13 +166,9 @@ const dedupTimeout = 3 * time.Second
 // would let the same event apply twice if Stripe re-delivered
 // during a fail-over.
 //
-// On any DB error we fail OPEN — log via the returned errOnce
-// channel (consumed nowhere yet; see ErrPolicy below) and return
-// false so the handler proceeds with the apply. This is the
-// deliberate trade-off: a transient DB hiccup must not 200 a
-// real event we never applied. The handler's SetOrgPlan is
-// idempotent (UPDATE … SET plan_tier = $2) so re-application on
-// a Stripe retry is safe; missed application is not.
+// On any DB error we fail CLOSED — log, increment dbErr, and return
+// (false, err) so the webhook handler returns 503 and Stripe retries
+// rather than double-applying events and emitting duplicate audit rows.
 type PostgresEventDedup struct {
 	db pgxExecer
 	// dbErr counts DB failures since process start. Exposed for
@@ -176,21 +190,33 @@ var ErrDedupUnavailable = errors.New("billing: postgres event dedup requires a n
 // the connection is nil so the caller can fall back to
 // InMemoryEventDedup explicitly (rather than us choosing for them).
 func NewPostgresEventDedup(db pgxExecer) (*PostgresEventDedup, error) {
+	switch v := db.(type) {
+	case *pgx.Conn:
+		if v == nil {
+			db = nil
+		}
+	case *pgxpool.Pool:
+		if v == nil {
+			db = nil
+		}
+	}
 	if db == nil {
 		return nil, ErrDedupUnavailable
 	}
 	return &PostgresEventDedup{db: db}, nil
 }
 
-// SeenOrMark implements EventDedup. Returns true iff the event ID
-// was already in the table; on first sight inserts a row and
-// returns false. On DB error returns false (fail-open) — the
-// handler will then re-apply, which is safe because SetOrgPlan is
-// idempotent. The DB error is recorded internally for observability.
-func (d *PostgresEventDedup) SeenOrMark(eventID string) bool {
+// SeenOrMark implements EventDedup. Returns (true, nil) iff the
+// event ID was already in the table; on first sight inserts a row and
+// returns (false, nil). Fails closed on nil receiver/DB or DB errors,
+// incrementing DBErrorCount and returning (false, err).
+func (d *PostgresEventDedup) SeenOrMark(eventID string) (bool, error) {
+	if d == nil || d.db == nil {
+		return false, ErrDedupUnavailable
+	}
 	if eventID == "" {
 		// Mirror InMemoryEventDedup: empty IDs are never deduped.
-		return false
+		return false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dedupTimeout)
 	defer cancel()
@@ -203,29 +229,21 @@ func (d *PostgresEventDedup) SeenOrMark(eventID string) bool {
 		d.mu.Lock()
 		d.dbErr++
 		d.mu.Unlock()
-		// Fail-open: returning false lets the handler proceed. A
-		// stripe retry of the same event will hit the same path
-		// and apply idempotently.
-		//
-		// Log the failure so operators can see dedup outages instead
-		// of only discovering them via DBErrorCount(). During a
-		// sustained Postgres blip, EVERY Stripe retry re-runs the
-		// full handler; SetPlan is idempotent but audit-log writes
-		// are additive, so duplicate audit entries may appear until
-		// the DB recovers. This log is the single point where ops
-		// can correlate audit duplicates to a dedup outage.
-		log.Printf("BILLING: dedup SeenOrMark DB error (fail-open, handler will proceed) event_id=%s err=%v", eventID, err)
-		return false
+		log.Printf("BILLING: dedup SeenOrMark DB error (fail-closed) event_id=%s err=%v", eventID, err)
+		return false, fmt.Errorf("billing: dedup seen_or_mark: %w", err)
 	}
 	// RowsAffected == 0 means the row already existed → replay.
 	// RowsAffected == 1 means we inserted it → first sight.
-	return tag.RowsAffected() == 0
+	return tag.RowsAffected() == 0, nil
 }
 
 // DBErrorCount reports the running tally of dedup INSERT failures.
 // Exposed for tests; an operator-facing /healthz can read this in
 // a follow-up phase.
 func (d *PostgresEventDedup) DBErrorCount() int {
+	if d == nil {
+		return 0
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.dbErr
@@ -238,7 +256,7 @@ func (d *PostgresEventDedup) DBErrorCount() int {
 // dedup-table outage MUST NOT block the webhook from returning its
 // response.
 func (d *PostgresEventDedup) Forget(eventID string) {
-	if eventID == "" {
+	if d == nil || d.db == nil || eventID == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dedupTimeout)

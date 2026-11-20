@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: updated gateway port to canonical 9101.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +25,7 @@ from agents.utils.communication import call_agent
 from agents.utils.communication import SimulationA2AClient
 
 # Fixed test gateway/agent URLs -- unit tests must not depend on .env
-_TEST_GATEWAY_URL = "http://127.0.0.1:8101"
+_TEST_GATEWAY_URL = "http://127.0.0.1:9101"
 _TEST_RUNNER_URL = "http://runner-autopilot-service:8210"
 
 # Controlled environment for all tests in this module so they are

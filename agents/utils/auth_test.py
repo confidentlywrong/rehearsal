@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,10 +56,29 @@ def test_get_id_token_fetches_via_google_oauth2(monkeypatch):
     assert call_args.args[1] == "https://gateway.run.app"
 
 
-def test_get_id_token_returns_none_on_failure(monkeypatch):
-    """If google.oauth2 raises (no ADC, network error, etc.), helper returns None."""
-    with patch(
-        "agents.utils.auth.id_token.fetch_id_token",
-        side_effect=RuntimeError("no ADC"),
+def test_get_id_token_returns_none_on_failure(monkeypatch, caplog):
+    """If google.oauth2 raises (no ADC, network error, etc.), helper logs warning and returns None."""
+    import logging
+
+    with (
+        patch(
+            "agents.utils.auth.id_token.fetch_id_token",
+            side_effect=RuntimeError("no ADC"),
+        ),
+        caplog.at_level(logging.WARNING, logger="agents.utils.auth"),
     ):
         assert auth.get_id_token("https://gateway.run.app") is None
+
+    assert any("failed to fetch ID token" in r.message for r in caplog.records)
+
+
+def test_is_remote_https_url_rejects_non_https_loopback_and_control_chars():
+    """Verify _is_remote_https_url accepts valid https hosts and rejects unsafe/local inputs."""
+    assert auth._is_remote_https_url("https://gateway.run.app") is True
+    assert auth._is_remote_https_url("http://gateway.run.app") is False
+    assert auth._is_remote_https_url("https://localhost:9101") is False
+    assert auth._is_remote_https_url("https://sub.localhost") is False
+    assert auth._is_remote_https_url("https://127.0.0.1:9101") is False
+    assert auth._is_remote_https_url("https://[::1]:9101") is False
+    assert auth._is_remote_https_url("https://gateway.run.app\nX-Evil: 1") is False
+    assert auth._is_remote_https_url("") is False

@@ -65,7 +65,7 @@ def prepare_simulation_agent(
         app_name = agent_or_app.name
     else:
         agent = agent_or_app
-        app_name = getattr(agent, "name", "unknown")
+        app_name = getattr(agent, "name", None) or "unknown"
 
     # Build the rpc_url from the base URL + the mount prefix.
     # Starlette mounts the sub-app at /a2a/{name}, so the actual RPC
@@ -269,14 +269,22 @@ def register_a2a_routes(
     from agents.utils.simulation_plugin import SimulationNetworkPlugin
 
     orchestration_plugin = next(
-        (p for p in getattr(app_instance, "plugins", []) if isinstance(p, SimulationNetworkPlugin)),
+        (p for p in (getattr(app_instance, "plugins", None) or []) if isinstance(p, SimulationNetworkPlugin)),
         None,
     )
     if orchestration_plugin:
         orchestration_plugin.set_runner(simulation_runner)
 
         async def handle_orchestration(request):
-            data = await request.json()
+            try:
+                data = await request.json()
+            except (ValueError, TypeError):
+                return JSONResponse(content={"status": "error", "message": "Invalid JSON payload"}, status_code=400)
+            if not isinstance(data, dict):
+                return JSONResponse(
+                    content={"status": "error", "message": "Orchestration payload must be a JSON object"},
+                    status_code=400,
+                )
             if orchestration_plugin.dispatcher:
                 logger.debug(f"A2A_ORCHESTRATION: Pushed event for {app_name}")
                 await orchestration_plugin.dispatcher.handle_event(data)
@@ -299,7 +307,9 @@ def register_a2a_routes(
     # Add CORS to the mounted sub_app as well, as it might be accessed directly
     from fastapi.middleware.cors import CORSMiddleware
 
-    cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    cors_origins = [
+        origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",") if origin.strip()
+    ] or ["*"]
     sub_app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,

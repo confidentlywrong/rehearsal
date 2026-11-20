@@ -56,7 +56,7 @@ def main():
         model = os.environ["RUNNER_MODEL"].removeprefix("openai/")
 
         # The health endpoint is at the root, not under /v1
-        health_url = base_url.rstrip("/v1").rstrip("/")
+        health_url = base_url.rstrip("/").removesuffix("/v1")
 
         print(f"Testing vLLM at {base_url}")
         print(f"Model: {model}")
@@ -79,10 +79,13 @@ def main():
         # 2. List models
         print("\n2. Listing models...")
         resp = httpx.get(f"{base_url}/models", timeout=10)
+        if resp.status_code != 200:
+            print(f"   FAIL: /models returned HTTP {resp.status_code}: {resp.text[:200]}")
+            sys.exit(1)
         models = resp.json()
         print(f"   Available: {[m['id'] for m in models['data']]}")
 
-        # 3. Chat completion
+        # 3. Chat completion + tool calling
         print(f"\n3. Chat completion (model={model})...")
         resp = httpx.post(
             f"{base_url}/chat/completions",
@@ -91,37 +94,52 @@ def main():
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are a marathon runner. Respond in 1-2 sentences.",
+                        "content": "You are a marathon runner. Use get_vitals to report your status.",
                     },
                     {"role": "user", "content": "How are you feeling at mile 15?"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_vitals",
+                            "description": "Retrieve current runner vitals.",
+                            "parameters": {"type": "object", "properties": {}, "required": []},
+                        },
+                    }
                 ],
                 "max_tokens": 100,
                 "temperature": 0.7,
             },
             timeout=60,
         )
-        result = resp.json()
-        if resp.status_code != 200 or "error" in result:
-            print(f"   Status: {resp.status_code}")
-            print(f"   Error: {result.get('error', result.get('message', 'unknown'))}")
-            print(
-                "   WARNING: Tool calling may not be supported by this vLLM "
-                "build/model. Chat completions work; tool calling is optional."
-            )
-        elif "choices" in result:
-            choice = result["choices"][0]
-            if choice["message"].get("tool_calls"):
-                tool_call = choice["message"]["tool_calls"][0]
-                print(f"   Tool called: {tool_call['function']['name']}")
-                print(f"   Arguments: {tool_call['function']['arguments']}")
-                print("   OK - Tool calling works!")
-            else:
-                content = choice["message"].get("content", "")
-                print(f"   Response (no tool call): {content[:200]}")
-                print("   WARNING: Model did not use tool calling. May need prompt tuning for this model.")
+        if resp.status_code != 200:
+            print(f"   FAIL: /chat/completions returned HTTP {resp.status_code}: {resp.text[:200]}")
+            sys.exit(1)
+
+        try:
+            result = resp.json()
+        except ValueError as exc:
+            print(f"   FAIL: Invalid JSON from /chat/completions: {exc}")
+            sys.exit(1)
+
+        if "error" in result:
+            print(f"   FAIL: {result.get('error', result.get('message', 'unknown'))}")
+            sys.exit(1)
+        if "choices" not in result or not result["choices"]:
+            print(f"   FAIL: Unexpected response (no choices): {str(result)[:200]}")
+            sys.exit(1)
+
+        choice = result["choices"][0]
+        if choice["message"].get("tool_calls"):
+            tool_call = choice["message"]["tool_calls"][0]
+            print(f"   Tool called: {tool_call['function']['name']}")
+            print(f"   Arguments: {tool_call['function']['arguments']}")
+            print("   OK - Tool calling works!")
         else:
-            print(f"   Unexpected response: {str(result)[:200]}")
-            print("   WARNING: Could not parse tool calling response.")
+            content = choice["message"].get("content", "")
+            print(f"   Response (no tool call): {content[:200]}")
+            print("   WARNING: Model did not invoke tool call; chat completions succeeded.")
 
         print("\n--- All tests passed ---")
     finally:

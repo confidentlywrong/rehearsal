@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: mark decorative spinner aria-hidden for accessibility.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +25,7 @@ import { CommonModule } from '@angular/common';
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [CommonModule],
   styleUrls: ['./spinner.scss'],
-  template: ` <div class="spinner" [class.spinner--spinning]="spinning"></div> `,
+  template: ` <div class="spinner" [class.spinner--spinning]="spinning" aria-hidden="true"></div> `,
 })
 export class SpinnerComponent {
   @Input() spinning = false;

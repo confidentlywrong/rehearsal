@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: proxied /api, /admin, and /config.js to cmd/admin (port 9121) for local Vite dev parity.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +24,15 @@ export default defineConfig({
     port: 8000,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:9101",
+        target: "http://127.0.0.1:9121",
+        changeOrigin: true,
+      },
+      "/admin": {
+        target: "http://127.0.0.1:9121",
+        changeOrigin: true,
+      },
+      "/config.js": {
+        target: "http://127.0.0.1:9121",
         changeOrigin: true,
       },
     },

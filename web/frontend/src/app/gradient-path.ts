@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard non-finite rates, segment counts, and degenerate coincident segment tangents in GradientPathMesh.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,8 +35,9 @@ function rateToColor(rate: number): THREE.Color {
   const green = new THREE.Color(0x22cc66);
   const yellow = new THREE.Color(0xeecc22);
   const red = new THREE.Color(0xdd3333);
-  if (rate >= 0.5) return lerpColor(yellow, green, (rate - 0.5) * 2);
-  return lerpColor(red, yellow, rate * 2);
+  const safeRate = Number.isFinite(rate) ? Math.max(0, Math.min(1, rate)) : 0;
+  if (safeRate >= 0.5) return lerpColor(yellow, green, (safeRate - 0.5) * 2);
+  return lerpColor(red, yellow, safeRate * 2);
 }
 
 export class GradientPathMesh {
@@ -56,7 +59,11 @@ export class GradientPathMesh {
   }
 
   setVisibleSegmentCount(count: number): void {
-    this.visibleSegmentCount = Math.max(0, Math.min(GRADIENT_SEGMENTS, count));
+    if (!Number.isFinite(count)) {
+      this.visibleSegmentCount = 0;
+    } else {
+      this.visibleSegmentCount = Math.max(0, Math.min(GRADIENT_SEGMENTS, Math.floor(count)));
+    }
     this.rebuild();
   }
 
@@ -68,7 +75,7 @@ export class GradientPathMesh {
       this.mesh = null;
     }
 
-    if (this.visibleSegmentCount < 1) return;
+    if (this.visibleSegmentCount < 1 || this.path.getWorldPoints().length < 2) return;
 
     const pos: number[] = [];
     const colors: number[] = [];
@@ -80,7 +87,13 @@ export class GradientPathMesh {
 
       const p0 = this.path.getPositionAt(t0);
       const p1 = this.path.getPositionAt(t1);
-      const tang = new THREE.Vector3().subVectors(p1, p0).normalize();
+      const tang = new THREE.Vector3().subVectors(p1, p0);
+      if (tang.lengthSq() < 1e-12) {
+        tang.copy(this.path.getTangentAt(t0));
+        if (tang.lengthSq() < 1e-12) tang.set(1, 0, 0);
+      } else {
+        tang.normalize();
+      }
       const perp = new THREE.Vector3(-tang.z, 0, tang.x);
 
       const rate = this.segmentRates[i] ?? 1.0;

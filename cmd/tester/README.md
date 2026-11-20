@@ -56,9 +56,9 @@ WebSocket traffic. The BFF proxies it to the gateway transparently.
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` | `8080` | HTTP listen port (set to `8304` via `.env`) |
+| `PORT` | `8080` | HTTP listen port (set to `9112` via `.env`) |
 | `GATEWAY_INTERNAL_URL` | -- | Internal gateway URL (highest priority) |
-| `GATEWAY_URL` | `http://localhost:8101` | Gateway URL (fallback) |
+| `GATEWAY_URL` | `http://127.0.0.1:9101` | Gateway URL (fallback) |
 | `IAP_CLIENT_ID` | -- | OIDC audience for Cloud Run IAP auth |
 
 ## File layout

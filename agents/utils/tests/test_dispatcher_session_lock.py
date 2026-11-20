@@ -129,3 +129,76 @@ async def test_lock_created_lazily():
 
     # Lock should have been created
     assert "session-new" in dispatcher._session_locks
+
+
+@pytest.mark.asyncio
+async def test_trigger_agent_run_supersedes_slow_task_and_handles_cancellation():
+    """Superseding an in-progress session task cancels the stale task cleanly without leaking errors."""
+    dispatcher = _make_dispatcher()
+    dispatcher.agent_type = "leadership_runner_autopilot"
+    dispatcher._loop = asyncio.get_running_loop()
+    dispatcher._active_session_tasks = {}
+
+    events: list[tuple[str, str]] = []
+    first_started = asyncio.Event()
+
+    async def tracked_logic(session_id, content, pulses_collector=None):
+        events.append(("start", str(content)))
+        if content == "start_gun":
+            first_started.set()
+            await asyncio.sleep(5.0)
+        events.append(("end", str(content)))
+
+    dispatcher._trigger_agent_run_logic = tracked_logic
+
+    dispatcher._trigger_agent_run("session-S", "start_gun")
+    await first_started.wait()
+    dispatcher._trigger_agent_run("session-S", "tick_0")
+
+    pending = list(dispatcher._background_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    assert ("start", "start_gun") in events
+    assert ("end", "start_gun") not in events
+    assert ("start", "tick_0") in events
+    assert ("end", "tick_0") in events
+
+
+@pytest.mark.asyncio
+async def test_singleflight_cancellation_does_not_leak_unretrieved_future_exception(monkeypatch):
+    """Cancelling an in-flight get_context_id lookup must not trigger unretrieved Future errors."""
+    import gc
+    from agents.utils import simulation_registry
+
+    simulation_registry._context_map.clear()
+    simulation_registry._inflight_context.clear()
+
+    gate = asyncio.Event()
+
+    class _SlowRedis:
+        async def get(self, _key):
+            await gate.wait()
+            return b"ctx-1"
+
+    monkeypatch.setattr(simulation_registry, "get_shared_redis_client", lambda: _SlowRedis())
+
+    loop = asyncio.get_running_loop()
+    unretrieved_errors: list[dict] = []
+    orig_handler = loop.get_exception_handler()
+
+    def _capture_handler(_loop, context):
+        unretrieved_errors.append(context)
+
+    loop.set_exception_handler(_capture_handler)
+    try:
+        t = asyncio.create_task(simulation_registry.get_context_id("vertex-cancel-1"))
+        await asyncio.sleep(0.01)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not any("never retrieved" in str(ctx.get("message", "")) for ctx in unretrieved_errors)
+    finally:
+        loop.set_exception_handler(orig_handler)

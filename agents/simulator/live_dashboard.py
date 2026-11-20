@@ -22,6 +22,7 @@ Zero LLM cost — pure Python string formatting.
 """
 
 import logging
+import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,36 @@ _RESOURCE_SHORT = {
 }
 
 
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric input to a finite float, rejecting None, bool, NaN, and Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    """Coerce numeric input to an int safely, rejecting None, bool, NaN, and Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(round(num))
+
+
 def _bar(value: float, max_val: float = 100.0, width: int = 10) -> str:
     """Create a text-based progress bar using Unicode block characters.
 
@@ -50,11 +81,16 @@ def _bar(value: float, max_val: float = 100.0, width: int = 10) -> str:
     Unicode bar; the dashboard itself now emits A2UI ``ScoreBar`` components
     instead.
     """
-    if max_val <= 0:
-        return "░" * width
-    ratio = min(max(value / max_val, 0.0), 1.0)
-    filled = round(ratio * width)
-    empty = width - filled
+    safe_width = max(0, _finite_int(width, 10))
+    if safe_width == 0:
+        return ""
+    safe_max = _finite_float(max_val, 0.0)
+    if safe_max <= 0:
+        return "░" * safe_width
+    safe_value = _finite_float(value, 0.0)
+    ratio = min(max(safe_value / safe_max, 0.0), 1.0)
+    filled = round(ratio * safe_width)
+    empty = safe_width - filled
     return "█" * filled + "░" * empty
 
 
@@ -75,12 +111,14 @@ def _score_bar(
     """
     # ScoreBar default range is 0..100. Override maxValue when the metric uses
     # a different scale (e.g. budget pools that start at 500+).
+    safe_value = _finite_float(value, 0.0)
+    safe_max = _finite_float(max_value, 100.0)
     bar_props: dict[str, Any] = {
         "label": {"literalString": label},
-        "value": {"literalNumber": float(value)},
+        "value": {"literalNumber": safe_value},
     }
-    if max_value and abs(max_value - 100.0) > 0.001:
-        bar_props["maxValue"] = {"literalNumber": float(max_value)}
+    if safe_max > 0 and abs(safe_max - 100.0) > 0.001:
+        bar_props["maxValue"] = {"literalNumber": safe_max}
     if band in ("high", "mid", "low"):
         bar_props["colorBand"] = {"literalString": band}
     return {
@@ -91,19 +129,28 @@ def _score_bar(
 
 def _resource_status_emoji(current: float, critical: float) -> str:
     """Return status emoji based on resource health."""
-    if current <= critical:
+    safe_current = _finite_float(current, 0.0)
+    safe_critical = _finite_float(critical, 0.0)
+    if safe_current <= safe_critical:
         return "🔴"
-    if current <= critical * 1.5:
+    warn_limit = safe_critical * 1.5
+    is_warning = (
+        safe_current <= warn_limit
+        if math.isfinite(warn_limit)
+        else (safe_critical > 0 and (safe_current / 1.5) <= safe_critical)
+    )
+    if is_warning:
         return "⚠️"
     return ""
 
 
 def _delta_str(delta: float) -> str:
     """Format a resource delta as a compact string."""
-    if delta == 0:
+    safe_delta = _finite_float(delta, 0.0)
+    if safe_delta == 0:
         return ""
-    sign = "▲" if delta > 0 else "▼"
-    return f" {sign}{abs(delta):.0f}"
+    sign = "▲" if safe_delta > 0 else "▼"
+    return f" {sign}{abs(safe_delta):.0f}"
 
 
 def build_live_dashboard(
@@ -143,12 +190,20 @@ def build_live_dashboard(
     )
     content_children.append("dash-title")
 
+    safe_tick = _finite_int(tick, 0)
+    safe_max_ticks = _finite_int(max_ticks, 0)
+    safe_completion_pct = _finite_float(completion_pct, 0.0)
+    safe_resource_state = resource_state if isinstance(resource_state, dict) else {}
+    safe_resource_deltas = resource_deltas if isinstance(resource_deltas, dict) else {}
+    safe_status_counts = status_counts if isinstance(status_counts, dict) else {}
+    safe_persona_status_counts = persona_status_counts if isinstance(persona_status_counts, dict) else {}
+
     # ── Progress overview ──
     components.append(
         _score_bar(
             "dash-progress",
-            f"Sprint {tick}/{max_ticks} — {completion_pct:.0f}% aligned",
-            completion_pct,
+            f"Sprint {safe_tick}/{safe_max_ticks} — {safe_completion_pct:.0f}% aligned",
+            safe_completion_pct,
             max_value=100.0,
         )
     )
@@ -177,30 +232,32 @@ def build_live_dashboard(
     content_children.append("dash-res-title")
 
     for key in ["lau", "bt", "tbu", "owb"]:
-        pool = resource_state.get(key, {})
+        pool = safe_resource_state.get(key, {})
         if not isinstance(pool, dict):
             continue
-        current = pool.get("current", 0)
-        critical = pool.get("critical_threshold", 0)
+        current = _finite_float(pool.get("current"), 0.0)
+        critical = _finite_float(pool.get("critical_threshold"), 0.0)
         # Use the pool's initial value as the bar's maxValue so each resource
         # is shown relative to its own scale (budget peaks at 500–800, OWB
         # peaks at 40–70, etc.). Fall back to a sensible default.
-        initial = pool.get("initial")
-        if not isinstance(initial, (int, float)) or initial <= 0:
-            initial = max(float(current), critical * 4.0, 100.0)
+        initial = _finite_float(pool.get("initial"), 0.0)
+        if initial <= 0:
+            scaled_critical = critical * 4.0
+            fallback_max = scaled_critical if math.isfinite(scaled_critical) else critical
+            initial = max(current, fallback_max, 100.0)
         name = _RESOURCE_SHORT.get(key, key)
         emoji = _resource_status_emoji(current, critical)
 
         # Get delta from resource_deltas dict
-        rd = resource_deltas.get(key, {})
-        delta = rd.get("delta", 0) if isinstance(rd, dict) else 0
+        rd = safe_resource_deltas.get(key, {})
+        delta = _finite_float(rd.get("delta"), 0.0) if isinstance(rd, dict) else 0.0
         delta_s = _delta_str(delta)
 
         # Compose label: "Attention  82/100 ▲5 ⚠️" — including the absolute
         # value/initial disambiguates the bar (a full green bar on tick 1
         # otherwise reads as "nothing has happened" rather than "full
         # headroom").
-        label_bits = [name, f"{float(current):.0f}/{float(initial):.0f}"]
+        label_bits = [name, f"{current:.0f}/{initial:.0f}"]
         if delta_s:
             label_bits.append(delta_s.strip())
         if emoji:
@@ -209,9 +266,15 @@ def build_live_dashboard(
 
         comp_id = f"dash-res-{key}"
         # Status-driven band: critical → red, ≤2× critical → amber, else green.
+        warn_limit = critical * 1.5
+        is_warn_band = (
+            current <= warn_limit
+            if math.isfinite(warn_limit)
+            else (critical > 0 and (current / 1.5) <= critical)
+        )
         if critical and current <= critical:
             res_band = "low"
-        elif critical and current <= critical * 1.5:
+        elif critical and is_warn_band:
             res_band = "mid"
         else:
             res_band = "high"
@@ -219,8 +282,8 @@ def build_live_dashboard(
             _score_bar(
                 comp_id,
                 label,
-                float(current),
-                max_value=float(initial),
+                current,
+                max_value=initial,
                 band=res_band,
             )
         )
@@ -249,10 +312,10 @@ def build_live_dashboard(
     content_children.append("dash-stake-title")
 
     # Status summary line
-    aligned = status_counts.get("finished", 0)
-    active = status_counts.get("running", 0)
-    stalled = status_counts.get("exhausted", 0)
-    lost = status_counts.get("collapsed", 0)
+    aligned = max(0, _finite_int(safe_status_counts.get("finished"), 0))
+    active = max(0, _finite_int(safe_status_counts.get("running"), 0))
+    stalled = max(0, _finite_int(safe_status_counts.get("exhausted"), 0))
+    lost = max(0, _finite_int(safe_status_counts.get("collapsed"), 0))
     total = aligned + active + stalled + lost
 
     # Four ScoreBars instead of a single status text line. Each bar uses
@@ -262,7 +325,8 @@ def build_live_dashboard(
     #   Active  → neutral; always amber/mid (people in motion is normal)
     #   Stalled → "more = bad"   (low/red when share >25 %, amber 10–25 %)
     #   Lost    → "more = bad"   (low/red when share >10 %, amber 5–10 %)
-    if total > 0:
+    total_f = _finite_float(total, 0.0)
+    if total > 0 and total_f > 0.0:
 
         def _bad_band(share: float, warn: float, crit: float) -> str:
             if share >= crit:
@@ -278,16 +342,21 @@ def build_live_dashboard(
                 return "mid"
             return "low"
 
-        aligned_share = aligned / total
-        stalled_share = stalled / total
-        lost_share = lost / total
+        aligned_f = _finite_float(aligned, 0.0)
+        active_f = _finite_float(active, 0.0)
+        stalled_f = _finite_float(stalled, 0.0)
+        lost_f = _finite_float(lost, 0.0)
+
+        aligned_share = aligned_f / total_f
+        stalled_share = stalled_f / total_f
+        lost_share = lost_f / total_f
 
         components.append(
             _score_bar(
                 "dash-stake-aligned",
                 f"Aligned {aligned}/{total}",
-                float(aligned),
-                max_value=float(total),
+                aligned_f,
+                max_value=total_f,
                 band=_good_band(aligned_share),
             )
         )
@@ -297,8 +366,8 @@ def build_live_dashboard(
             _score_bar(
                 "dash-stake-active",
                 f"Active {active}/{total}",
-                float(active),
-                max_value=float(total),
+                active_f,
+                max_value=total_f,
                 band="mid",
             )
         )
@@ -308,8 +377,8 @@ def build_live_dashboard(
             _score_bar(
                 "dash-stake-stalled",
                 f"Stalled {stalled}/{total}",
-                float(stalled),
-                max_value=float(total),
+                stalled_f,
+                max_value=total_f,
                 band=_bad_band(stalled_share, warn=0.10, crit=0.25),
             )
         )
@@ -319,8 +388,8 @@ def build_live_dashboard(
             _score_bar(
                 "dash-stake-lost",
                 f"Lost {lost}/{total}",
-                float(lost),
-                max_value=float(total),
+                lost_f,
+                max_value=total_f,
                 band=_bad_band(lost_share, warn=0.05, crit=0.10),
             )
         )
@@ -335,11 +404,11 @@ def build_live_dashboard(
     }
     persona_parts = []
     for persona in ["pragmatist", "visionary", "diplomat", "disruptor"]:
-        counts = persona_status_counts.get(persona, {})
-        if not counts:
+        counts = safe_persona_status_counts.get(persona, {})
+        if not isinstance(counts, dict) or not counts:
             continue
-        n = sum(counts.values())
-        done = counts.get("finished", 0)
+        n = sum(max(0, _finite_int(v, 0)) for v in counts.values())
+        done = max(0, _finite_int(counts.get("finished"), 0))
         abbr = _PERSONA_ABBR.get(persona, persona[0].upper())
         if done > 0:
             persona_parts.append(f"{abbr}:{done}/{n}")
@@ -384,6 +453,8 @@ def build_live_dashboard(
         content_children.append("dash-voices-title")
 
         for idx, voice in enumerate(voices[:3]):
+            if not isinstance(voice, str):
+                voice = "" if voice is None else str(voice)
             # Strip leading thought-bubble emoji if present
             clean = voice.lstrip("\U0001f4ad ").strip()
             comp_id = f"dash-voice-{idx}"
@@ -422,13 +493,13 @@ def build_live_dashboard(
     )
     content_children.append("dash-infra-title")
 
-    infra = infrastructure or {}
+    infra = infrastructure if isinstance(infrastructure, dict) else {}
 
     # Active Resistors — leadership-domain replacement for the marathon
     # "medical interventions" metric. Counts gatekeepers actively resisting
     # change this sprint.
-    active_gatekeepers = infra.get("active_gatekeepers", 0)
-    medical_saves = infra.get("medical_saves_this_tick", 0)
+    active_gatekeepers = max(0, _finite_int(infra.get("active_gatekeepers"), 0))
+    medical_saves = max(0, _finite_int(infra.get("medical_saves_this_tick"), 0))
     resistor_bits = [f"Active Resistors: {active_gatekeepers}"]
     if medical_saves > 0:
         resistor_bits.append(f"{medical_saves} intervention{'s' if medical_saves != 1 else ''} this sprint")
@@ -446,11 +517,7 @@ def build_live_dashboard(
     content_children.append("dash-infra-resistors")
 
     # Psych. Safety — render as a ScoreBar (it's already 0–100).
-    comfort_raw = infra.get("avg_comfort", 100)
-    try:
-        comfort = float(comfort_raw)
-    except (TypeError, ValueError):
-        comfort = 0.0
+    comfort = _finite_float(infra.get("avg_comfort"), 100.0)
     comfort_emoji = "🔴" if comfort < 20 else ("⚠️" if comfort < 40 else "✅")
     components.append(
         _score_bar(
@@ -463,8 +530,9 @@ def build_live_dashboard(
     content_children.append("dash-infra-psych")
 
     # Org. Drag — categorical, keep as Text but on its own line.
-    friction_level = infra.get("friction_level", "none")
-    friction_emoji = {"high": "🔴", "moderate": "⚠️", "low": "🟢", "none": "✅"}.get(friction_level, "")
+    friction_raw = infra.get("friction_level")
+    friction_level = str(friction_raw).strip() if isinstance(friction_raw, str) and friction_raw.strip() else "none"
+    friction_emoji = {"high": "🔴", "moderate": "⚠️", "low": "🟢", "none": "✅"}.get(friction_level.lower(), "")
     components.append(
         {
             "id": "dash-infra-drag",
@@ -485,7 +553,8 @@ def build_live_dashboard(
     #  string.)
 
     # ── Active Alerts ──
-    if active_alerts_count > 0:
+    safe_alerts = max(0, _finite_int(active_alerts_count, 0))
+    if safe_alerts > 0:
         components.append(
             {
                 "id": "dash-div4",
@@ -500,7 +569,7 @@ def build_live_dashboard(
                 "component": {
                     "Text": {
                         "text": {
-                            "literalString": f"{active_alerts_count} active alert{'s' if active_alerts_count != 1 else ''}"
+                            "literalString": f"{safe_alerts} active alert{'s' if safe_alerts != 1 else ''}"
                         },
                         "usageHint": "caption",
                     }

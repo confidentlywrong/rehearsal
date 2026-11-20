@@ -37,8 +37,9 @@ async def plan_marathon_event(event_name: str, city: str, tool_context: Optional
 
     # Persist city in session state for downstream tools (e.g.
     # record_scenario_outcome uses state["city"] to tag simulation summaries).
-    if tool_context is not None:
-        tool_context.state["city"] = city
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is not None and hasattr(state, "__setitem__"):
+        state["city"] = city
 
     return {
         "status": "success",

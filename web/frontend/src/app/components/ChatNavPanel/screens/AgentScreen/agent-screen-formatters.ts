@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,15 +13,18 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: fix 60-second rollover bug in formatPaceFromNormalizedAvgVelocity and guard NaN/Infinity inputs.
  */
 
 /** Backend velocity is normalized: real mph = velocity × SPEED_SCALE (6.2137). */
 const PACE_SPEED_SCALE = 6.2137;
 
 export function formatPaceFromNormalizedAvgVelocity(avgVelocity: number): string {
-  if (!avgVelocity || avgVelocity <= 0) return '0:00';
+  if (!Number.isFinite(avgVelocity) || avgVelocity <= 0) return '0:00';
   const totalMinutes = 60 / (avgVelocity * PACE_SPEED_SCALE);
-  const mins = Math.floor(totalMinutes);
-  const secs = Math.round((totalMinutes % 1) * 60);
+  const totalSeconds = Math.round(totalMinutes * 60);
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }

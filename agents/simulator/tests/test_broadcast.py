@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +21,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agents.simulator.broadcast import publish_to_runners, wait_for_runners_ready
+from agents.simulator.broadcast import (
+    BroadcastError,
+    publish_end_simulation,
+    publish_to_runners,
+    wait_for_runners_ready,
+)
 
 
 class TestPublishToRunners:
@@ -43,18 +50,18 @@ class TestPublishToRunners:
             assert inner == '{"event":"tick","tick":1}'
 
     @pytest.mark.asyncio
-    async def test_handles_redis_failure_gracefully(self):
-        """Redis errors should be logged, not raised."""
+    async def test_raises_on_redis_client_failure(self):
+        """Redis client lookup errors must propagate instead of silently dropping broadcasts."""
         with patch(
             "agents.simulator.broadcast.get_shared_redis_client",
             side_effect=ConnectionError("connection refused"),
         ):
-            # Should not raise
-            await publish_to_runners("data", simulation_id="sim-test")
+            with pytest.raises(ConnectionError, match="connection refused"):
+                await publish_to_runners("data", simulation_id="sim-test")
 
     @pytest.mark.asyncio
     async def test_handles_none_client(self):
-        """Should silently return if no Redis client available."""
+        """Should silently return if no Redis client available (unconfigured test isolation)."""
         with patch(
             "agents.simulator.broadcast.get_shared_redis_client",
             return_value=None,
@@ -63,16 +70,16 @@ class TestPublishToRunners:
             await publish_to_runners("data", simulation_id="sim-test")
 
     @pytest.mark.asyncio
-    async def test_swallows_publish_errors(self):
-        """Publish errors should be logged, not raised."""
+    async def test_raises_on_publish_error(self):
+        """Publish errors must propagate to callers."""
         mock_redis = AsyncMock()
-        mock_redis.publish.side_effect = Exception("publish failed")
+        mock_redis.publish.side_effect = RuntimeError("publish failed")
         with patch(
             "agents.simulator.broadcast.get_shared_redis_client",
             return_value=mock_redis,
         ):
-            # Should not raise
-            await publish_to_runners("data", simulation_id="sim-test")
+            with pytest.raises(RuntimeError, match="publish failed"):
+                await publish_to_runners("data", simulation_id="sim-test")
 
     @pytest.mark.asyncio
     async def test_uses_shared_redis_client(self):
@@ -240,3 +247,68 @@ class TestWaitForRunnersReady:
         """Should return 0 immediately for empty list."""
         result = await wait_for_runners_ready([], simulation_id="sim-1")
         assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_raises_broadcast_error_on_persistent_mget_failure(self):
+        """Persistent Redis mget errors must raise BroadcastError instead of returning 0."""
+        mock_redis = AsyncMock()
+        mock_redis.mget = AsyncMock(side_effect=ConnectionError("redis down"))
+        with (
+            patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis),
+            patch("agents.simulator.broadcast.asyncio.sleep", AsyncMock()),
+            patch("agents.simulator.broadcast.time.monotonic", side_effect=[0.0, 0.1, 0.2, 2.0]),
+        ):
+            with pytest.raises(BroadcastError, match="failed persistently"):
+                await wait_for_runners_ready(["s1", "s2"], simulation_id="sim-1", timeout_seconds=1.0)
+
+    @pytest.mark.asyncio
+    async def test_succeeds_after_transient_mget_failure(self):
+        """A transient mget error followed by a successful poll should recover and return count."""
+        mock_redis = AsyncMock()
+        mock_redis.mget = AsyncMock(side_effect=[ConnectionError("transient"), ["sim-1", "sim-1"]])
+        with (
+            patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis),
+            patch("agents.simulator.broadcast.asyncio.sleep", AsyncMock()),
+        ):
+            result = await wait_for_runners_ready(["s1", "s2"], simulation_id="sim-1", timeout_seconds=5.0)
+            assert result == 2
+
+
+class TestPublishEndSimulation:
+    """Tests for publish_end_simulation helper."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_end_simulation_envelope(self):
+        mock_redis = AsyncMock()
+        with patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis):
+            await publish_end_simulation("sim-end-1")
+
+        mock_redis.publish.assert_called_once()
+        channel, raw = mock_redis.publish.call_args[0]
+        assert channel == "simulation:sim-end-1:broadcast"
+        envelope = json.loads(raw)
+        assert envelope["type"] == "end_simulation"
+        assert envelope["simulation_id"] == "sim-end-1"
+        assert "eventId" in envelope
+
+    @pytest.mark.asyncio
+    async def test_handles_none_client(self):
+        with patch("agents.simulator.broadcast.get_shared_redis_client", return_value=None):
+            await publish_end_simulation("sim-end-none")
+
+    @pytest.mark.asyncio
+    async def test_raises_on_redis_client_failure(self):
+        with patch(
+            "agents.simulator.broadcast.get_shared_redis_client",
+            side_effect=ConnectionError("redis down"),
+        ):
+            with pytest.raises(ConnectionError, match="redis down"):
+                await publish_end_simulation("sim-end-err")
+
+    @pytest.mark.asyncio
+    async def test_raises_on_publish_error(self):
+        mock_redis = AsyncMock()
+        mock_redis.publish.side_effect = RuntimeError("publish boom")
+        with patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis):
+            with pytest.raises(RuntimeError, match="publish boom"):
+                await publish_end_simulation("sim-end-err")

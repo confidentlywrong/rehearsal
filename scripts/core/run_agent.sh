@@ -1,5 +1,7 @@
 #!/bin/bash
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +17,12 @@
 
 # Robust wrapper for ADK agents under Honcho
 # Uses the PORT env var provided by the parent
-PORT=${PORT:-8000}
+if [[ -z "${PORT:-}" ]]; then
+    echo "ERROR: PORT environment variable is required." >&2
+    exit 1
+fi
 echo "Starting Agent with PORT=$PORT"
-exec .venv/bin/python3 -m google.adk.cli api_server "$@" --port "$PORT"
+if command -v uv >/dev/null 2>&1; then
+    exec uv run python -m google.adk.cli api_server "$@" --port "$PORT"
+fi
+exec python3 -m google.adk.cli api_server "$@" --port "$PORT"

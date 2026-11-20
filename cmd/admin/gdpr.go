@@ -2,7 +2,7 @@
 
 package main
 
-// Per-user GDPR control-plane handlers. Three superadmin-only
+// Per-user GDPR control-plane handlers. Four superadmin-only
 // endpoints (gated by middleware.RequireSuperadmin at the
 // route layer in setupRouter):
 //
@@ -19,9 +19,9 @@ package main
 // nothing auto-fires.
 
 import (
-	"log"
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -99,9 +99,9 @@ func softDeleteUserHandler(store *account.Store) gin.HandlerFunc {
 // Composed inline (no Store helper) because the constituent reads
 // are dirt cheap and only superadmin endpoints touch them.
 type userExport struct {
-	User    account.User         `json:"user"`
-	Audit   []account.AuditEntry `json:"audit"`
-	Exported time.Time           `json:"exported_at"`
+	User     account.User         `json:"user"`
+	Audit    []account.AuditEntry `json:"audit"`
+	Exported time.Time            `json:"exported_at"`
 }
 
 // exportUserHandler returns a gin handler that emits a userExport
@@ -151,7 +151,15 @@ func exportUserHandler(store *account.Store) gin.HandlerFunc {
 		// internally). 500 is the per-page hard cap; an export
 		// truncated at that depth still satisfies Article 15 for
 		// any account in this product's lifetime.
-		audit, _ := store.ListAudit(ctx, userID, "", 500, 0)
+		audit, err := store.ListAudit(ctx, userID, "", 500, 0)
+		if err != nil {
+			log.Printf("handler error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+		if audit == nil {
+			audit = []account.AuditEntry{}
+		}
 
 		recordAuditBestEffort(ctx, store, c, account.AuditEntry{
 			UserID: userID,
@@ -163,13 +171,30 @@ func exportUserHandler(store *account.Store) gin.HandlerFunc {
 			},
 		})
 		c.Header("Content-Disposition",
-			`attachment; filename="user-`+userID+`-export.json"`)
+			`attachment; filename="user-`+sanitizeHeaderFilename(userID)+`-export.json"`)
 		c.JSON(http.StatusOK, userExport{
 			User:     user,
 			Audit:    audit,
 			Exported: time.Now().UTC(),
 		})
 	}
+}
+
+func sanitizeHeaderFilename(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' {
+			b.WriteByte(ch)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }
 
 // eraseUserHandler returns a gin handler that HARD-deletes a user
@@ -202,15 +227,23 @@ func eraseUserHandler(store *account.Store) gin.HandlerFunc {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		defer cancel()
 
-		var (
-			emailAtErase   string
-			softDeletedISO string
-		)
-		if u, err := store.GetUser(ctx, userID); err == nil {
-			emailAtErase = u.Email
-			if u.DeletedAt != nil {
-				softDeletedISO = u.DeletedAt.UTC().Format(time.RFC3339)
-			}
+		u, lookupErr := store.GetUserAnyState(ctx, userID)
+		if errors.Is(lookupErr, account.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "user not found",
+				"id":    userID,
+			})
+			return
+		}
+		if lookupErr != nil {
+			log.Printf("handler error: %v", lookupErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+		emailAtErase := u.Email
+		var softDeletedISO string
+		if u.DeletedAt != nil {
+			softDeletedISO = u.DeletedAt.UTC().Format(time.RFC3339)
 		}
 
 		// Audit FIRST — once the DELETE commits the audit_log

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PgxConn is the minimal pgx-style surface the Store needs. Both
@@ -68,6 +69,10 @@ var ErrEmailTaken = errors.New("account: email already in use")
 // admin account trying to orphan the operator role.
 var ErrLastSuperadmin = errors.New("account: refusing to demote last superadmin")
 
+// ErrNilStore is returned by Store methods when the Store or its
+// underlying PgxConn is nil (including typed-nil *pgx.Conn / *pgxpool.Pool).
+var ErrNilStore = errors.New("account: nil store")
+
 // Store is the per-user data accessor. It does not own a pool; the
 // caller hands in any PgxConn-satisfying value (production passes a
 // *pgx.Conn, tests pass a fake).
@@ -75,12 +80,28 @@ type Store struct {
 	db PgxConn
 }
 
-// NewStore constructs a Store over db. db may be nil; methods on a
-// nil-db Store return ErrNotFound consistently so the surrounding
-// handlers can treat a degraded DB the same as a missing row. The
-// admin /healthz separately surfaces the actual DB ping result.
+// NewStore constructs a Store over db. db may be nil (including typed-nil
+// *pgx.Conn or *pgxpool.Pool); every read and write method on a nil or
+// unbacked Store returns ErrNilStore consistently.
 func NewStore(db PgxConn) *Store {
+	switch v := db.(type) {
+	case *pgx.Conn:
+		if v == nil {
+			db = nil
+		}
+	case *pgxpool.Pool:
+		if v == nil {
+			db = nil
+		}
+	}
 	return &Store{db: db}
+}
+
+func (s *Store) ok() error {
+	if s == nil || s.db == nil {
+		return ErrNilStore
+	}
+	return nil
 }
 
 // --- user CRUD --------------------------------------------------------
@@ -92,8 +113,12 @@ func NewStore(db PgxConn) *Store {
 // because the Account middleware 410s them via GetUserAnyState +
 // the FirebaseResolver's IsActive check before any handler runs).
 func (s *Store) GetUser(ctx context.Context, id string) (User, error) {
-	if s == nil || s.db == nil {
-		return User{}, ErrNotFound
+	if err := s.ok(); err != nil {
+		return User{}, err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return User{}, errors.New("account: user id required")
 	}
 	row := s.db.QueryRow(ctx, `
 		SELECT id, email, COALESCE(display_name,''), COALESCE(timezone,''),
@@ -125,8 +150,12 @@ func (s *Store) GetUser(ctx context.Context, id string) (User, error) {
 // still owned. Handler-layer callers should keep using GetUser so
 // they cannot accidentally write through a stale identity.
 func (s *Store) GetUserAnyState(ctx context.Context, id string) (User, error) {
-	if s == nil || s.db == nil {
-		return User{}, ErrNotFound
+	if err := s.ok(); err != nil {
+		return User{}, err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return User{}, errors.New("account: user id required")
 	}
 	row := s.db.QueryRow(ctx, `
 		SELECT id, email, COALESCE(display_name,''), COALESCE(timezone,''),
@@ -141,8 +170,12 @@ func (s *Store) GetUserAnyState(ctx context.Context, id string) (User, error) {
 // GetUserByEmail looks up by email (case-sensitive — Firebase
 // already normalizes). Returns ErrNotFound for missing or deleted.
 func (s *Store) GetUserByEmail(ctx context.Context, email string) (User, error) {
-	if s == nil || s.db == nil {
-		return User{}, ErrNotFound
+	if err := s.ok(); err != nil {
+		return User{}, err
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return User{}, errors.New("account: email required")
 	}
 	row := s.db.QueryRow(ctx, `
 		SELECT id, email, COALESCE(display_name,''), COALESCE(timezone,''),
@@ -159,9 +192,10 @@ func (s *Store) GetUserByEmail(ctx context.Context, email string) (User, error) 
 // customer and need to find the local user row. Returns ErrNotFound
 // for missing or deleted users.
 func (s *Store) GetUserByStripeCustomerID(ctx context.Context, cust string) (User, error) {
-	if s == nil || s.db == nil {
-		return User{}, ErrNotFound
+	if err := s.ok(); err != nil {
+		return User{}, err
 	}
+	cust = strings.TrimSpace(cust)
 	if cust == "" {
 		return User{}, ErrNotFound
 	}
@@ -197,8 +231,8 @@ func (s *Store) GetUserByStripeCustomerID(ctx context.Context, cust string) (Use
 // hits a UNIQUE-violation. We catch 23505 here and re-fetch instead
 // of bubbling a 500 up to the SPA on a double-clicked /me/init.
 func (s *Store) CreateUser(ctx context.Context, id, email, displayName string) (User, bool, error) {
-	if s == nil || s.db == nil {
-		return User{}, false, errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return User{}, false, err
 	}
 	id = strings.TrimSpace(id)
 	email = strings.TrimSpace(email)
@@ -208,10 +242,24 @@ func (s *Store) CreateUser(ctx context.Context, id, email, displayName string) (
 	// Check idempotency: existing live row with same id wins.
 	if existing, err := s.GetUser(ctx, id); err == nil {
 		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return User{}, false, err
+	}
+	// Refuse if this UID belongs to a soft-deleted account (prevents
+	// misclassifying a PK collision on users.id as ErrEmailTaken).
+	if existing, err := s.GetUserAnyState(ctx, id); err == nil {
+		if !existing.IsActive() {
+			return User{}, false, ErrAccountDeleted
+		}
+		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return User{}, false, err
 	}
 	// Refuse if a different id already owns this email.
 	if existing, err := s.GetUserByEmail(ctx, email); err == nil && existing.ID != id {
 		return User{}, false, ErrEmailTaken
+	} else if err != nil && !errors.Is(err, ErrNotFound) {
+		return User{}, false, err
 	}
 	// L2 (2026-06-25 audit): use INSERT ... RETURNING so the
 	// happy path is a single roundtrip. The trailing GetUser on
@@ -237,6 +285,16 @@ func (s *Store) CreateUser(ctx context.Context, id, email, displayName string) (
 			// catches and surfaces as ErrEmailTaken.
 			if existing, gerr := s.GetUser(ctx, id); gerr == nil {
 				return existing, false, nil
+			} else if !errors.Is(gerr, ErrNotFound) {
+				return User{}, false, gerr
+			}
+			if existing, gerr := s.GetUserAnyState(ctx, id); gerr == nil {
+				if !existing.IsActive() {
+					return User{}, false, ErrAccountDeleted
+				}
+				return existing, false, nil
+			} else if !errors.Is(gerr, ErrNotFound) {
+				return User{}, false, gerr
 			}
 			return User{}, false, ErrEmailTaken
 		}
@@ -249,8 +307,12 @@ func (s *Store) CreateUser(ctx context.Context, id, email, displayName string) (
 // when tier is not one of the catalog values; ErrNotFound when the
 // user row is missing or soft-deleted.
 func (s *Store) SetPlan(ctx context.Context, userID string, tier PlanTier) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: SetPlan: empty user id")
 	}
 	if !tier.IsKnown() {
 		return ErrInvalidPlan
@@ -273,12 +335,16 @@ func (s *Store) SetPlan(ctx context.Context, userID string, tier PlanTier) error
 // no-op; a call with a different id overwrites (last write wins,
 // matching Stripe's own customer-merging behavior).
 func (s *Store) SetStripeCustomerID(ctx context.Context, userID, cust string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: SetStripeCustomerID: empty user id")
 	}
 	tag, err := s.db.Exec(ctx, `
 		UPDATE users SET stripe_customer_id = NULLIF($1,'')
-		 WHERE id = $2 AND deleted_at IS NULL`, cust, userID)
+		 WHERE id = $2 AND deleted_at IS NULL`, strings.TrimSpace(cust), userID)
 	if err != nil {
 		return fmt.Errorf("account: set stripe customer: %w", err)
 	}
@@ -291,8 +357,15 @@ func (s *Store) SetStripeCustomerID(ctx context.Context, userID, cust string) er
 // MarkPaymentFailed sets payment_failed_at = ts. Webhook handler
 // calls this on invoice.payment_failed.
 func (s *Store) MarkPaymentFailed(ctx context.Context, userID string, ts time.Time) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: MarkPaymentFailed: empty user id")
+	}
+	if ts.IsZero() {
+		return errors.New("account: MarkPaymentFailed: timestamp required")
 	}
 	tag, err := s.db.Exec(ctx, `
 		UPDATE users SET payment_failed_at = $1
@@ -309,8 +382,12 @@ func (s *Store) MarkPaymentFailed(ctx context.Context, userID string, ts time.Ti
 // ClearPaymentFailed nulls out payment_failed_at. Webhook handler
 // calls this on invoice.payment_succeeded.
 func (s *Store) ClearPaymentFailed(ctx context.Context, userID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: ClearPaymentFailed: empty user id")
 	}
 	tag, err := s.db.Exec(ctx, `
 		UPDATE users SET payment_failed_at = NULL
@@ -324,69 +401,113 @@ func (s *Store) ClearPaymentFailed(ctx context.Context, userID string) error {
 	return nil
 }
 
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+type sqlRunner interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // SetSuperadmin flips the is_superadmin column. Intended for use by
 // an operator-only admin endpoint or a direct DBA SQL UPDATE.
-// Idempotent.
+// Returns ErrNotFound when the email does not match a live user row.
 //
 // Demote guard: a call with isAdmin=false that would leave the
 // system with zero live superadmins returns ErrLastSuperadmin
-// without touching the row. This prevents both accidental
-// self-lockout and an adversarial single-admin compromise from
-// orphaning the operator role. The check uses a single SQL
-// statement so it is safe under concurrent demotes (Postgres's
-// row-level locking serialises the UPDATEs; the EXISTS subquery
-// sees the pre-update snapshot of OTHER admin rows but the WHERE
-// clause re-evaluates per row, so the worst case is one of two
-// racing demotes succeeds and the other no-ops, never both).
+// without touching the row. When the backing connection supports
+// transactions (*pgxpool.Pool, *pgx.Conn), demotes are serialized via
+// pg_advisory_xact_lock to prevent concurrent READ COMMITTED demotes
+// of distinct admin emails from leaving zero superadmins.
 func (s *Store) SetSuperadmin(ctx context.Context, email string, isAdmin bool) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return errors.New("account: SetSuperadmin: empty email")
 	}
 	if isAdmin {
-		_, err := s.db.Exec(ctx, `
+		tag, err := s.db.Exec(ctx, `
 			UPDATE users SET is_superadmin = TRUE
 			 WHERE email = $1 AND deleted_at IS NULL`, email)
 		if err != nil {
 			return fmt.Errorf("account: set superadmin: %w", err)
 		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
 		return nil
 	}
-	// Demote path: only touch the row when at least one OTHER
-	// live superadmin exists. RowsAffected==0 then means either
-	// (a) the target email is not a live superadmin (no-op) or
-	// (b) the guard fired. Disambiguate with a follow-up read.
-	tag, err := s.db.Exec(ctx, `
-		UPDATE users SET is_superadmin = FALSE
-		 WHERE email = $1
-		   AND deleted_at IS NULL
-		   AND is_superadmin = TRUE
-		   AND EXISTS (
-		     SELECT 1 FROM users
-		      WHERE is_superadmin = TRUE
-		        AND deleted_at IS NULL
-		        AND email != $1
-		   )`, email)
-	if err != nil {
-		return fmt.Errorf("account: set superadmin: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Was the target a live superadmin at all? If yes, the
-		// guard fired; if no, the call was a no-op.
-		var wasAdmin bool
-		if err := s.db.QueryRow(ctx, `
-			SELECT EXISTS(
-			  SELECT 1 FROM users
-			   WHERE email = $1
-			     AND deleted_at IS NULL
-			     AND is_superadmin = TRUE
-			)`, email).Scan(&wasAdmin); err != nil {
-			return fmt.Errorf("account: set superadmin (guard probe): %w", err)
+
+	demoteWith := func(r sqlRunner) error {
+		tag, err := r.Exec(ctx, `
+			UPDATE users SET is_superadmin = FALSE
+			 WHERE email = $1
+			   AND deleted_at IS NULL
+			   AND is_superadmin = TRUE
+			   AND EXISTS (
+			     SELECT 1 FROM users
+			      WHERE is_superadmin = TRUE
+			        AND deleted_at IS NULL
+			        AND email != $1
+			   )`, email)
+		if err != nil {
+			return fmt.Errorf("account: set superadmin: %w", err)
 		}
-		if wasAdmin {
-			return ErrLastSuperadmin
+		if tag.RowsAffected() == 0 {
+			var wasAdmin bool
+			if err := r.QueryRow(ctx, `
+				SELECT is_superadmin
+				  FROM users
+				 WHERE email = $1
+				   AND deleted_at IS NULL`, email).Scan(&wasAdmin); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrNotFound
+				}
+				return fmt.Errorf("account: set superadmin (guard probe): %w", err)
+			}
+			if wasAdmin {
+				return ErrLastSuperadmin
+			}
 		}
+		return nil
 	}
-	return nil
+
+	if b, ok := s.db.(txBeginner); ok {
+		tx, err := b.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("account: set superadmin begin tx: %w", err)
+		}
+		committed := false
+		defer func() {
+			if committed {
+				return
+			}
+			rbCtx := ctx
+			if rbCtx == nil || rbCtx.Err() != nil {
+				var cancel context.CancelFunc
+				rbCtx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+			}
+			_ = tx.Rollback(rbCtx)
+		}()
+		// Transaction-scoped advisory lock ('SADM' = 0x5341444d) serializes
+		// concurrent superadmin demotes under READ COMMITTED.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(1396786253)"); err != nil {
+			return fmt.Errorf("account: set superadmin lock: %w", err)
+		}
+		if err := demoteWith(tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("account: set superadmin commit: %w", err)
+		}
+		committed = true
+		return nil
+	}
+	return demoteWith(s.db)
 }
 
 // HasAnySuperadmin reports whether at least one live (non-deleted)
@@ -394,8 +515,8 @@ func (s *Store) SetSuperadmin(ctx context.Context, email string, isAdmin bool) e
 // for any future admin UI that needs a fast "is the system bootstrapped"
 // signal.
 func (s *Store) HasAnySuperadmin(ctx context.Context) (bool, error) {
-	if s == nil || s.db == nil {
-		return false, errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return false, err
 	}
 	var exists bool
 	err := s.db.QueryRow(ctx, `
@@ -413,8 +534,8 @@ func (s *Store) HasAnySuperadmin(ctx context.Context) (bool, error) {
 // alphabetically. Available for observability and admin UIs that
 // need to render the current operator roster.
 func (s *Store) ListSuperadminEmails(ctx context.Context) ([]string, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return nil, err
 	}
 	rows, err := s.db.Query(ctx, `
 		SELECT email FROM users
@@ -457,9 +578,10 @@ func (s *Store) ListSuperadminEmails(ctx context.Context) ([]string, error) {
 // `auth.RevokeRefreshTokens(uid)` server-side via the Admin SDK
 // (deferred — single dep, modest payoff).
 func (s *Store) RevokeTokens(ctx context.Context, userID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
 	}
+	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return errors.New("account: RevokeTokens: empty user id")
 	}
@@ -480,32 +602,21 @@ func (s *Store) RevokeTokens(ctx context.Context, userID string) error {
 // Returns ErrInvalidStatus for unknown statuses, ErrNotFound when
 // the row is missing or already soft-deleted.
 //
-// For StatusApproved we stamp approved_at = now() and
-// approved_by = actorID so the audit trail shows which superadmin
-// flipped the gate. For StatusRejected we still record the actor
-// in approved_by (the column is the audit "last actor", not "the
-// approver"). We do not clear them when moving back to pending
-// (unreachable in the current UI but harmless if a future op needs
-// it) — the audit log captures the transitions, so leaving the
-// previous values is fine.
-//
-// Idempotent: setting the row to its current status is a no-op
-// (zero RowsAffected → returned as nil, matching SetUserPlan's
-// behaviour). This is intentional so the admin dashboard can
-// re-fire the action without producing a 404.
+// For StatusApproved we stamp approved_at = now() (preserving an
+// existing approved_at when already approved) and approved_by = actorID
+// (stored as SQL NULL when empty).
 func (s *Store) SetUserStatus(ctx context.Context, userID string, status UserStatus, actorID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
 	}
+	userID = strings.TrimSpace(userID)
 	if userID == "" {
 		return errors.New("account: SetUserStatus: empty user id")
 	}
 	if !status.IsKnown() {
 		return ErrInvalidStatus
 	}
-	// approved_at is set only when transitioning into approved.
-	// Keep it nil for pending/rejected so the column reflects "when
-	// did this row enter the live tier".
+	actorID = strings.TrimSpace(actorID)
 	var approvedAt any
 	if status == StatusApproved {
 		approvedAt = time.Now().UTC()
@@ -513,8 +624,11 @@ func (s *Store) SetUserStatus(ctx context.Context, userID string, status UserSta
 	tag, err := s.db.Exec(ctx, `
 		UPDATE users
 		   SET status = $2,
-		       approved_at = COALESCE($3, approved_at),
-		       approved_by = $4
+		       approved_at = CASE
+		           WHEN status = 'approved' THEN approved_at
+		           ELSE COALESCE($3, approved_at)
+		       END,
+		       approved_by = NULLIF($4, '')
 		 WHERE id = $1 AND deleted_at IS NULL`,
 		userID, string(status), approvedAt, actorID)
 	if err != nil {
@@ -522,9 +636,6 @@ func (s *Store) SetUserStatus(ctx context.Context, userID string, status UserSta
 	}
 	if tag.RowsAffected() == 0 {
 		// Distinguish "no row" from "row already in this state".
-		// We can't tell them apart from RowsAffected alone, so probe
-		// the row's existence; if it exists we return nil (idempotent
-		// success), otherwise ErrNotFound.
 		var exists bool
 		if perr := s.db.QueryRow(ctx, `
 			SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL)
@@ -537,23 +648,23 @@ func (s *Store) SetUserStatus(ctx context.Context, userID string, status UserSta
 	}
 	return nil
 }
-// stays in the DB (and FK relationships hold) for the configured
-// GDPR retention window; HardDeleteExpired sweeps it out later.
-//
-// P2 (2026-06-23 audit): also clears stripe_customer_id so a
-// re-signup with the same email cannot inherit the previous owner's
-// Stripe customer object. The Stripe-side customer record itself is
-// untouched (operators can delete it via the Stripe dashboard if
-// needed); we only break the local association so the next
-// /me/init for that email mints a fresh customer.
+
+// SoftDeleteUser marks the user soft-deleted so the row stays in the DB
+// for the configured GDPR retention window; HardDeleteExpiredUsers sweeps
+// it out later. Also clears stripe_customer_id and revokes active tokens.
 func (s *Store) SoftDeleteUser(ctx context.Context, userID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: SoftDeleteUser: empty user id")
 	}
 	tag, err := s.db.Exec(ctx, `
 		UPDATE users
 		   SET deleted_at = now(),
-		       stripe_customer_id = NULL
+		       stripe_customer_id = NULL,
+		       tokens_invalid_after = now()
 		 WHERE id = $1 AND deleted_at IS NULL`, userID)
 	if err != nil {
 		return fmt.Errorf("account: soft delete: %w", err)
@@ -576,8 +687,12 @@ func (s *Store) SoftDeleteUser(ctx context.Context, userID string) error {
 //
 // Returns ErrNotFound when the user row is missing or soft-deleted.
 func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayName, timezone *string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: UpdateUserProfile: empty user id")
 	}
 	if displayName == nil && timezone == nil {
 		return nil
@@ -615,8 +730,12 @@ func (s *Store) UpdateUserProfile(ctx context.Context, userID string, displayNam
 // NULL so the audit trail survives the user). Used by both operator
 // admin route and the bulk sweep below.
 func (s *Store) HardDeleteUser(ctx context.Context, userID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return errors.New("account: HardDeleteUser: empty user id")
 	}
 	tag, err := s.db.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
 	if err != nil {
@@ -633,8 +752,8 @@ func (s *Store) HardDeleteUser(ctx context.Context, userID string) error {
 // timestamp (it's a programmer error to pass time.Now() or a future
 // value — the caller computes `now - retention` and passes that).
 func (s *Store) HardDeleteExpiredUsers(ctx context.Context, cutoff time.Time) (int64, error) {
-	if s == nil || s.db == nil {
-		return 0, errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return 0, err
 	}
 	if cutoff.IsZero() || cutoff.After(time.Now().Add(time.Second)) {
 		return 0, fmt.Errorf("account: refusing sweep with non-past cutoff %v", cutoff)
@@ -659,8 +778,8 @@ func (s *Store) HardDeleteExpiredUsers(ctx context.Context, cutoff time.Time) (i
 // admin process; the operator UI will need explicit pagination once
 // we approach the cap.
 func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
-	if s == nil || s.db == nil {
-		return nil, nil
+	if err := s.ok(); err != nil {
+		return nil, err
 	}
 	rows, err := s.db.Query(ctx, `
 		SELECT id, email, COALESCE(display_name,''), COALESCE(timezone,''),
@@ -690,8 +809,8 @@ func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
 
 // GetPlan returns the catalog row for the named tier, or ErrNotFound.
 func (s *Store) GetPlan(ctx context.Context, tier PlanTier) (Plan, error) {
-	if s == nil || s.db == nil {
-		return Plan{}, ErrNotFound
+	if err := s.ok(); err != nil {
+		return Plan{}, err
 	}
 	row := s.db.QueryRow(ctx, `
 		SELECT tier, monthly_token_cap, max_concurrent_runs, COALESCE(description,'')
@@ -714,18 +833,22 @@ func (s *Store) GetPlan(ctx context.Context, tier PlanTier) (Plan, error) {
 // log the error but do NOT fail the underlying request when audit
 // emit fails (matches the legacy tenant.Store behavior).
 func (s *Store) RecordAudit(ctx context.Context, e AuditEntry) error {
-	if s == nil || s.db == nil {
-		return errors.New("account: nil store")
+	if err := s.ok(); err != nil {
+		return err
 	}
-	var meta any
-	if len(e.Metadata) > 0 {
-		meta = encodeJSON(e.Metadata)
+	action := strings.TrimSpace(e.Action)
+	if action == "" {
+		return errors.New("account: RecordAudit: empty action")
 	}
-	uid := nullIfEmpty(e.UserID)
-	_, err := s.db.Exec(ctx, `
+	meta, err := encodeJSON(e.Metadata)
+	if err != nil {
+		return err
+	}
+	uid := nullIfEmpty(strings.TrimSpace(e.UserID))
+	_, err = s.db.Exec(ctx, `
 		INSERT INTO audit_log (user_id, actor_id, action, target, metadata)
 		VALUES ($1, NULLIF($2,''), $3, NULLIF($4,''), $5)`,
-		uid, e.ActorID, e.Action, e.Target, meta)
+		uid, strings.TrimSpace(e.ActorID), action, strings.TrimSpace(e.Target), meta)
 	if err != nil {
 		return fmt.Errorf("account: record audit: %w", err)
 	}
@@ -736,11 +859,13 @@ func (s *Store) RecordAudit(ctx context.Context, e AuditEntry) error {
 // across all users (superadmin view); action="" matches all actions.
 // limit is clamped to [1, 500].
 func (s *Store) ListAudit(ctx context.Context, userID, action string, limit, offset int) ([]AuditEntry, error) {
-	if s == nil || s.db == nil {
-		return nil, nil
+	if err := s.ok(); err != nil {
+		return nil, err
 	}
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 {
 		limit = 50
+	} else if limit > 500 {
+		limit = 500
 	}
 	if offset < 0 {
 		offset = 0
@@ -766,7 +891,11 @@ func (s *Store) ListAudit(ctx context.Context, userID, action string, limit, off
 			return nil, err
 		}
 		if len(meta) > 0 {
-			e.Metadata = decodeJSON(meta)
+			decoded, derr := decodeJSON(meta)
+			if derr != nil {
+				return nil, fmt.Errorf("account: decode audit metadata (id=%d): %w", e.ID, derr)
+			}
+			e.Metadata = decoded
 		}
 		out = append(out, e)
 	}

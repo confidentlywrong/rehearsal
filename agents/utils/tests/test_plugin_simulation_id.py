@@ -104,6 +104,29 @@ class TestPluginSimulationIdFallback:
             assert call_kwargs[1]["simulation_id"] == "sim-from-state"
 
     @pytest.mark.asyncio
+    async def test_simulator_subagent_child_session_maps_to_simulation_id(self):
+        """Ephemeral AgentTool child sessions in simulator pipeline map session_id to simulation_id."""
+        plugin = self._make_plugin()
+        ctx = self._make_context("ephemeral-agent-tool-child-id", simulation_id="sim-parent-123")
+        ctx.agent_name = "tick"
+
+        with patch.object(plugin, "_emit_narrative", new_callable=AsyncMock) as mock_narrative:
+            await plugin._publish(
+                ctx,
+                {
+                    "type": "tool_end",
+                    "agent": "tick",
+                    "tool": "advance_tick",
+                    "result": {"status": "ok"},
+                    "timestamp": 1234567890.0,
+                },
+            )
+
+            mock_narrative.assert_called_once()
+            assert mock_narrative.call_args[0][0] == "sim-parent-123"
+            assert mock_narrative.call_args[1]["simulation_id"] == "sim-parent-123"
+
+    @pytest.mark.asyncio
     async def test_plugin_returns_none_when_neither_source_has_id(self):
         """When neither state nor registry has simulation_id, it should be None."""
         plugin = self._make_plugin()

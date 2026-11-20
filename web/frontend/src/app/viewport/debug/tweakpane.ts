@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: catch malformed custom LUT parses and handle async LUT load failures.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -240,21 +242,33 @@ export function initTweakpane(
           if (!file) return;
           const reader = new FileReader();
           reader.onload = (ev) => {
-            const result = (new LUTCubeLoader() as any).parse(ev.target!.result);
-            ctx.lutPass.lut = result.texture3D;
-            ctx.lutPass.enabled = true;
-            lutEnabledBinding.refresh();
+            try {
+              const raw = ev.target?.result;
+              if (!raw || !ctx.lutPass) return;
+              const result = (new LUTCubeLoader() as any).parse(raw);
+              if (!result?.texture3D) return;
+              ctx.lutPass.lut = result.texture3D;
+              ctx.lutPass.enabled = true;
+              lutEnabledBinding.refresh();
+            } catch (err) {
+              console.error('Failed to parse custom LUT:', err);
+            }
           };
           reader.readAsText(file);
         };
         fileInput.click();
         return;
       }
-      new LUTCubeLoader().loadAsync(`/assets/luts/${value}`).then((result: any) => {
-        if (!ctx.lutPass) return;
-        ctx.lutPass.lut = result.texture3D;
-        ctx.lutPass.enabled = true;
-        lutEnabledBinding.refresh();
-      });
+      new LUTCubeLoader()
+        .loadAsync(`/assets/luts/${value}`)
+        .then((result: any) => {
+          if (!ctx.lutPass || !result?.texture3D) return;
+          ctx.lutPass.lut = result.texture3D;
+          ctx.lutPass.enabled = true;
+          lutEnabledBinding.refresh();
+        })
+        .catch((err: unknown) => {
+          console.error('Failed to load LUT:', value, err);
+        });
     });
 }

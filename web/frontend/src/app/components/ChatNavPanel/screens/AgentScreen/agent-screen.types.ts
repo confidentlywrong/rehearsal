@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: make tick_feed infrastructure telemetry optional instead of fabricating fallback metrics.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -71,7 +73,7 @@ export type DisplayItem =
         is_critical: boolean;
         is_warning: boolean;
       }>;
-      infrastructure: {
+      infrastructure?: {
         medical_saves_this_tick: number;
         medical_events: string[];
         avg_comfort: number;

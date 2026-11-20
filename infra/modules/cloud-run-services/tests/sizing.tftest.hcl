@@ -308,3 +308,48 @@ run "embedding_backend_defaults_to_vertex_ai" {
     error_message = "EMBEDDING_BACKEND must default to vertex_ai for OSS Cloud SQL deploys"
   }
 }
+
+run "frontend_firebase_mode_has_no_duplicate_firebase_project_id_env" {
+  command = plan
+
+  variables {
+    identity_provider    = "firebase"
+    firebase_web_api_key = "AIzaSyTestKey"
+  }
+
+  assert {
+    condition = length([
+      for e in google_cloud_run_v2_service.frontend.template[0].containers[0].env :
+      e if e.name == "FIREBASE_PROJECT_ID"
+    ]) == 1
+    error_message = "frontend must emit FIREBASE_PROJECT_ID exactly once in firebase mode (Cloud Run v2 rejects duplicate env names)"
+  }
+}
+
+run "billing_service_exposed_in_service_names_when_enabled" {
+  command = plan
+
+  variables {
+    enable_billing_service = true
+    image_tags = {
+      gateway                     = "us-central1-docker.pkg.dev/test-project/race-condition/gateway:abc"
+      admin                       = "us-central1-docker.pkg.dev/test-project/race-condition/admin:abc"
+      dash                        = "us-central1-docker.pkg.dev/test-project/race-condition/dash:abc"
+      frontend                    = "us-central1-docker.pkg.dev/test-project/race-condition/frontend:abc"
+      tester                      = "us-central1-docker.pkg.dev/test-project/race-condition/tester:abc"
+      billing                     = "us-central1-docker.pkg.dev/test-project/race-condition/billing:abc"
+      runner_autopilot            = "us-central1-docker.pkg.dev/test-project/race-condition/runner_autopilot:abc"
+      runner_cloudrun             = "us-central1-docker.pkg.dev/test-project/race-condition/runner_cloudrun:abc"
+      leadership_runner_autopilot = "us-central1-docker.pkg.dev/test-project/race-condition/leadership_runner_autopilot:abc"
+      leadership_runner           = "us-central1-docker.pkg.dev/test-project/race-condition/leadership_runner:abc"
+      ai_echo                     = "us-central1-docker.pkg.dev/test-project/race-condition/ai_echo:abc"
+      ai_echo_reactive            = "us-central1-docker.pkg.dev/test-project/race-condition/ai_echo_reactive:abc"
+      ai_echo_autopilot           = "us-central1-docker.pkg.dev/test-project/race-condition/ai_echo_autopilot:abc"
+    }
+  }
+
+  assert {
+    condition     = contains(keys(output.service_names), "billing") && output.service_names["billing"] == "billing"
+    error_message = "service_names output must include billing when enable_billing_service=true"
+  }
+}

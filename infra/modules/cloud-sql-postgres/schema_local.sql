@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS rules (
     embedding   VECTOR(3072)
 );
 
+-- Deduplicate any legacy rows from pre-constraint seed_rules.sql re-runs
+-- before enforcing the natural (source_file, chunk_id) uniqueness key.
+DELETE FROM rules a
+USING rules b
+WHERE a.ctid < b.ctid
+  AND a.source_file = b.source_file
+  AND a.chunk_id = b.chunk_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_source_chunk
+    ON rules (source_file, chunk_id);
+
 -- ============================================================
 -- 2. PLANNED ROUTES TABLE  (full fidelity locally)
 -- ============================================================
@@ -156,5 +167,22 @@ CREATE TABLE IF NOT EXISTS leadership_simulation_records (
 -- FK lookup index: get_scenario joins by scenario_id.
 CREATE INDEX IF NOT EXISTS idx_leadership_sim_records_scenario_id
     ON leadership_simulation_records (scenario_id);
+
+CREATE TABLE IF NOT EXISTS leadership_stakeholder_artifacts (
+    scenario_id           VARCHAR(64)  PRIMARY KEY
+        REFERENCES leadership_scenarios(scenario_id) ON DELETE CASCADE,
+    stakeholder_graph     JSONB,
+    stakeholder_personas  JSONB,
+    stakeholder_reactions JSONB,
+    simulation_timeline   JSONB,
+    simulation_report     JSONB,
+    stakeholder_interview JSONB,
+    owner_id              VARCHAR(64),
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_leadership_artifacts_owner_updated
+    ON leadership_stakeholder_artifacts (owner_id, updated_at DESC);
 
 

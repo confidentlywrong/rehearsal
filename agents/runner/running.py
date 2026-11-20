@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import logging
+import math
 import random
 
 from google.adk.tools.tool_context import ToolContext
@@ -39,6 +41,47 @@ from agents.runner.constants import (
 logger = logging.getLogger(__name__)
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
 async def accelerate(intensity: float, tool_context: ToolContext) -> dict:
     """Increase the runner's speed based on the specified intensity.
 
@@ -48,14 +91,15 @@ async def accelerate(intensity: float, tool_context: ToolContext) -> dict:
         intensity: Acceleration intensity (0.0 to 1.0).
         tool_context: ADK tool context for state management.
     """
-    velocity = tool_context.state.get("velocity", 0.0)
-    water = tool_context.state.get("water", 100.0)
-    crowd_responsiveness = tool_context.state.get("crowd_responsiveness", 0.5)
+    safe_intensity = max(0.0, _finite_float(intensity, 0.0))
+    velocity = max(0.0, _finite_float(tool_context.state.get("velocity", 0.0), 0.0))
+    water = max(0.0, min(100.0, _finite_float(tool_context.state.get("water", 100.0), 100.0)))
+    crowd_responsiveness = max(0.0, _finite_float(tool_context.state.get("crowd_responsiveness", 0.5), 0.5))
     boost_multiplier = 0.1
     # Dehydration penalty: linearly scale from 1.0 (full water) to 0.5 (no water)
     hydration_factor = 0.5 + 0.5 * (water / 100.0)
-    new_velocity = velocity + (intensity * boost_multiplier * hydration_factor * crowd_responsiveness)
-    new_velocity = min(MAX_VELOCITY, new_velocity)  # Hard cap
+    new_velocity = velocity + (safe_intensity * boost_multiplier * hydration_factor * crowd_responsiveness)
+    new_velocity = max(0.0, min(MAX_VELOCITY, new_velocity))  # Hard cap
     tool_context.state["velocity"] = new_velocity
     logger.info(f"Runner accelerating: velocity={new_velocity:.2f} (hydration: {water:.0f}%)")
     return {
@@ -72,8 +116,9 @@ async def brake(intensity: float, tool_context: ToolContext) -> dict:
         intensity: Braking intensity (0.0 to 1.0).
         tool_context: ADK tool context for state management.
     """
-    velocity = tool_context.state.get("velocity", 0.0)
-    new_velocity = max(0.0, velocity - (intensity * 1.5))
+    safe_intensity = max(0.0, _finite_float(intensity, 0.0))
+    velocity = max(0.0, _finite_float(tool_context.state.get("velocity", 0.0), 0.0))
+    new_velocity = max(0.0, velocity - (safe_intensity * 1.5))
     tool_context.state["velocity"] = new_velocity
     logger.info(f"Runner braking: velocity={new_velocity:.2f}")
     return {
@@ -148,22 +193,25 @@ async def process_tick(
     # schema -- which lets small models (gemma4:e2b) drop the
     # ``inner_thought`` arg too. See Task I in
     # docs/plans/2026-04-19-llm-runner-cap-task-i-required-inner-thought.md.
-    tick_params = state.get("_tick_params", {})
-    if tick < 0:
-        tick = tick_params.get("tick")
-    if minutes_per_tick < 0:
-        minutes_per_tick = tick_params.get("minutes_per_tick")
-    if elapsed_minutes < 0:
-        elapsed_minutes = tick_params.get("elapsed_minutes")
-    if race_distance_mi < 0:
-        race_distance_mi = tick_params.get("race_distance_mi")
+    raw_tick_params = state.get("_tick_params")
+    tick_params = raw_tick_params if isinstance(raw_tick_params, dict) else {}
+    raw_tick = tick_params.get("tick") if tick < 0 else tick
+    raw_minutes_per_tick = tick_params.get("minutes_per_tick") if minutes_per_tick < 0 else minutes_per_tick
+    raw_elapsed_minutes = tick_params.get("elapsed_minutes") if elapsed_minutes < 0 else elapsed_minutes
+    raw_race_distance_mi = tick_params.get("race_distance_mi") if race_distance_mi < 0 else race_distance_mi
     if not collector_buffer_key:
-        collector_buffer_key = tick_params.get("collector_buffer_key", "")
+        raw_cbk = tick_params.get("collector_buffer_key")
+        collector_buffer_key = raw_cbk if isinstance(raw_cbk, str) else ""
 
     # Validate we have all required params from either source.
     # Return an error dict (not raise) so the LLM can recover if it calls
     # process_tick before any tick event has been received (e.g. during spawn).
-    if tick is None or minutes_per_tick is None or elapsed_minutes is None or race_distance_mi is None:
+    if (
+        raw_tick is None
+        or raw_minutes_per_tick is None
+        or raw_elapsed_minutes is None
+        or raw_race_distance_mi is None
+    ):
         logger.warning("process_tick called without tick params -- no tick event received yet")
         return {
             "status": "error",
@@ -172,16 +220,38 @@ async def process_tick(
             ),
         }
 
-    velocity = state.get("velocity", 0.0)
-    distance = state.get("distance", 0.0)
-    water = state.get("water", 100.0)
-    exhausted = state.get("exhausted", False)
-    collapsed = state.get("collapsed", False)
-    finished = state.get("finished", False)
-
-    # Already finished or collapsed: no-op
-    if finished or collapsed:
+    tick = _finite_int(raw_tick, -1)
+    minutes_per_tick = _finite_float(raw_minutes_per_tick, -1.0)
+    elapsed_minutes = _finite_float(raw_elapsed_minutes, -1.0)
+    race_distance_mi = _finite_float(raw_race_distance_mi, -1.0)
+    if tick < 0 or minutes_per_tick < 0.0 or elapsed_minutes < 0.0 or race_distance_mi <= 0.0:
+        logger.warning(
+            "process_tick called with invalid numeric params: tick=%s mpt=%s elapsed=%s dist=%s",
+            tick,
+            minutes_per_tick,
+            elapsed_minutes,
+            race_distance_mi,
+        )
         return {
+            "status": "error",
+            "message": "Invalid tick timing parameters.",
+        }
+
+    velocity = max(0.0, _finite_float(state.get("velocity", 0.0), 0.0))
+    distance = max(0.0, _finite_float(state.get("distance", 0.0), 0.0))
+    water = max(0.0, min(100.0, _finite_float(state.get("water", 100.0), 100.0)))
+    exhausted = bool(state.get("exhausted", False))
+    collapsed = bool(state.get("collapsed", False))
+    finished = bool(state.get("finished", False))
+
+    # Already finished or collapsed: no-op (still report to collector buffer)
+    if finished or collapsed:
+        raw_term_pace = state.get("pace_min_per_mi")
+        term_pace = _finite_float(raw_term_pace, 0.0) if raw_term_pace is not None else None
+        raw_term_finish = state.get("finish_time_minutes")
+        term_finish = _finite_float(raw_term_finish, 0.0) if raw_term_finish is not None else None
+        term_wave = _finite_int(state.get("wave_number", 0), 0)
+        terminal_result = {
             "status": "success",
             "tick": tick,
             "runner_status": "finished" if finished else "collapsed",
@@ -190,14 +260,17 @@ async def process_tick(
             "distance_mi": distance,
             "distance": round(distance, 4),
             "water": water,
-            "pace_min_per_mi": state.get("pace_min_per_mi"),
+            "pace_min_per_mi": term_pace,
             "elapsed_minutes": elapsed_minutes,
             "mi_this_tick": 0.0,
-            "finish_time_minutes": state.get("finish_time_minutes"),
+            "finish_time_minutes": term_finish,
             "exhausted": exhausted,
             "collapsed": collapsed,
             "inner_thought": inner_thought,
+            "wave_number": term_wave,
         }
+        await _push_to_collector_buffer(collector_buffer_key, tool_context, terminal_result)
+        return terminal_result
 
     # --- Effective velocity with degradation factors ---
     # 1. Hydration: 50-100% of base speed
@@ -205,8 +278,9 @@ async def process_tick(
 
     # 2. Wall: sharp pace degradation if past wall_mi
     wall_factor = 1.0
-    if state.get("will_hit_wall") and distance > state.get("wall_mi", 18.6411):
-        wall_factor = 1.0 - state.get("wall_severity", 0.25)
+    if state.get("will_hit_wall") and distance > _finite_float(state.get("wall_mi", 18.6411), 18.6411):
+        wall_sev = max(0.0, min(1.0, _finite_float(state.get("wall_severity", 0.25), 0.25)))
+        wall_factor = 1.0 - wall_sev
 
     # 3. Natural fatigue: gradual slowdown ~0.2% per tick
     fatigue_factor = max(MIN_FATIGUE_FACTOR, 1.0 - NATURAL_FATIGUE_RATE * tick)
@@ -217,50 +291,71 @@ async def process_tick(
     # runners start comfortable and degrade via natural decay (-0.5/tick),
     # portable toilet stops (resets to 100.0), and water station side-effects
     # (-15.0 per drink).
-    comfort = state.get("comfort", 100.0)
+    comfort = max(0.0, min(100.0, _finite_float(state.get("comfort", 100.0), 100.0)))
     comfort_factor = 1.0
     if comfort < 20.0:
         comfort_factor = 0.85
     elif comfort < 40.0:
         comfort_factor = 0.95
 
-    effective_velocity = velocity * hydration_factor * wall_factor * fatigue_factor * comfort_factor
+    # 5. Weather modifier (1.0 default or dict with speed_factor/velocity_factor)
+    weather_mod = tick_params.get("weather_modifier", 1.0)
+    if isinstance(weather_mod, dict):
+        raw_wf = weather_mod.get("speed_factor", weather_mod.get("velocity_factor", 1.0))
+        weather_factor = _finite_float(raw_wf, 1.0)
+    elif isinstance(weather_mod, (int, float)) and not isinstance(weather_mod, bool):
+        weather_factor = _finite_float(weather_mod, 1.0)
+    else:
+        weather_factor = 1.0
+    weather_factor = max(0.5, min(1.5, weather_factor))
+
+    effective_velocity = velocity * hydration_factor * wall_factor * fatigue_factor * comfort_factor * weather_factor
+    if not math.isfinite(effective_velocity):
+        effective_velocity = 0.0
 
     # --- Phase 2: Recovery Logic ---
-    recovering = state.get("recovering", False)
-    recovery_ticks_left = state.get("recovery_ticks_left", 0)
+    recovering = bool(state.get("recovering", False))
+    recovery_ticks_left = _finite_int(state.get("recovery_ticks_left", 0), 0)
 
     if recovering:
         recovery_ticks_left -= 1
         if recovery_ticks_left <= 0:
             recovering = False
+            recovery_ticks_left = 0
         state["recovery_ticks_left"] = recovery_ticks_left
         state["recovering"] = recovering
         # Heavy speed penalty while recovering
         effective_velocity *= 0.7
+        if not math.isfinite(effective_velocity):
+            effective_velocity = 0.0
 
     # --- Distance computation ---
-    effective_mph = effective_velocity * SPEED_SCALE
-    mi_this_tick = effective_mph / 60.0 * minutes_per_tick
+    raw_effective_mph = effective_velocity * SPEED_SCALE
+    effective_mph = raw_effective_mph if math.isfinite(raw_effective_mph) else 0.0
+    raw_mi_this_tick = (effective_mph / 60.0) * minutes_per_tick
+    mi_this_tick = raw_mi_this_tick if math.isfinite(raw_mi_this_tick) else 0.0
     raw_distance = distance + mi_this_tick
+    if not math.isfinite(raw_distance):
+        raw_distance = race_distance_mi
     new_distance = min(raw_distance, race_distance_mi)
     state["distance"] = new_distance
 
-    # --- Hydration depletion ---
-    efficiency = state.get("hydration_efficiency", 1.0)
-    base_depletion = BASE_DEPLETION_RATE * mi_this_tick * efficiency
-    fatigue_growth = 1.0 + FATIGUE_DEPLETION_GROWTH * new_distance
-    depletion = base_depletion * fatigue_growth
-    new_water = max(0.0, water - depletion)
-
     # --- Phase 3: Comfort Decay and Toilets ---
-    # Process toilets BEFORE hydration stations because a toilet stop
-    # reduces mi_this_tick (and therefore new_distance).  Hydration
-    # station checks must use the corrected distance so the runner
-    # cannot drink at a station it never actually reached.
-    station_index = state.get("_tick_params", {}).get("station_index", {})
+    # Process toilets BEFORE hydration depletion and hydration stations
+    # because a toilet stop reduces mi_this_tick (and therefore new_distance).
+    raw_station_index = tick_params.get("station_index")
+    station_index = raw_station_index if isinstance(raw_station_index, dict) else {}
     comfort = max(0.0, comfort - 0.5 * minutes_per_tick)
-    toilet_stations = station_index.get("portable_toilets", [])
+    raw_toilets = station_index.get("portable_toilets")
+    toilet_stations = (
+        [
+            num
+            for x in raw_toilets
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_toilets, list)
+        else []
+    )
 
     for toilet_mi in toilet_stations:
         if distance < toilet_mi <= new_distance:
@@ -268,23 +363,62 @@ async def process_tick(
                 comfort = 100.0
                 # Small speed penalty for stopping
                 mi_this_tick *= 0.9
-                new_distance = min(distance + mi_this_tick, race_distance_mi)
+                if not math.isfinite(mi_this_tick):
+                    mi_this_tick = 0.0
+                raw_distance = distance + mi_this_tick
+                if not math.isfinite(raw_distance):
+                    raw_distance = race_distance_mi
+                new_distance = min(raw_distance, race_distance_mi)
                 state["distance"] = new_distance
                 break  # At most one toilet stop per tick
 
     state["comfort"] = comfort
 
+    # --- Hydration depletion ---
+    efficiency = max(0.0, _finite_float(state.get("hydration_efficiency", 1.0), 1.0))
+    raw_base_depletion = BASE_DEPLETION_RATE * mi_this_tick * efficiency
+    base_depletion = raw_base_depletion if math.isfinite(raw_base_depletion) else 0.0
+    raw_fatigue_growth = 1.0 + FATIGUE_DEPLETION_GROWTH * new_distance
+    fatigue_growth = raw_fatigue_growth if math.isfinite(raw_fatigue_growth) else 1.0
+    raw_depletion = base_depletion * fatigue_growth
+    if math.isnan(raw_depletion):
+        depletion = 0.0
+    elif not math.isfinite(raw_depletion):
+        depletion = water
+    else:
+        depletion = raw_depletion
+    new_water = max(0.0, water - depletion)
+
     # --- Auto hydration station check (at planner-placed positions) ---
-    water_stations = station_index.get("water_stations", [])
-    medical_stations = station_index.get("medical_tents", [])
+    raw_water_stations = station_index.get("water_stations")
+    water_stations = (
+        [
+            num
+            for x in raw_water_stations
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_water_stations, list)
+        else []
+    )
+    raw_medical_stations = station_index.get("medical_tents")
+    medical_stations = (
+        [
+            num
+            for x in raw_medical_stations
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_medical_stations, list)
+        else []
+    )
 
     # Check EVERY station crossed this tick (fast runners may cross 2-3).
     if not water_stations:
         # Fallback to hardcoded interval if planner didn't provide stations or old data
-        prev_marker = int(distance / HYDRATION_STATION_INTERVAL_MI)
-        new_marker = int(new_distance / HYDRATION_STATION_INTERVAL_MI)
+        interval = max(HYDRATION_STATION_INTERVAL_MI, 1e-6)
+        prev_marker = int(distance / interval)
+        new_marker = int(new_distance / interval)
         if new_marker > prev_marker:
-            session_id = getattr(getattr(tool_context, "session", None), "id", "default")
+            session_id = getattr(getattr(tool_context, "session", None), "id", None) or "default"
             for marker in range(prev_marker + 1, new_marker + 1):
                 rng = random.Random(runner_seed(session_id, marker))
                 should_drink = (
@@ -296,12 +430,24 @@ async def process_tick(
                 if should_drink:
                     new_water = min(100.0, new_water + HYDRATION_STATION_REFILL)
                     comfort = max(0.0, comfort - 15.0)  # Drinking water reduces comfort
+                if new_water >= 100.0 and comfort <= 0.0:
+                    break
     else:
         for station_mi in water_stations:
             if distance < station_mi <= new_distance:
-                session_id = getattr(getattr(tool_context, "session", None), "id", "default")
+                session_id = getattr(getattr(tool_context, "session", None), "id", None) or "default"
                 # Use station mile marker (multiplied) for deterministic seed
-                rng = random.Random(runner_seed(session_id, int(station_mi * 1000)))
+                try:
+                    scaled_station = station_mi * 1000
+                except OverflowError:
+                    scaled_station = float("nan")
+                if math.isfinite(scaled_station):
+                    station_salt = int(scaled_station)
+                elif math.isfinite(station_mi):
+                    station_salt = int(station_mi)
+                else:
+                    station_salt = 0
+                rng = random.Random(runner_seed(session_id, station_salt))
                 should_drink = (
                     new_water <= 40.0
                     or exhausted
@@ -311,11 +457,14 @@ async def process_tick(
                 if should_drink:
                     new_water = min(100.0, new_water + HYDRATION_STATION_REFILL)
                     comfort = max(0.0, comfort - 15.0)  # Drinking water reduces comfort
+                if new_water >= 100.0 and comfort <= 0.0:
+                    break
 
     state["water"] = new_water
+    state["comfort"] = comfort
 
     # --- Phase 2: Injury Risk ---
-    injury_risk = state.get("injury_risk", 0.0)
+    injury_risk = max(0.0, _finite_float(state.get("injury_risk", 0.0), 0.0))
     if not recovering:
         # Natural recovery: small per-tick decay so injury_risk is not
         # monotonically increasing (prevents guaranteed collapse in long sims).
@@ -334,7 +483,7 @@ async def process_tick(
         for med_mi in medical_stations:
             if distance < med_mi <= new_distance:
                 injury_risk = max(0.0, injury_risk - 0.15)
-                state["medical_saves"] = state.get("medical_saves", 0) + 1
+                state["medical_saves"] = _finite_int(state.get("medical_saves", 0), 0) + 1
 
         state["injury_risk"] = injury_risk
 
@@ -355,7 +504,7 @@ async def process_tick(
             state["recovering"] = True
             state["recovery_ticks_left"] = 2
             state["injury_risk"] = 0.4
-            state["medical_saves"] = state.get("medical_saves", 0) + 1
+            state["medical_saves"] = _finite_int(state.get("medical_saves", 0), 0) + 1
         else:
             collapsed = True
 
@@ -363,8 +512,10 @@ async def process_tick(
 
     # --- Finish detection ---
     runner_status = "running"
-    finish_time = state.get("finish_time_minutes")
-    pace = state.get("pace_min_per_mi")
+    raw_finish_state = state.get("finish_time_minutes")
+    finish_time = _finite_float(raw_finish_state, 0.0) if raw_finish_state is not None else None
+    raw_pace_state = state.get("pace_min_per_mi")
+    pace = _finite_float(raw_pace_state, 0.0) if raw_pace_state is not None else None
 
     if new_distance >= race_distance_mi and not finished:
         finished = True
@@ -373,9 +524,13 @@ async def process_tick(
         # Interpolate exact finish time (use raw_distance, before clamping)
         overshoot = raw_distance - race_distance_mi
         fraction = 1.0 - (overshoot / mi_this_tick) if mi_this_tick > 0 else 1.0
+        if not math.isfinite(fraction):
+            fraction = 1.0
         fraction = max(0.0, min(1.0, fraction))  # L8: clamp to prevent edge-case anomalies
-        finish_time = elapsed_minutes - minutes_per_tick * (1.0 - fraction)
-        pace = finish_time / race_distance_mi if race_distance_mi > 0 else 0.0
+        raw_finish_time = elapsed_minutes - minutes_per_tick * (1.0 - fraction)
+        finish_time = raw_finish_time if math.isfinite(raw_finish_time) else 0.0
+        raw_pace = finish_time / race_distance_mi if race_distance_mi > 0 else 0.0
+        pace = raw_pace if math.isfinite(raw_pace) else 0.0
         state["finish_time_minutes"] = round(finish_time, 2)
         state["pace_min_per_mi"] = round(pace, 2)
     elif collapsed:
@@ -385,6 +540,7 @@ async def process_tick(
 
     state["runner_status"] = runner_status
 
+    wave = _finite_int(state.get("wave_number", 0), 0)
     result = {
         "status": "success",
         "tick": tick,
@@ -401,39 +557,59 @@ async def process_tick(
         "exhausted": exhausted,
         "collapsed": collapsed,
         "inner_thought": inner_thought,
-        "wave_number": state.get("wave_number", 0),
+        "wave_number": wave,
     }
 
     # Stagger the first movement tick's gateway emission by wave so the
     # frontend sees runners start in waves (~2s between each wave).
     WAVE_STAGGER_SECONDS = 2.0
-    wave = state.get("wave_number", 0)
+    MAX_GATEWAY_DELAY_SECONDS = 30.0
     if tick == 1 and wave > 0:
-        result["gateway_delay_seconds"] = wave * WAVE_STAGGER_SECONDS
+        try:
+            gateway_delay = wave * WAVE_STAGGER_SECONDS
+        except OverflowError:
+            gateway_delay = float("nan")
+        if math.isfinite(gateway_delay):
+            result["gateway_delay_seconds"] = min(gateway_delay, MAX_GATEWAY_DELAY_SECONDS)
 
     # --- Direct-write to collector buffer (bypass PubSub bottleneck) ---
-    if collector_buffer_key:
-        try:
-            r = get_shared_redis_client()
-            if r is not None:
-                session_id = getattr(getattr(tool_context, "session", None), "id", "")
-                direct_msg = json.dumps(
-                    {
-                        "session_id": session_id,
-                        "payload": {
-                            "tool_name": "process_tick",
-                            "result": result,
-                        },
-                    },
-                    default=str,
-                )
-                await r.rpush(collector_buffer_key, direct_msg)  # type: ignore[misc]
-                await r.expire(collector_buffer_key, 7200)
-        except Exception:
-            logger.warning(
-                "process_tick: direct-write RPUSH failed for %s",
-                collector_buffer_key,
-                exc_info=True,
-            )
+    await _push_to_collector_buffer(collector_buffer_key, tool_context, result)
 
     return result
+
+
+async def _push_to_collector_buffer(
+    collector_buffer_key: str,
+    tool_context: ToolContext,
+    result: dict,
+) -> None:
+    """Direct-write tick result to RaceCollector Redis buffer (sync/async safe)."""
+    if not collector_buffer_key:
+        return
+    try:
+        r = get_shared_redis_client()
+        if r is not None:
+            session_id = getattr(getattr(tool_context, "session", None), "id", "") or ""
+            payload_obj = {
+                "session_id": session_id,
+                "payload": {
+                    "tool_name": "process_tick",
+                    "result": result,
+                },
+            }
+            try:
+                direct_msg = json.dumps(payload_obj, allow_nan=False, default=str)
+            except ValueError:
+                direct_msg = json.dumps(_strip_nonfinite(payload_obj), allow_nan=False, default=str)
+            maybe_push = r.rpush(collector_buffer_key, direct_msg)  # type: ignore[misc]
+            if inspect.isawaitable(maybe_push):
+                await maybe_push
+            maybe_exp = r.expire(collector_buffer_key, 7200)
+            if inspect.isawaitable(maybe_exp):
+                await maybe_exp
+    except Exception:
+        logger.warning(
+            "process_tick: direct-write RPUSH failed for %s",
+            collector_buffer_key,
+            exc_info=True,
+        )

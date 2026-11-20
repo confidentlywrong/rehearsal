@@ -879,3 +879,38 @@ class TestRunnerTypeParam:
         payload = json.loads(captured_message)
         assert payload["simulation_config"]["runner_type"] == "runner_cloudrun"
         assert payload["simulation_config"]["runner_count"] == 5
+
+
+class TestSimDataErrorHandling:
+    """Verify SimDataError from configured Redis is returned explicitly (no silent inline fallback)."""
+
+    @pytest.mark.asyncio
+    async def test_simdata_error_returns_error_and_does_not_call_simulator(self):
+        from unittest.mock import AsyncMock
+        from agents.utils.simdata import SimDataError
+
+        route = {
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[0, 0]]}, "properties": {}}
+            ],
+        }
+        ctx = _make_tool_context(state={"marathon_route": route})
+        mock_call = AsyncMock(return_value="should not be called")
+
+        with (
+            patch(
+                "agents.utils.simdata.store_simulation_data",
+                AsyncMock(side_effect=SimDataError("Redis connection refused")),
+            ),
+            patch("agents.utils.communication.call_agent", mock_call),
+        ):
+            result = await submit_plan_to_simulator(
+                action="execute",
+                message="Run it",
+                tool_context=ctx,
+            )
+
+        assert result["status"] == "error"
+        assert "Redis connection refused" in result["message"]
+        mock_call.assert_not_awaited()

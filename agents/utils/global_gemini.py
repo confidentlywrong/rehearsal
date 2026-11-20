@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # Modifications copyright 2026 Christian Haeussinger
-# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,9 +25,10 @@ platform-level vertexai.init() override.
 
 Usage in LlmAgent definitions:
     from agents.utils.global_gemini import GlobalGemini
+    from agents.utils.models import DEFAULT_PLANNER_MODEL
 
     agent = LlmAgent(
-        model=GlobalGemini(model="gemini-3-flash-preview"),
+        model=GlobalGemini(model=DEFAULT_PLANNER_MODEL),
         ...
     )
 
@@ -59,10 +60,10 @@ class GlobalGemini(Gemini):
     For per-agent location control::
 
         # Global endpoint (default, required for Gemini 3 previews)
-        model = GlobalGemini(model="gemini-3-flash-preview")
+        model = GlobalGemini(model=DEFAULT_PLANNER_MODEL)
 
         # Regional endpoint
-        model = GlobalGemini(model="gemini-2.0-flash", location="us-central1")
+        model = GlobalGemini(model="gemini-2.5-flash", location="us-central1")
     """
 
     location: str = "global"
@@ -74,9 +75,17 @@ class GlobalGemini(Gemini):
         """Create a genai Client with the configured location (or API key when no GCP project is active)."""
         from google.genai import Client
 
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID") or ""
-        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in ("0", "false", "no")
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+        project = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT") or ""
+        ).strip() or (
+            os.environ.get("PROJECT_ID") or ""
+        ).strip()
+        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() not in ("0", "false", "no")
+        api_key = (
+            os.environ.get("GEMINI_API_KEY") or ""
+        ).strip() or (
+            os.environ.get("GOOGLE_API_KEY") or ""
+        ).strip()
         http_opts = types.HttpOptions(
             headers=self._tracking_headers(),
             retry_options=self.retry_options,

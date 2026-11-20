@@ -43,14 +43,20 @@ re-read on the next access, gated by single-flight.
 """
 
 import asyncio
+import contextvars
+from contextlib import contextmanager
 import logging
 import os
 from collections import OrderedDict
+from typing import Iterator, Optional
 
 from agents.utils.redis_pool import get_shared_redis_client
 from agents.utils import tenant_keys
 
 logger = logging.getLogger(__name__)
+
+_ANONYMOUS_USER_IDS = frozenset({"simulation", "simulation_user", "anonymous", "default", "user"})
+_current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar("simreg_user_id", default="")
 
 # Legacy un-prefixed prefixes — kept for back-compat scanning in clear()
 # and for callers that still reference them by name (e.g. broadcast.py).
@@ -72,23 +78,99 @@ def _dispatcher_user_id() -> str:
     return os.environ.get("DISPATCHER_USER_ID", "").strip()
 
 
-def _session_key(session_id: str) -> str:
+@contextmanager
+def user_scope(user_id: Optional[str]) -> Iterator[None]:
+    """Bind a tenant user_id to the current async/execution context for simreg helpers."""
+    cleaned = user_id.strip() if isinstance(user_id, str) else ""
+    token = _current_user_id.set(cleaned)
+    try:
+        yield
+    finally:
+        _current_user_id.reset(token)
+
+
+def get_current_user_id() -> str:
+    """Return the active tenant user_id bound via :func:`user_scope`, or ``""``."""
+    return _current_user_id.get("").strip()
+
+
+def _resolve_registry_user(
+    user_id: Optional[str] = None,
+    *,
+    require_when_saas: bool = False,
+) -> str:
+    """Resolve effective tenant user_id from explicit arg, contextvar, or DISPATCHER_USER_ID."""
+    if user_id is not None:
+        if not isinstance(user_id, str):
+            raise ValueError(f"simreg: user_id must be a string, got {type(user_id).__name__}")
+        candidate = user_id.strip()
+    else:
+        ctx_uid = _current_user_id.get("").strip()
+        candidate = ctx_uid if ctx_uid else _dispatcher_user_id()
+
+    if tenant_keys._saas_mode_enabled():
+        if candidate:
+            if candidate.lower() in _ANONYMOUS_USER_IDS:
+                if require_when_saas:
+                    raise ValueError(
+                        f"Authenticated user_id is required in simulation_registry when SAAS_MODE=on (got {candidate!r})"
+                    )
+                return ""
+            return tenant_keys._validate_component(candidate, "user_id")
+        if require_when_saas:
+            raise ValueError("Authenticated user_id is required in simulation_registry when SAAS_MODE=on")
+    return candidate
+
+
+def _session_key(session_id: str, user_id: Optional[str] = None) -> str:
     """Tenant-aware Redis key for a session→simulation mapping.
 
     SAAS_MODE=off → ``simreg:session:<id>`` (legacy, byte-identical).
     SAAS_MODE=on  → ``{ACCOUNT_KEY_PREFIX}:{user}:simreg:session:<id>``.
     """
-    return tenant_keys.key_for_user(_dispatcher_user_id(), "simreg", "session", session_id)
+    eff_user = _resolve_registry_user(user_id, require_when_saas=False)
+    return tenant_keys.key_for_user(eff_user, "simreg", "session", session_id)
 
 
-def _context_key(vertex_session_id: str) -> str:
+def _context_key(vertex_session_id: str, user_id: Optional[str] = None) -> str:
     """Tenant-aware Redis key for a Vertex session→context mapping."""
-    return tenant_keys.key_for_user(_dispatcher_user_id(), "simreg", "context", vertex_session_id)
+    eff_user = _resolve_registry_user(user_id, require_when_saas=False)
+    return tenant_keys.key_for_user(eff_user, "simreg", "context", vertex_session_id)
+
+
+def _l1_key(raw_id: str, user_id: Optional[str] = None) -> str:
+    """Tenant-aware L1 cache key matching Redis key scoping.
+
+    When SAAS_MODE=on and a tenant user_id is resolved, namespaces L1 entries by
+    tenant prefix so in-process multi-tenant calls cannot collide. Collapses
+    to ``raw_id`` when SAAS_MODE=off or no tenant user_id is available.
+    """
+    eff_user = _resolve_registry_user(user_id, require_when_saas=False)
+    if eff_user and tenant_keys._saas_mode_enabled():
+        prefix = tenant_keys._key_prefix_for_user(eff_user)
+        if prefix:
+            return f"{prefix}:{raw_id}"
+    return raw_id
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("simreg: invalid integer for %s=%r; using default %d", name, raw, default)
+        return default
+    if parsed < 1:
+        logger.warning("simreg: non-positive %s=%d; clamping to 1", name, parsed)
+        return 1
+    return parsed
 
 
 # Cap on the in-process L1 caches. Configurable so an operator can
 # raise it without a redeploy if the eviction warning fires steadily.
-_L1_MAX_ENTRIES = max(1, int(os.environ.get("SIMREG_L1_MAX_ENTRIES", "10000")))
+_L1_MAX_ENTRIES = _parse_positive_int_env("SIMREG_L1_MAX_ENTRIES", 10000)
 
 # Process-local L1 caches — populated on register()/lookup(), used as
 # fast-path. OrderedDict + FIFO eviction caps memory growth.
@@ -101,14 +183,12 @@ _local: "OrderedDict[str, str]" = OrderedDict()
 # session-based rendering filters work.
 _context_map: "OrderedDict[str, str]" = OrderedDict()
 
-# Single-flight in-flight maps. Keyed by the lookup id; value is a Future
-# resolved with the Redis read result (or None on miss / error). A second
-# concurrent caller for the same key awaits the existing Future instead of
-# issuing its own Redis read.  Entries are removed in the lookup's finally
-# block so subsequent calls re-check L1 (which may have been warmed in the
-# meantime).
-_inflight_session: dict[str, "asyncio.Future[str | None]"] = {}
-_inflight_context: dict[str, "asyncio.Future[str | None]"] = {}
+# Single-flight in-flight maps. Keyed by (id(loop), lookup_id) so that
+# concurrent L1 misses on different event loops (e.g. FastAPI's main loop
+# vs RedisOrchestratorDispatcher's background loop) never await a Future
+# bound to another loop.
+_inflight_session: dict[tuple[int, str], "asyncio.Future[str | None]"] = {}
+_inflight_context: dict[tuple[int, str], "asyncio.Future[str | None]"] = {}
 
 
 def _set_l1(cache: "OrderedDict[str, str]", key: str, value: str) -> None:
@@ -126,18 +206,28 @@ def _set_l1(cache: "OrderedDict[str, str]", key: str, value: str) -> None:
         logger.debug("simreg: L1 evicted oldest key %s (cap=%d)", evicted, _L1_MAX_ENTRIES)
 
 
-async def register(session_id: str, simulation_id: str) -> None:
+async def register(session_id: str, simulation_id: str, user_id: Optional[str] = None) -> None:
     """Associate a session with a simulation (writes to Redis + L1)."""
-    _set_l1(_local, session_id, simulation_id)
+    eff_user = _resolve_registry_user(user_id, require_when_saas=True)
+    _set_l1(_local, _l1_key(session_id, user_id=eff_user), simulation_id)
     r = get_shared_redis_client()
     if r is not None:
         try:
-            await r.setex(_session_key(session_id), _TTL_SECONDS, simulation_id)  # type: ignore[misc]
+            await r.setex(_session_key(session_id, user_id=eff_user), _TTL_SECONDS, simulation_id)  # type: ignore[misc]
         except Exception:
-            logger.warning("simreg: Redis write failed for %s", session_id, exc_info=True)
+            logger.error("simreg: Redis write failed for %s", session_id, exc_info=True)
 
 
-async def lookup(session_id: str) -> str | None:
+def _consume_unretrieved_exception(fut: "asyncio.Future[str | None]") -> None:
+    """Retrieve exception on abandoned single-flight Futures so asyncio does not log leaks."""
+    if not fut.cancelled():
+        try:
+            fut.exception()
+        except BaseException:
+            pass
+
+
+async def lookup(session_id: str, user_id: Optional[str] = None) -> str | None:
     """Return the simulation_id for a session, or None.
 
     Checks the process-local L1 cache first, then falls back to Redis
@@ -147,31 +237,36 @@ async def lookup(session_id: str) -> str | None:
     Concurrent L1 misses for the same session_id collapse to a single
     Redis GET via the ``_inflight_session`` Future map (single-flight).
     """
+    eff_user = _resolve_registry_user(user_id, require_when_saas=True)
+    l1_key = _l1_key(session_id, user_id=eff_user)
     # L1 fast-path
-    result = _local.get(session_id)
+    result = _local.get(l1_key)
     if result is not None:
         return result
 
-    # Single-flight: if another task is already loading this key, wait for it.
-    pending = _inflight_session.get(session_id)
+    loop = asyncio.get_running_loop()
+    inflight_key = (id(loop), l1_key)
+
+    # Single-flight: if another task on this loop is already loading this key, wait for it.
+    pending = _inflight_session.get(inflight_key)
     if pending is not None:
         return await pending
 
-    # We're the first miss for this key; install a Future for other tasks to await.
-    loop = asyncio.get_running_loop()
+    # We're the first miss for this key on this loop; install a Future for other tasks to await.
     fut: asyncio.Future[str | None] = loop.create_future()
-    _inflight_session[session_id] = fut
+    fut.add_done_callback(_consume_unretrieved_exception)
+    _inflight_session[inflight_key] = fut
     try:
         decoded: str | None = None
         r = get_shared_redis_client()
         if r is not None:
             try:
-                val = await r.get(_session_key(session_id))  # type: ignore[misc]
+                val = await r.get(_session_key(session_id, user_id=eff_user))  # type: ignore[misc]
                 if val is not None:
                     decoded = val if isinstance(val, str) else val.decode()
-                    _set_l1(_local, session_id, decoded)  # warm L1
+                    _set_l1(_local, l1_key, decoded)  # warm L1
             except Exception:
-                logger.warning("simreg: Redis read failed for %s", session_id, exc_info=True)
+                logger.error("simreg: Redis read failed for %s", session_id, exc_info=True)
         if not fut.done():
             fut.set_result(decoded)
         return decoded
@@ -181,26 +276,27 @@ async def lookup(session_id: str) -> str | None:
             fut.set_exception(exc)
         raise
     finally:
-        _inflight_session.pop(session_id, None)
+        _inflight_session.pop(inflight_key, None)
 
 
-async def register_context(vertex_session_id: str, context_id: str) -> None:
+async def register_context(vertex_session_id: str, context_id: str, user_id: Optional[str] = None) -> None:
     """Map a Vertex AI session_id back to the original A2A context_id.
 
     Called by SimulationExecutor after SessionManager creates a session.
     DashLogPlugin calls ``get_context_id()`` to retrieve the original
     spawn session UUID for the protobuf origin field.
     """
-    _set_l1(_context_map, vertex_session_id, context_id)
+    eff_user = _resolve_registry_user(user_id, require_when_saas=True)
+    _set_l1(_context_map, _l1_key(vertex_session_id, user_id=eff_user), context_id)
     r = get_shared_redis_client()
     if r is not None:
         try:
-            await r.setex(_context_key(vertex_session_id), _TTL_SECONDS, context_id)  # type: ignore[misc]
+            await r.setex(_context_key(vertex_session_id, user_id=eff_user), _TTL_SECONDS, context_id)  # type: ignore[misc]
         except Exception:
-            logger.warning("simreg: Redis context write failed for %s", vertex_session_id, exc_info=True)
+            logger.error("simreg: Redis context write failed for %s", vertex_session_id, exc_info=True)
 
 
-async def get_context_id(vertex_session_id: str) -> str | None:
+async def get_context_id(vertex_session_id: str, user_id: Optional[str] = None) -> str | None:
     """Return the original context_id for a Vertex AI session, or None.
 
     Concurrent L1 misses for the same vertex_session_id collapse to a
@@ -209,28 +305,33 @@ async def get_context_id(vertex_session_id: str) -> str | None:
     on the in-process runner_autopilot dispatcher under 1000-runner
     bursts.
     """
-    result = _context_map.get(vertex_session_id)
+    eff_user = _resolve_registry_user(user_id, require_when_saas=True)
+    l1_key = _l1_key(vertex_session_id, user_id=eff_user)
+    result = _context_map.get(l1_key)
     if result is not None:
         return result
 
-    pending = _inflight_context.get(vertex_session_id)
+    loop = asyncio.get_running_loop()
+    inflight_key = (id(loop), l1_key)
+
+    pending = _inflight_context.get(inflight_key)
     if pending is not None:
         return await pending
 
-    loop = asyncio.get_running_loop()
     fut: asyncio.Future[str | None] = loop.create_future()
-    _inflight_context[vertex_session_id] = fut
+    fut.add_done_callback(_consume_unretrieved_exception)
+    _inflight_context[inflight_key] = fut
     try:
         decoded: str | None = None
         r = get_shared_redis_client()
         if r is not None:
             try:
-                val = await r.get(_context_key(vertex_session_id))  # type: ignore[misc]
+                val = await r.get(_context_key(vertex_session_id, user_id=eff_user))  # type: ignore[misc]
                 if val is not None:
                     decoded = val if isinstance(val, str) else val.decode()
-                    _set_l1(_context_map, vertex_session_id, decoded)
+                    _set_l1(_context_map, l1_key, decoded)
             except Exception:
-                logger.warning("simreg: Redis context read failed for %s", vertex_session_id, exc_info=True)
+                logger.error("simreg: Redis context read failed for %s", vertex_session_id, exc_info=True)
         if not fut.done():
             fut.set_result(decoded)
         return decoded
@@ -239,50 +340,85 @@ async def get_context_id(vertex_session_id: str) -> str | None:
             fut.set_exception(exc)
         raise
     finally:
-        _inflight_context.pop(vertex_session_id, None)
+        _inflight_context.pop(inflight_key, None)
 
 
-async def unregister(session_id: str) -> None:
+async def unregister(session_id: str, user_id: Optional[str] = None) -> None:
     """Remove a session from the registry (L1 + Redis)."""
-    _local.pop(session_id, None)
-    _context_map.pop(session_id, None)  # M12: prevent memory leak
+    eff_user = _resolve_registry_user(user_id, require_when_saas=True)
+    l1_key = _l1_key(session_id, user_id=eff_user)
+    _local.pop(l1_key, None)
+    _context_map.pop(l1_key, None)  # M12: prevent memory leak
     r = get_shared_redis_client()
     if r is not None:
         try:
             await r.delete(  # type: ignore[misc]
-                _session_key(session_id),
-                _context_key(session_id),
+                _session_key(session_id, user_id=eff_user),
+                _context_key(session_id, user_id=eff_user),
             )
         except Exception:
-            logger.warning("simreg: Redis unregister failed for %s", session_id, exc_info=True)
+            logger.error("simreg: Redis unregister failed for %s", session_id, exc_info=True)
 
 
-async def clear() -> None:
-    """Remove all entries (for environment_reset)."""
-    _local.clear()
-    _context_map.clear()
-    # Drop in-flight Futures too; the lookups that own them will detect their
-    # entry is gone but still resolve their own Future, which is fine for any
-    # already-awaiting callers (they get whatever the original Redis read
-    # returned, post-clear).
-    for fut in _inflight_session.values():
-        if not fut.done():
-            fut.cancel()
-    _inflight_session.clear()
+async def clear(user_id: Optional[str] = None) -> None:
+    """Remove entries (for environment_reset)."""
+    eff_user = _resolve_registry_user(user_id, require_when_saas=False)
+    saas_on = tenant_keys._saas_mode_enabled()
 
-    for fut in _inflight_context.values():
-        if not fut.done():
-            fut.cancel()
-    _inflight_context.clear()
+    if saas_on and not eff_user:
+        logger.warning("simreg: skipping global clear in SAAS_MODE=on without user_id")
+        return
+
+    def _cancel_future_safely(fut: "asyncio.Future[str | None]") -> None:
+        if fut.done():
+            return
+        try:
+            fut_loop = fut.get_loop()
+            try:
+                cur_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                cur_loop = None
+            if fut_loop is cur_loop or not fut_loop.is_running():
+                fut.cancel()
+            else:
+                fut_loop.call_soon_threadsafe(fut.cancel)
+        except Exception:
+            logger.debug("simreg: failed to cancel in-flight future during clear()", exc_info=True)
+
+    if saas_on:
+        tenant_prefix = f"{tenant_keys._key_prefix_for_user(eff_user)}:"
+        for k in [k for k in list(_local.keys()) if k.startswith(tenant_prefix)]:
+            _local.pop(k, None)
+        for k in [k for k in list(_context_map.keys()) if k.startswith(tenant_prefix)]:
+            _context_map.pop(k, None)
+        for ik in [ik for ik in list(_inflight_session.keys()) if ik[1].startswith(tenant_prefix)]:
+            fut = _inflight_session.pop(ik, None)
+            if fut is not None:
+                _cancel_future_safely(fut)
+        for ik in [ik for ik in list(_inflight_context.keys()) if ik[1].startswith(tenant_prefix)]:
+            fut = _inflight_context.pop(ik, None)
+            if fut is not None:
+                _cancel_future_safely(fut)
+    else:
+        _local.clear()
+        _context_map.clear()
+        for fut in list(_inflight_session.values()):
+            _cancel_future_safely(fut)
+        _inflight_session.clear()
+
+        for fut in list(_inflight_context.values()):
+            _cancel_future_safely(fut)
+        _inflight_context.clear()
+
     r = get_shared_redis_client()
     if r is not None:
         try:
             # Build per-tenant scan patterns so SAAS_MODE=on with
-            # DISPATCHER_USER_ID only clears that tenant's namespace, while
+            # user_id / DISPATCHER_USER_ID only clears that tenant's namespace, while
             # SAAS_MODE=off still scans the legacy un-prefixed keyspace.
             scan_patterns = (
-                f"{_session_key('')}*",
-                f"{_context_key('')}*",
+                f"{_session_key('', user_id=eff_user)}:*",
+                f"{_context_key('', user_id=eff_user)}:*",
             )
             for pattern in scan_patterns:
                 batch: list = []

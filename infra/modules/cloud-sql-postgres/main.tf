@@ -95,11 +95,14 @@ resource "google_sql_user" "agent_engine_sa" {
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 
-# IAM database users for human developers
+# IAM database users for human developers (filter to user: prefix, matching alloydb module)
 resource "google_sql_user" "iam_users" {
-  for_each = toset(var.iam_users)
+  for_each = toset([
+    for m in var.iam_users : trimprefix(m, "user:")
+    if startswith(m, "user:")
+  ])
 
-  name     = split(":", each.value)[1]
+  name     = each.value
   instance = google_sql_database_instance.postgres.name
   project  = var.project_id
   type     = "CLOUD_IAM_USER"

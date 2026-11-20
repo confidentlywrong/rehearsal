@@ -25,6 +25,7 @@ Dependencies: Python stdlib only (heapq, math, random, json).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -141,6 +142,55 @@ _DEFAULT_WEATHER: Dict[str, Any] = {
 }
 
 
+def _finite_float(value: Any, default: float) -> float:
+    """Coerce *value* to a finite float, rejecting bools and non-finite inputs."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        try:
+            fv = float(value)
+            return fv if math.isfinite(fv) else default
+        except OverflowError:
+            return default
+    if isinstance(value, str):
+        try:
+            fv = float(value.strip())
+            return fv if math.isfinite(fv) else default
+        except (ValueError, OverflowError):
+            return default
+    return default
+
+
+def _sanitize_weather(weather: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a validated, finite weather modifier dict with safe defaults."""
+    if not isinstance(weather, dict) or not weather:
+        return dict(_DEFAULT_WEATHER)
+    out: Dict[str, Any] = {
+        "time_factor": max(0.0, _finite_float(weather.get("time_factor", 1.0), 1.0)),
+        "capital_factor": max(0.0, _finite_float(weather.get("capital_factor", 1.0), 1.0)),
+        "morale_factor": max(0.0, _finite_float(weather.get("morale_factor", 1.0), 1.0)),
+        "resistance_delta": _finite_float(weather.get("resistance_delta", 0.0), 0.0),
+        "distance_factor": max(0.0, _finite_float(weather.get("distance_factor", 1.0), 1.0)),
+        "perturbation_range": (0.7, 1.5),
+    }
+    raw_pr = weather.get("perturbation_range")
+    if isinstance(raw_pr, (list, tuple)) and len(raw_pr) == 2:
+        lo = _finite_float(raw_pr[0], -1.0)
+        hi = _finite_float(raw_pr[1], -1.0)
+        if 0.0 < lo <= hi:
+            out["perturbation_range"] = (lo, hi)
+    if "condition" in weather:
+        out["condition"] = str(weather["condition"])
+    return out
+
+
+def _safe_finite_vec(raw: Any) -> List[float]:
+    """Convert a sequence into finite floats (replacing invalid/non-finite entries with 0.0)."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [_finite_float(v, 0.0) for v in raw]
+
+
 def _friction_multiplier(travel_minutes: Optional[float]) -> float:
     """Convert travel duration to an engagement friction multiplier.
 
@@ -148,10 +198,16 @@ def _friction_multiplier(travel_minutes: Optional[float]) -> float:
     coalitions (multiplier < 1).  Long travel times indicate organizational
     silos requiring deliberate bridging effort (multiplier > 1).
     """
-    if travel_minutes is None:
+    if travel_minutes is None or isinstance(travel_minutes, bool) or not isinstance(travel_minutes, (int, float)):
+        return 1.0
+    try:
+        minutes = float(travel_minutes)
+    except OverflowError:
+        return 1.0
+    if not math.isfinite(minutes):
         return 1.0
     for threshold, factor in _FRICTION_THRESHOLDS:
-        if travel_minutes <= threshold:
+        if minutes <= threshold:
             return factor
     return _FRICTION_MAX
 
@@ -163,12 +219,23 @@ def _friction_multiplier(travel_minutes: Optional[float]) -> float:
 
 def _influence_distance(s1: Dict, s2: Dict) -> float:
     """Compute influence distance in [0, 1] between two stakeholders."""
-    a1 = s1["affinity"]
-    a2 = s2["affinity"]
-    dot = sum(x * y for x, y in zip(a1, a2))
-    n1 = math.sqrt(sum(x * x for x in a1))
-    n2 = math.sqrt(sum(y * y for y in a2))
-    cosine = dot / (n1 * n2) if n1 * n2 > 0 else 0.0
+    a1 = _safe_finite_vec(s1.get("affinity"))
+    a2 = _safe_finite_vec(s2.get("affinity"))
+    k = min(len(a1), len(a2))
+    a1 = a1[:k]
+    a2 = a2[:k]
+    m1 = max((abs(x) for x in a1), default=0.0)
+    m2 = max((abs(y) for y in a2), default=0.0)
+    if m1 == 0.0 or m2 == 0.0:
+        cosine = 0.0
+    else:
+        u1 = [x / m1 for x in a1]
+        u2 = [y / m2 for y in a2]
+        dot = sum(x * y for x, y in zip(u1, u2))
+        n1 = math.sqrt(sum(x * x for x in u1))
+        n2 = math.sqrt(sum(y * y for y in u2))
+        denom_norm = n1 * n2
+        cosine = (dot / denom_norm) if (denom_norm > 0.0 and math.isfinite(denom_norm)) else 0.0
 
     p1 = set(s1.get("domain_principles", []))
     p2 = set(s2.get("domain_principles", []))
@@ -201,17 +268,17 @@ def _edge_cost(
     base = _influence_distance(source, target)
 
     # Apply weather distance factor (fog amplifies perceived gaps)
-    w = weather or _DEFAULT_WEATHER
-    base *= w.get("distance_factor", 1.0)
+    w = _sanitize_weather(weather)
+    base *= w["distance_factor"]
 
     owb = resources.get("OWB", {})
-    owb_crit = owb.get("critical_threshold", 25)
-    owb_init = owb.get("initial", 70)
+    owb_crit = _finite_float(owb.get("critical_threshold", 25), 25.0)
+    owb_init = _finite_float(owb.get("initial", 70), 70.0)
     owb_mult = 1.5 if owb_init < owb_crit else 1.0
 
-    resist = target.get("initial_resistance", 0.3)
-    influence = target.get("initial_influence", 0.5)
-    sentiment = target.get("initial_sentiment", 0.5)
+    resist = _finite_float(target.get("initial_resistance", 0.3), 0.3)
+    influence = _finite_float(target.get("initial_influence", 0.5), 0.5)
+    sentiment = _finite_float(target.get("initial_sentiment", 0.5), 0.5)
 
     time_cost = base * (1 + resist) * owb_mult
     capital_cost = base * resist * (1 - influence) * owb_mult
@@ -229,18 +296,27 @@ def _edge_cost(
         tgt_role = target.get("role", "")
         key = f"{src_role}→{tgt_role}"
         reverse_key = f"{tgt_role}→{src_role}"
-        minutes = travel_matrix.get(key) or travel_matrix.get(reverse_key)
+        if key in travel_matrix:
+            minutes = travel_matrix[key]
+        elif reverse_key in travel_matrix:
+            minutes = travel_matrix[reverse_key]
+        else:
+            minutes = None
         friction = _friction_multiplier(minutes)
         time_cost *= friction
         capital_cost *= friction
         morale_cost *= friction
 
     # --- Organizational Terrain: Weather Pressure (Weather API) ---
-    time_cost *= w.get("time_factor", 1.0)
-    capital_cost *= w.get("capital_factor", 1.0)
-    morale_cost *= w.get("morale_factor", 1.0)
+    time_cost *= w["time_factor"]
+    capital_cost *= w["capital_factor"]
+    morale_cost *= w["morale_factor"]
 
-    return (time_cost, capital_cost, morale_cost)
+    return (
+        time_cost if math.isfinite(time_cost) else 0.0,
+        capital_cost if math.isfinite(capital_cost) else 0.0,
+        morale_cost if math.isfinite(morale_cost) else 0.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -286,17 +362,18 @@ def _interpolate_stakeholder(
     index: int,
 ) -> Dict:
     """Create a synthetic intermediate stakeholder derived from *parent*."""
-    noise = [rng.gauss(0, 0.08) for _ in parent["affinity"]]
-    affinity = [max(0.0, min(1.0, a + n)) for a, n in zip(parent["affinity"], noise)]
+    parent_affinity = _safe_finite_vec(parent.get("affinity"))
+    noise = [rng.gauss(0, 0.08) for _ in parent_affinity]
+    affinity = [max(0.0, min(1.0, a + n)) for a, n in zip(parent_affinity, noise)]
     return {
         "role": f"synthetic_{parent['role']}_{index}",
         "tier": tier,
         "persona": f"Synthetic intermediary derived from {parent['role']}.",
         "domain_principles": list(parent.get("domain_principles", [])),
         "affinity": affinity,
-        "initial_sentiment": max(0.0, min(1.0, parent.get("initial_sentiment", 0.5) + rng.gauss(0, 0.1))),
-        "initial_resistance": max(0.0, min(1.0, parent.get("initial_resistance", 0.3) + rng.gauss(0, 0.1))),
-        "initial_influence": max(0.0, min(1.0, parent.get("initial_influence", 0.5) * 0.7)),
+        "initial_sentiment": max(0.0, min(1.0, _finite_float(parent.get("initial_sentiment", 0.5), 0.5) + rng.gauss(0, 0.1))),
+        "initial_resistance": max(0.0, min(1.0, _finite_float(parent.get("initial_resistance", 0.3), 0.3) + rng.gauss(0, 0.1))),
+        "initial_influence": max(0.0, min(1.0, _finite_float(parent.get("initial_influence", 0.5), 0.5) * 0.7)),
     }
 
 
@@ -337,10 +414,19 @@ def _scale_influence_graph(
 def _power_iteration(matrix: List[List[float]], iterations: int = 50) -> List[float]:
     """Find dominant eigenvector of a square matrix via power iteration."""
     n = len(matrix)
+    if n == 0:
+        return []
+    m_scale = max((abs(_finite_float(matrix[i][j], 0.0)) for i in range(n) for j in range(n)), default=0.0)
+    if m_scale == 0.0 or not math.isfinite(m_scale):
+        return [1.0 / math.sqrt(n)] * n
+    scaled_mat = [[_finite_float(matrix[i][j], 0.0) / m_scale for j in range(n)] for i in range(n)]
     v = [1.0 / math.sqrt(n)] * n
     for _ in range(iterations):
-        mv = [sum(matrix[i][j] * v[j] for j in range(n)) for i in range(n)]
-        norm = math.sqrt(sum(x * x for x in mv)) or 1.0
+        mv = [sum(scaled_mat[i][j] * v[j] for j in range(n)) for i in range(n)]
+        sq_sum = sum(x * x for x in mv)
+        norm = math.sqrt(sq_sum) if math.isfinite(sq_sum) else 0.0
+        if norm == 0.0 or not math.isfinite(norm):
+            break
         v = [x / norm for x in mv]
     return v
 
@@ -348,19 +434,45 @@ def _power_iteration(matrix: List[List[float]], iterations: int = 50) -> List[fl
 def _deflate(matrix: List[List[float]], eigvec: List[float]) -> List[List[float]]:
     """Deflate matrix by removing component along eigvec."""
     n = len(matrix)
-    mv = [sum(matrix[i][j] * eigvec[j] for j in range(n)) for i in range(n)]
-    eigenvalue = sum(mv[i] * eigvec[i] for i in range(n))
-    return [[matrix[i][j] - eigenvalue * eigvec[i] * eigvec[j] for j in range(n)] for i in range(n)]
+    if n == 0:
+        return []
+    m_scale = max((abs(_finite_float(matrix[i][j], 0.0)) for i in range(n) for j in range(n)), default=0.0)
+    if m_scale == 0.0 or not math.isfinite(m_scale):
+        return [[0.0] * n for _ in range(n)]
+    scaled_mat = [[_finite_float(matrix[i][j], 0.0) / m_scale for j in range(n)] for i in range(n)]
+    mv = [sum(scaled_mat[i][j] * eigvec[j] for j in range(n)) for i in range(n)]
+    eigenvalue_scaled = sum(mv[i] * eigvec[i] for i in range(n))
+    if not math.isfinite(eigenvalue_scaled):
+        return [list(row) for row in matrix]
+    return [
+        [
+            (scaled_mat[i][j] - eigenvalue_scaled * eigvec[i] * eigvec[j]) * m_scale
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
 
 
 def _project_to_geo(stakeholders: List[Dict]) -> List[Tuple[float, float]]:
     """Map stakeholder affinity vectors to [lon, lat] within Las Vegas bounds."""
-    affinities = [s["affinity"] for s in stakeholders]
-    n = len(affinities)
-    d = len(affinities[0])
+    if not stakeholders:
+        return []
+    raw_affinities = [_safe_finite_vec(s.get("affinity")) for s in stakeholders]
+    n = len(raw_affinities)
+    d = max((len(a) for a in raw_affinities), default=0)
+    b = LAS_VEGAS_BOUNDS
+    center = ((b["lon_min"] + b["lon_max"]) / 2, (b["lat_min"] + b["lat_max"]) / 2)
+    if d == 0:
+        return [center] * n
 
-    mean = [sum(a[j] for a in affinities) / n for j in range(d)]
-    centered = [[a[j] - mean[j] for j in range(d)] for a in affinities]
+    affinities = [a + [0.0] * (d - len(a)) for a in raw_affinities]
+    scale = max((abs(v) for row in affinities for v in row), default=0.0)
+    if scale == 0.0 or not math.isfinite(scale):
+        return [center] * n
+    normed = [[v / scale for v in row] for row in affinities]
+
+    mean = [sum(a[j] for a in normed) / n for j in range(d)]
+    centered = [[a[j] - mean[j] for j in range(d)] for a in normed]
 
     # Covariance matrix (d×d)
     cov = [[sum(centered[i][j] * centered[i][k] for i in range(n)) / max(n, 1) for k in range(d)] for j in range(d)]
@@ -373,14 +485,19 @@ def _project_to_geo(stakeholders: List[Dict]) -> List[Tuple[float, float]]:
 
     xs = [c[0] for c in coords]
     ys = [c[1] for c in coords]
-    x_range = max(xs) - min(xs) or 1.0
-    y_range = max(ys) - min(ys) or 1.0
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    x_range = max_x - min_x
+    y_range = max_y - min_y
+    if not math.isfinite(x_range) or x_range == 0.0:
+        x_range = 1.0
+    if not math.isfinite(y_range) or y_range == 0.0:
+        y_range = 1.0
 
-    b = LAS_VEGAS_BOUNDS
     return [
         (
-            b["lon_min"] + (x - min(xs)) / x_range * (b["lon_max"] - b["lon_min"]),
-            b["lat_min"] + (y - min(ys)) / y_range * (b["lat_max"] - b["lat_min"]),
+            max(b["lon_min"], min(b["lon_max"], b["lon_min"] + (x - min_x) / x_range * (b["lon_max"] - b["lon_min"]))),
+            max(b["lat_min"], min(b["lat_max"], b["lat_min"] + (y - min_y) / y_range * (b["lat_max"] - b["lat_min"]))),
         )
         for x, y in coords
     ]
@@ -401,7 +518,9 @@ def _project_to_real_venues(
     Falls back to the Las Vegas bounding-box center when a role has no
     matching venue entry.
     """
-    rng = random.Random(hash(tuple(sorted(venue_coords.keys()))))
+    seed_material = "|".join(str(k) for k in sorted(venue_coords.keys())).encode("utf-8")
+    venue_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+    rng = random.Random(venue_seed)
     b = LAS_VEGAS_BOUNDS
     center = (
         (b["lon_min"] + b["lon_max"]) / 2,
@@ -414,9 +533,17 @@ def _project_to_real_venues(
             coords.append(venue_coords[role])
         else:
             # Synthetic stakeholders: derive parent role and jitter.
-            # Synthetic roles follow the pattern "synthetic_<parent>_<index>".
-            parts = role.split("_")
-            parent_role = parts[1] if len(parts) >= 3 and parts[0] == "synthetic" else role
+            # Synthetic roles follow "synthetic_<parent>_<index>" (and tier-3
+            # frontline nodes follow "synthetic_synthetic_<parent>_<i1>_<i2>").
+            parent_role = role
+            while parent_role.startswith("synthetic_"):
+                stripped = parent_role[len("synthetic_") :]
+                head, sep, tail = stripped.rpartition("_")
+                if sep and tail.isdigit():
+                    parent_role = head
+                else:
+                    parent_role = stripped
+                    break
             base = venue_coords.get(parent_role, center)
             jitter = (rng.gauss(0, 0.002), rng.gauss(0, 0.002))
             coords.append((base[0] + jitter[0], base[1] + jitter[1]))
@@ -518,14 +645,16 @@ def _consensus_score(path: List[int], stakeholders: List[Dict]) -> float:
     """Estimate consensus achieved: weighted sum of aligned stakeholders."""
     if not path:
         return 0.0
-    total_influence = sum(s.get("initial_influence", 0.5) for s in stakeholders)
-    if total_influence == 0:
+    total_influence = sum(max(0.0, _finite_float(s.get("initial_influence", 0.5), 0.5)) for s in stakeholders)
+    if total_influence == 0 or not math.isfinite(total_influence):
         return 0.0
     aligned = sum(
-        stakeholders[i].get("initial_influence", 0.5) * (1 - stakeholders[i].get("initial_resistance", 0.5) * 0.5)
+        max(0.0, _finite_float(stakeholders[i].get("initial_influence", 0.5), 0.5))
+        * (1 - max(0.0, min(1.0, _finite_float(stakeholders[i].get("initial_resistance", 0.5), 0.5))) * 0.5)
         for i in path
     )
-    return min(1.0, aligned / total_influence)
+    score = aligned / total_influence
+    return max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
 
 
 def _validate_pathway(
@@ -569,8 +698,8 @@ def _generate_consensus_pathway(
     ordered += remaining
 
     # Perturbation range from weather (high wind → wider variance)
-    w = weather or _DEFAULT_WEATHER
-    p_range = tuple(w.get("perturbation_range", (0.7, 1.5)))
+    w = _sanitize_weather(weather)
+    p_range = w["perturbation_range"]
 
     # Build path greedily through ordered waypoints using Dijkstra segments
     full_path: List[int] = [ordered[0]]
@@ -881,7 +1010,7 @@ def generate_consensus_pathway(
     marathon_tools = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(marathon_tools)
 
-    with open(network_path, "r") as f:
+    with open(network_path, "r", encoding="utf-8") as f:
         geojson_data = f.read()
 
     data = json.loads(geojson_data)
@@ -919,11 +1048,12 @@ def generate_consensus_pathway(
     scaled = _scale_influence_graph(stakeholders, runner_count, rng)
 
     # Apply weather resistance delta globally (storm makes everyone defensive)
-    w = weather_modifier or _DEFAULT_WEATHER
-    r_delta = w.get("resistance_delta", 0.0)
+    w = _sanitize_weather(weather_modifier)
+    r_delta = w["resistance_delta"]
     if r_delta:
         for s in scaled:
-            s["initial_resistance"] = min(1.0, s.get("initial_resistance", 0.3) + r_delta)
+            base_res = _finite_float(s.get("initial_resistance", 0.3), 0.3)
+            s["initial_resistance"] = max(0.0, min(1.0, base_res + r_delta))
 
     best_path, best_cost = _generate_best_pathway(
         scaled,
@@ -934,7 +1064,7 @@ def generate_consensus_pathway(
         base_seed=seed,
         venue_types=venue_types,
         travel_matrix=travel_matrix,
-        weather=weather_modifier,
+        weather=w,
     )
     score = _consensus_score(best_path, scaled)
 
@@ -995,17 +1125,25 @@ def generate_consensus_pathway(
         "features": mapped_features,
     }
 
+    pathway_nodes = [
+        {
+            "role": scaled[n]["role"],
+            "tier": scaled[n]["tier"],
+            "coordinates": list(
+                route_coords[int(i * (len(route_coords) - 1) / max(1, len(best_path) - 1))]
+            ),
+            **(
+                {"venue_type": venue_types[scaled[n]["role"]]}
+                if venue_types and scaled[n]["role"] in venue_types
+                else {}
+            ),
+        }
+        for i, n in enumerate(best_path)
+    ]
+
     return {
-        "pathway": [
-            {
-                "role": scaled[n]["role"],
-                "tier": scaled[n]["tier"],
-                "coordinates": list(
-                    route_coords[int(i * (len(route_coords) - 1) / max(1, len(best_path) - 1))]
-                ),
-            }
-            for i, n in enumerate(best_path)
-        ],
+        "pathway": pathway_nodes,
+        "waypoints": pathway_nodes,
         "cost": {"time": round(best_cost[0], 2), "capital": round(best_cost[1], 2), "morale": round(best_cost[2], 2)},
         "consensus_score": score,
         "geojson": geojson,
@@ -1050,11 +1188,12 @@ def _generate_consensus_pathway_pca(
     scaled = _scale_influence_graph(stakeholders, runner_count, rng)
 
     # Apply weather resistance delta globally (storm makes everyone defensive)
-    w = weather_modifier or _DEFAULT_WEATHER
-    r_delta = w.get("resistance_delta", 0.0)
+    w = _sanitize_weather(weather_modifier)
+    r_delta = w["resistance_delta"]
     if r_delta:
         for s in scaled:
-            s["initial_resistance"] = min(1.0, s.get("initial_resistance", 0.3) + r_delta)
+            base_res = _finite_float(s.get("initial_resistance", 0.3), 0.3)
+            s["initial_resistance"] = max(0.0, min(1.0, base_res + r_delta))
 
     # Geo projection: real venues when available, PCA fallback otherwise
     geo_coords = _project_to_real_venues(scaled, venue_coords) if venue_coords else _project_to_geo(scaled)
@@ -1068,7 +1207,7 @@ def _generate_consensus_pathway_pca(
         base_seed=resolved_seed,
         venue_types=venue_types,
         travel_matrix=travel_matrix,
-        weather=weather_modifier,
+        weather=w,
     )
     geojson = _pathway_to_geojson(
         path,
@@ -1085,9 +1224,24 @@ def _generate_consensus_pathway_pca(
         runner_count,
         "active" if any([venue_types, travel_matrix, weather_modifier]) else "baseline",
     )
+    pathway_nodes = [
+        {
+            "role": scaled[n]["role"],
+            "tier": scaled[n]["tier"],
+            "coordinates": list(geo_coords[n]),
+            **(
+                {"venue_type": venue_types[scaled[n]["role"]]}
+                if venue_types and scaled[n]["role"] in venue_types
+                else {}
+            ),
+        }
+        for n in path
+    ]
     return {
         "geojson": geojson,
         "path": path,
-        "cost": {"time": cost[0], "capital": cost[1], "morale": cost[2]},
+        "pathway": pathway_nodes,
+        "waypoints": pathway_nodes,
+        "cost": {"time": round(cost[0], 2), "capital": round(cost[1], 2), "morale": round(cost[2], 2)},
         "consensus_score": _consensus_score(path, scaled),
     }

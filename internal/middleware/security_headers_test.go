@@ -253,3 +253,17 @@ func TestSecurityHeaders_HandlerRespects200Path(t *testing.T) {
 		t.Errorf("status = %d, want 200", w.Code)
 	}
 }
+
+func TestSecurityHeadersFromEnv_StripsControlCharsFromCSPOverride(t *testing.T) {
+	t.Setenv("CSP_OVERRIDE", "default-src 'self'\r\n\t\x01\x7f; img-src https:")
+	cfg := SecurityHeadersFromEnv()
+	if strings.ContainsAny(cfg.ContentSecurityPolicy, "\r\n\t\x01\x7f") {
+		t.Fatalf("CSP_OVERRIDE retained control chars: %q", cfg.ContentSecurityPolicy)
+	}
+	if cfg.ContentSecurityPolicy != "default-src 'self'; img-src https:" {
+		t.Fatalf("unexpected cleaned CSP: %q", cfg.ContentSecurityPolicy)
+	}
+	if got := stripASCIIControlChars("a\x00b\x1fc\x7fd"); got != "abcd" {
+		t.Fatalf("stripASCIIControlChars failed on NUL/control bytes: %q", got)
+	}
+}

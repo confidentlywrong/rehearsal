@@ -125,8 +125,6 @@ type LoadState = 'loading' | 'ready' | 'unavailable';
               <span>{{ formatCap(p.monthly_token_cap) }} tokens/mo</span>
               <span aria-hidden="true">·</span>
               <span>{{ formatCap(p.max_concurrent_runs) }} concurrent</span>
-              <span aria-hidden="true">·</span>
-              <span>{{ formatCap(p.max_users) }} users</span>
             </div>
             <p class="billing-page__plan-desc">{{ p.description }}</p>
             <button

@@ -66,6 +66,7 @@ export interface AiEngineStatus {
   endpoint: string;
   text_model: string;
   embed_model: string;
+  can_configure?: boolean;
   cloud_project_configured: boolean;
   connected: boolean;
   protocol?: string;
@@ -110,7 +111,7 @@ export class AiEngineService {
       ? `/api/v1/settings/ai?endpoint=${encodeURIComponent(trimmed)}`
       : '/api/v1/settings/ai';
     const resp = await fetch(url, {
-      credentials: 'include',
+      credentials: 'same-origin',
     });
     if (!resp.ok) {
       throw new Error(await this.extractError(resp, 'Failed to load AI Engine status'));
@@ -121,7 +122,7 @@ export class AiEngineService {
   async saveConfig(payload: AiConfigPayload): Promise<AiEngineStatus> {
     const resp = await fetch('/api/v1/settings/ai', {
       method: 'PUT',
-      credentials: 'include',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
@@ -134,7 +135,7 @@ export class AiEngineService {
   async testConnection(endpoint: string, autoStart = true): Promise<AiTestResponse> {
     const resp = await fetch('/api/v1/settings/ai/test', {
       method: 'POST',
-      credentials: 'include',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpoint, auto_start: autoStart }),
     });
@@ -147,7 +148,7 @@ export class AiEngineService {
   async startDaemon(endpoint: string): Promise<AiEngineStatus> {
     const resp = await fetch('/api/v1/settings/ai/start', {
       method: 'POST',
-      credentials: 'include',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ endpoint }),
     });
@@ -160,7 +161,7 @@ export class AiEngineService {
   async pullModel(model: string, endpoint: string): Promise<AiPullResponse> {
     const resp = await fetch('/api/v1/settings/ai/pull', {
       method: 'POST',
-      credentials: 'include',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model, endpoint }),
     });
@@ -174,6 +175,9 @@ export class AiEngineService {
     try {
       const body = (await resp.json()) as { error?: string };
       if (body?.error) {
+        if (body.error === 'superadmin_required') {
+          return 'Only workspace administrators can modify AI Engine settings.';
+        }
         return body.error;
       }
     } catch {

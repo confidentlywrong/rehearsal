@@ -26,6 +26,8 @@ No LLM dependency — pure deterministic graph propagation.
 """
 
 import logging
+import math
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -39,20 +41,37 @@ DEFAULT_PROPAGATION_RATE = 0.1
 DEFAULT_DECAY_PER_TICK = 0.005
 
 
+def _finite_float(value: Any, default: float) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _clamp01(value: Any, default: float = 0.0) -> float:
+    """Coerce to finite float and clamp to [0.0, 1.0]."""
+    return min(1.0, max(0.0, _finite_float(value, default)))
+
+
 class InfluenceEdge:
     """A directed influence relationship between two Echoes."""
 
     __slots__ = ("source", "target", "weight", "original_weight")
 
     def __init__(self, source: str, target: str, weight: float):
-        self.source = source
-        self.target = target
-        self.weight = min(1.0, max(0.0, weight))
+        self.source = str(source) if source is not None else ""
+        self.target = str(target) if target is not None else ""
+        self.weight = _clamp01(weight, 0.0)
         self.original_weight = self.weight
 
     def decay(self, amount: float = DEFAULT_DECAY_PER_TICK) -> None:
         """Apply alliance fatigue — weight decays toward zero."""
-        self.weight = max(0.0, self.weight - amount)
+        safe_amount = max(0.0, _finite_float(amount, DEFAULT_DECAY_PER_TICK))
+        self.weight = max(0.0, min(1.0, self.weight - safe_amount))
 
     def to_dict(self) -> dict:
         return {
@@ -64,8 +83,12 @@ class InfluenceEdge:
 
     @classmethod
     def from_dict(cls, d: dict) -> "InfluenceEdge":
-        edge = cls(d["source"], d["target"], d.get("original_weight", d["weight"]))
-        edge.weight = d["weight"]
+        src = d.get("source") or ""
+        dst = d.get("target") or ""
+        raw_weight = d.get("weight", 0.0)
+        raw_orig = d.get("original_weight", raw_weight)
+        edge = cls(str(src), str(dst), _clamp01(raw_orig, 0.0))
+        edge.weight = _clamp01(raw_weight, 0.0)
         return edge
 
 
@@ -110,20 +133,35 @@ class InfluenceNetwork:
             Dict of role → sentiment delta to apply.
         """
         deltas: dict[str, float] = {}
+        if not echo_sentiments:
+            return deltas
+
+        safe_rate = max(0.0, _finite_float(propagation_rate, DEFAULT_PROPAGATION_RATE))
 
         for source_role, edges in self._adjacency.items():
-            src_sentiment = echo_sentiments.get(source_role)
-            if src_sentiment is None:
+            raw_src = echo_sentiments.get(source_role)
+            if raw_src is None or isinstance(raw_src, bool):
+                continue
+            src_sentiment = _finite_float(raw_src, float("nan"))
+            if not math.isfinite(src_sentiment):
                 continue
 
             for edge in edges:
-                dst_sentiment = echo_sentiments.get(edge.target)
-                if dst_sentiment is None:
+                if edge.weight <= 0.0:
+                    continue
+                raw_dst = echo_sentiments.get(edge.target)
+                if raw_dst is None or isinstance(raw_dst, bool):
+                    continue
+                dst_sentiment = _finite_float(raw_dst, float("nan"))
+                if not math.isfinite(dst_sentiment):
                     continue
 
                 # Sentiment flows from source to target
-                raw_delta = (src_sentiment - dst_sentiment) * edge.weight * propagation_rate
-                deltas[edge.target] = deltas.get(edge.target, 0.0) + raw_delta
+                raw_delta = (src_sentiment - dst_sentiment) * edge.weight * safe_rate
+                if not math.isfinite(raw_delta):
+                    raw_delta = 0.0
+                updated = deltas.get(edge.target, 0.0) + raw_delta
+                deltas[edge.target] = updated if math.isfinite(updated) else 0.0
 
         return deltas
 
@@ -136,11 +174,20 @@ class InfluenceNetwork:
         return [e.to_dict() for e in self.edges]
 
     @classmethod
-    def from_dict_list(cls, edges: list[dict]) -> "InfluenceNetwork":
-        return cls([InfluenceEdge.from_dict(e) for e in edges])
+    def from_dict_list(cls, edges: list[dict] | None) -> "InfluenceNetwork":
+        if not edges:
+            return cls()
+        parsed: list[InfluenceEdge] = []
+        for e in edges:
+            if not isinstance(e, dict):
+                continue
+            edge = InfluenceEdge.from_dict(e)
+            if edge.source and edge.target:
+                parsed.append(edge)
+        return cls(parsed)
 
     @classmethod
-    def from_quest_config(cls, quest_edges: list[dict] | None) -> "InfluenceNetwork":
+    def from_quest_config(cls, quest_edges: list[Any] | None) -> "InfluenceNetwork":
         """Build network from quest YAML ``influence_edges`` list.
 
         Expected format:
@@ -152,7 +199,7 @@ class InfluenceNetwork:
         ```
 
         Args:
-            quest_edges: List of edge dicts from quest YAML.
+            quest_edges: List of edge dicts or config objects from quest YAML.
 
         Returns:
             InfluenceNetwork instance.
@@ -161,11 +208,23 @@ class InfluenceNetwork:
             return cls()
         edges = []
         for e in quest_edges:
-            src = e.get("source", e.get("from", ""))
-            dst = e.get("target", e.get("to", ""))
-            weight = float(e.get("weight", 0.5))
-            if src and dst:
-                edges.append(InfluenceEdge(src, dst, weight))
+            if isinstance(e, dict):
+                src = e.get("source") if e.get("source") is not None else e.get("from", "")
+                dst = e.get("target") if e.get("target") is not None else e.get("to", "")
+                raw_weight = e.get("weight", 0.5)
+            else:
+                src = getattr(e, "source", None)
+                if src is None:
+                    src = getattr(e, "from_role", None) or ""
+                dst = getattr(e, "target", None)
+                if dst is None:
+                    dst = getattr(e, "to_role", None) or ""
+                raw_weight = getattr(e, "weight", 0.5)
+            weight = _clamp01(raw_weight, 0.5)
+            src_str = str(src).strip() if src is not None else ""
+            dst_str = str(dst).strip() if dst is not None else ""
+            if src_str and dst_str:
+                edges.append(InfluenceEdge(src_str, dst_str, weight))
         return cls(edges)
 
     def __len__(self) -> int:
@@ -189,7 +248,13 @@ def build_default_influence_edges(echo_configs: list[dict]) -> list[dict]:
     Returns:
         List of edge dicts suitable for InfluenceNetwork.from_quest_config.
     """
-    roles = {e.get("role", ""): e for e in echo_configs if e.get("role")}
+    if not echo_configs:
+        return []
+    roles = {
+        e["role"]: e
+        for e in echo_configs
+        if isinstance(e, dict) and isinstance(e.get("role"), str) and e.get("role")
+    }
     edges: list[dict] = []
 
     # Known relationship patterns

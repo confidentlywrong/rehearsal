@@ -22,7 +22,7 @@ when to accelerate, when to hydrate, how to respond to boosts.
 
 The model backend is configurable via the ``RUNNER_MODEL`` environment variable:
 
-- **Gemini** (default): ``gemini-3.1-flash-lite-preview`` via Vertex AI
+- **Gemini** (default): ``gemini-3.5-flash-lite`` via Vertex AI
 - **Ollama** (local): ``ollama_chat/gemma4:e2b`` via litellm
 - **vLLM** (GKE): ``openai/gemma-4-E4B-it`` via litellm + ``VLLM_API_URL``
 
@@ -47,6 +47,7 @@ from google.genai import types  # noqa: E402
 
 from agents.utils import config, load_agent_skills  # noqa: E402
 from agents.utils.communication_plugin import SimulationCommunicationPlugin  # noqa: E402
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model  # noqa: E402
 from agents.utils.retry import resilient_model  # noqa: E402
 from agents.utils.deployment import create_a2a_deployment  # noqa: E402
 from agents.utils.factory import create_simulation_runner  # noqa: E402
@@ -77,8 +78,8 @@ RUNNER_SUPPRESSED_EVENTS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
-RUNNER_MODEL = (os.environ.get("RUNNER_MODEL") or "").strip() or DEFAULT_MODEL
+DEFAULT_MODEL = DEFAULT_FLASH_LITE_MODEL
+RUNNER_MODEL = get_model("RUNNER_MODEL", DEFAULT_MODEL)
 
 # True when the selected model is served by Google's Gemini API / Vertex AI.
 _is_gemini = RUNNER_MODEL.startswith("gemini")
@@ -99,7 +100,7 @@ if not _is_gemini:
 # ---------------------------------------------------------------------------
 # The A2A identity advertised by this agent. Can be overridden via env var
 # (e.g. "runner_gke") so the same image works in multiple environments.
-AGENT_NAME = os.environ.get("AGENT_NAME", "runner")
+AGENT_NAME = (os.environ.get("AGENT_NAME") or "").strip() or "runner"
 
 # Load tool functions from the agent's skills/ directory
 _skills, skill_tools = load_agent_skills(str(pathlib.Path(__file__).parent))
@@ -198,19 +199,8 @@ async def _runner_before_agent_callback(callback_context):
     """
     state = callback_context.state
 
-    # --- Initialize runner on first tick ---
-    if state.get("velocity") is None:
-        session = getattr(callback_context, "session", None)
-        sid = getattr(session, "id", "unknown") if session else "unknown"
-        runner_count = state.get("runner_count", 10)
-        initialize_runner(state, sid, runner_count)
-        logger.info(
-            "Runner initialized: velocity=%.4f target_finish=%.1f min",
-            state["velocity"],
-            state.get("target_finish_minutes", 0),
-        )
-
     # --- Extract tick params from user message into state ---
+    incoming_tick_msg: dict | None = None
     content = getattr(callback_context, "user_content", None)
     if content and hasattr(content, "parts") and content.parts:
         for part in content.parts:
@@ -220,17 +210,50 @@ async def _runner_before_agent_callback(callback_context):
             try:
                 msg = json.loads(text)
                 if isinstance(msg, dict) and msg.get("event") == "tick":
-                    state["_tick_params"] = {
-                        "tick": msg.get("tick", 0),
-                        "minutes_per_tick": msg.get("minutes_per_tick", 0.0),
-                        "elapsed_minutes": msg.get("elapsed_minutes", 0.0),
-                        "race_distance_mi": msg.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
-                        "collector_buffer_key": msg.get("collector_buffer_key", ""),
-                        "station_index": msg.get("station_index", {}),
-                    }
+                    incoming_tick_msg = msg
                     break
             except (json.JSONDecodeError, TypeError):
                 pass
+
+    # --- Initialize runner on first tick ---
+    if state.get("velocity") is None:
+        session = getattr(callback_context, "session", None)
+        sid = getattr(session, "id", None) or "unknown" if session else "unknown"
+        runner_count = state.get("runner_count")
+        if runner_count is None and incoming_tick_msg is not None:
+            runner_count = incoming_tick_msg.get("runner_count")
+        if (
+            not isinstance(runner_count, int)
+            or isinstance(runner_count, bool)
+            or runner_count <= 0
+        ):
+            logger.warning(
+                "CRITICAL: runner_count is missing/invalid (%r) for session %s, defaulting to 1",
+                runner_count,
+                sid,
+            )
+            runner_count = 1
+        initialize_runner(state, sid, runner_count)
+        logger.info(
+            "Runner initialized: velocity=%.4f target_finish=%.1f min",
+            state["velocity"],
+            state.get("target_finish_minutes", 0),
+        )
+
+    if incoming_tick_msg is not None:
+        raw_stations = incoming_tick_msg.get("station_index")
+        raw_cbk = incoming_tick_msg.get("collector_buffer_key")
+        raw_sim_id = incoming_tick_msg.get("simulation_id")
+        state["_tick_params"] = {
+            "tick": incoming_tick_msg.get("tick", 0),
+            "minutes_per_tick": incoming_tick_msg.get("minutes_per_tick", 0.0),
+            "elapsed_minutes": incoming_tick_msg.get("elapsed_minutes", 0.0),
+            "race_distance_mi": incoming_tick_msg.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
+            "collector_buffer_key": raw_cbk if isinstance(raw_cbk, str) else "",
+            "station_index": raw_stations if isinstance(raw_stations, dict) else {},
+            "weather_modifier": incoming_tick_msg.get("weather_modifier", 1.0),
+            "simulation_id": raw_sim_id if isinstance(raw_sim_id, str) else "",
+        }
 
     return None  # Continue to LLM
 
@@ -303,11 +326,19 @@ runner_a2a_agent, agent_card = create_a2a_deployment(
     agent_getter=get_agent,
 )
 
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("RUNNER_PORT", "").strip()
+        or "9108"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("RUNNER_PORT", "9108")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info("Starting runner LLM agent server on port %d", port)
 

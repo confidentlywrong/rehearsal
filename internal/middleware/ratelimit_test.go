@@ -415,3 +415,88 @@ func TestRateLimitFromEnv_IgnoresGarbage(t *testing.T) {
 		t.Errorf("garbage env should yield zero-value opts, got %+v", opts)
 	}
 }
+
+func TestRateLimitScript_CorruptHashAndTinyRefillTTLClamp(t *testing.T) {
+	client, teardown := newMiniredisClient(t)
+	defer teardown()
+	ctx := context.Background()
+
+	// Partial hash with missing 'u' field must not fail Lua arithmetic.
+	if err := client.HSet(ctx, "rl:corrupt", "t", "2").Err(); err != nil {
+		t.Fatalf("HSet: %v", err)
+	}
+	ok, _, err := runRateLimitForTest(ctx, client, "rl:corrupt", 5, 1e-12, 1_000_000_000, 1)
+	if err != nil {
+		t.Fatalf("corrupt hash + tiny refill errored: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected first call on reset corrupt bucket to succeed")
+	}
+	ttl, err := client.TTL(ctx, "rl:corrupt").Result()
+	if err != nil {
+		t.Fatalf("TTL: %v", err)
+	}
+	if ttl <= 0 || ttl.Seconds() > 2592000 {
+		t.Fatalf("TTL=%v must be clamped to <= 30d (2592000s)", ttl)
+	}
+}
+
+func TestRateLimit_SkipPathsRejectsTraversalAndNilURLDoesNotPanic(t *testing.T) {
+	client, teardown := newMiniredisClient(t)
+	defer teardown()
+
+	r := gin.New()
+	r.Use(withTenant("acme"))
+	r.Use(RateLimit(RateLimitOptions{
+		Client:          client,
+		Capacity:        1,
+		RefillPerSecond: 0.001,
+		SkipPaths:       []string{"/api/v1/usage"},
+	}))
+	r.GET("/api/v1/usage", func(c *gin.Context) { c.Status(http.StatusOK) })
+	r.GET("/api/v1/expensive", func(c *gin.Context) { c.Status(http.StatusOK) })
+	r.NoRoute(func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// First request to /api/v1/usage/../expensive cleans to /api/v1/expensive and consumes the single token.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/usage/../expensive", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("first traversal call should consume token (200), got %d", w.Code)
+	}
+
+	// Second request MUST NOT skip rate limit and must return 429.
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/usage/../expensive", nil))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("traversal /api/v1/usage/../expensive must NOT skip rate limit; want 429, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// Direct middleware invocation with c.Request.URL == nil must not panic.
+	mw := RateLimit(RateLimitOptions{
+		Client:          client,
+		Capacity:        1,
+		RefillPerSecond: 0.001,
+		SkipPaths:       []string{"/api/v1/usage"},
+	})
+	wNil := httptest.NewRecorder()
+	cNil, _ := gin.CreateTestContext(wNil)
+	reqNil := httptest.NewRequest(http.MethodGet, "/api/v1/expensive", nil)
+	reqNil = reqNil.WithContext(account.WithContext(reqNil.Context(), account.UserContext{UserID: "nil-url-user"}))
+	reqNil.URL = nil
+	cNil.Request = reqNil
+	mw(cNil)
+	if cNil.IsAborted() {
+		t.Fatalf("first nil-URL request should be allowed, got aborted status=%d", wNil.Code)
+	}
+
+	wNil2 := httptest.NewRecorder()
+	cNil2, _ := gin.CreateTestContext(wNil2)
+	reqNil2 := httptest.NewRequest(http.MethodGet, "/api/v1/expensive", nil)
+	reqNil2 = reqNil2.WithContext(account.WithContext(reqNil2.Context(), account.UserContext{UserID: "nil-url-user"}))
+	reqNil2.URL = nil
+	cNil2.Request = reqNil2
+	mw(cNil2)
+	if !cNil2.IsAborted() || wNil2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second nil-URL request should be rate limited (429), got aborted=%v status=%d", cNil2.IsAborted(), wNil2.Code)
+	}
+}

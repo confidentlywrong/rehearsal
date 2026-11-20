@@ -35,10 +35,10 @@ Design choices (locked 2026-06-28 by the operator):
   Step-0 graph + the user's prompt and supplies the personas directly.
   Same lightweight pattern as ``emit_stakeholder_graph`` /
   ``emit_stakeholder_reactions``.
-* **No persistence yet.** Personas live in ``tool_context.state`` and
-  stream out via the tool_end payload. Postgres tables come later when
-  Artifact 2 (multi-tick simulation) lands and persistence starts to
-  matter. **Explicit GCP-friendly choice: no Neo4j required.**
+* **Persisted via artifact bundle.** Personas live in ``tool_context.state``,
+  stream out via the tool_end payload, and are persisted to Postgres/AlloyDB
+  via ``store_stakeholder_artifacts()`` / ``store_scenario()``.
+  **Explicit GCP-friendly choice: no Neo4j required.**
 * **Invented data is allowed here** — this tool lives in the simulation
   layer. The analytic stakeholder_graph stays untouched.
 * **One persona per Actor/Group node.** Beliefs, Frictions, and
@@ -53,11 +53,17 @@ Downstream consumers:
 
 from __future__ import annotations
 
-import json
 import logging
+import math
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_optional_rationale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +117,15 @@ def _validate_float_range(idx: int, field: str, value: Any, lo: float, hi: float
     if isinstance(value, str):
         try:
             value = float(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             pass
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, f"personas[{idx}].{field} must be a number in [{lo}, {hi}]"
-    v = float(value)
-    if v < lo or v > hi:
+    try:
+        v = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None, f"personas[{idx}].{field} must be a finite number in [{lo}, {hi}]"
+    if not math.isfinite(v) or v < lo or v > hi:
         return None, f"personas[{idx}].{field}={v} outside [{lo}, {hi}]"
     return v, None
 
@@ -186,9 +195,8 @@ def _validate_persona(idx: int, persona: Any, known_ids: set[str]) -> tuple[dict
         )
 
     concerns, err = _validate_concerns(idx, persona.get("primary_concerns"))
-    if err:
-        return None, err
-    assert concerns is not None
+    if err or concerns is None:
+        return None, err or "invalid primary_concerns"
 
     if not isinstance(inferred, bool):
         return None, f"personas[{idx}].inferred must be a boolean"
@@ -242,15 +250,9 @@ async def emit_stakeholder_personas(
         On failure: ``{"status": "error", "field": "...", "message": "..."}``.
     """
     # 1. Parse the JSON envelope (lenient: accept a dict directly).
-    if isinstance(personas_json, dict):
-        data = personas_json
-    else:
-        try:
-            data = json.loads(personas_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(personas_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Validate top-level shape.
     personas_raw = data.get("personas")
@@ -282,9 +284,8 @@ async def emit_stakeholder_personas(
     seen_sids: set[str] = set()
     for i, raw in enumerate(personas_raw):
         normalized, err = _validate_persona(i, raw, known_ids)
-        if err:
-            return _err(err, field="personas")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid persona", field="personas")
         sid = normalized["stakeholder_id"]
         if sid in seen_sids:
             return _err(
@@ -295,14 +296,18 @@ async def emit_stakeholder_personas(
         personas.append(normalized)
 
     # 5. Optional rationale.
-    rationale = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale, str) and rationale.strip():
-        rationale_clean = rationale.strip()[:500]
+    rationale_clean, rationale_err = validate_optional_rationale(data.get("rationale"), max_chars=500)
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
     payload: dict[str, Any] = {"personas": personas}
     if rationale_clean:
         payload["rationale"] = rationale_clean
+
+    clean_payload, json_err = sanitize_json_value(payload, path=STATE_KEY)
+    if json_err or not isinstance(clean_payload, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    payload = clean_payload
 
     # 6. Stash for downstream simulation tools.
     try:

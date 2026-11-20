@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: register/unregister with AgentRuntimeControlsService for UserMenu runtime controls, clear loading state on failed cached stream starts, and bind spawned live sessionId when switching from Cached to Live mode.
  */
 
 import {
@@ -37,7 +40,7 @@ import { OrganizerComponent } from '../Organizer/organizer.component';
 import { SimulationPanelComponent } from './SimulationPanel/simulation-panel.component';
 
 import { DEMO_CONFIG } from '../../../../demo-config';
-import { AgentMessageType } from '../../../../types';
+import { AgentMessageType, type ChatAgent } from '../../../../types';
 import { DemoService } from '../../../DemoOverlay/demo.service';
 import { simulationState } from '../../../../simulation-state';
 
@@ -65,6 +68,10 @@ import {
 import { AgentChatPanelComponent } from './agent-chat-panel/agent-chat-panel.component';
 import { AgentPanelHeaderComponent } from './agent-panel-header/agent-panel-header.component';
 import { AgentChatComposerComponent } from './agent-chat-composer/agent-chat-composer.component';
+import {
+  type AgentRuntimeControls,
+  AgentRuntimeControlsService,
+} from './agent-runtime-controls.service';
 
 export type { PathEntry } from './agent-screen.types';
 
@@ -103,7 +110,8 @@ export class AgentScreenComponent
   AgentScreenHost,
   AgentChatDisplayHost,
   AgentCachedGatewayReplayHost,
-  AgentWindowEventsScreenBridge {
+  AgentWindowEventsScreenBridge,
+  AgentRuntimeControls {
   @ViewChild('fileInput') fileInputRef!: ElementRef<HTMLInputElement>;
   @ViewChild('debugChatScroll') debugChatScrollRef!: ElementRef<HTMLDivElement>;
   @ViewChild(AgentChatComposerComponent) private chatComposer?: AgentChatComposerComponent;
@@ -113,6 +121,7 @@ export class AgentScreenComponent
   readonly panelTab = inject(AgentPanelTabExpansionService);
   readonly gatewayAgents = inject(AgentGatewayAgentsService);
   private readonly windowEvents = inject(AgentWindowEventsService);
+  private readonly runtimeControls = inject(AgentRuntimeControlsService);
 
   get showSimPanel(): boolean {
     return this.simulation.showSimPanel;
@@ -164,19 +173,34 @@ export class AgentScreenComponent
   private _isAgentWorking = false;
   private dotsTimer?: ReturnType<typeof setInterval>;
   private dotsState = 0;
+  private destroyed = false;
+  private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
+  private segmentThumbRafIds: number[] = [];
 
   private _forceLoading = false;
+
+  private scheduleTimeout(fn: () => void, ms: number): void {
+    if (this.destroyed) return;
+    const handle = setTimeout(() => {
+      this.pendingTimeouts.delete(handle);
+      if (!this.destroyed) fn();
+    }, ms);
+    this.pendingTimeouts.add(handle);
+  }
 
   get isAgentWorking(): boolean {
     return this._isAgentWorking || this._forceLoading;
   }
   set isAgentWorking(val: boolean) {
     this._isAgentWorking = val;
-    this.cdr.markForCheck();
-    if (val && !this.dotsTimer) {
+    if (!this.destroyed) {
+      this.cdr.markForCheck();
+    }
+    if (val && !this.dotsTimer && !this.destroyed) {
       this.dotsState = 1;
       this.loadingMessage = 'Thinking.';
       this.dotsTimer = setInterval(() => {
+        if (this.destroyed) return;
         this.dotsState = (this.dotsState % 3) + 1;
         this.loadingMessage = 'Thinking' + '.'.repeat(this.dotsState);
         this.cdr.markForCheck();
@@ -290,6 +314,7 @@ export class AgentScreenComponent
     if (next === this.cachedMessageTimeScale) return;
     this.cachedMessageTimeScale = next;
     this.cdr.markForCheck();
+    this.notifyRuntimeControlsUpdate();
   }
 
   async setSecureMode(value: boolean) {
@@ -302,6 +327,7 @@ export class AgentScreenComponent
     this._secureMode = value;
     this.cdr.markForCheck();
     this.scheduleSegmentThumbsLayout();
+    this.notifyRuntimeControlsUpdate();
   }
 
   setPlannerSecurity(secure: boolean) {
@@ -318,10 +344,22 @@ export class AgentScreenComponent
     if (value && !this.activeDemoHasRecordingConfig) return;
     this.runCachedMessages = value;
     this.scheduleSegmentThumbsLayout();
-    // When switching to Live, spawn the agent session if not already active.
-    // In Cached mode onInitAgent is a no-op, so the gateway session is null.
-    if (!value && this.currentAgent) {
-      await this.onInitAgent(this.currentAgent.agentType);
+    this.notifyRuntimeControlsUpdate();
+    // When switching to Live, stop any in-flight cached replay and spawn the
+    // agent session if not already active (in Cached mode onInitAgent is a no-op).
+    if (!value) {
+      this.stopCachedDataStream();
+      const agentType = (this.currentAgent?.agentType ??
+        DEMO_CONFIG[this.demoService.activeDemo()]?.agent) as ChatAgent | undefined;
+      if (agentType) {
+        await this.onInitAgent(agentType);
+        if (this.destroyed) return;
+        const sid = this.agents[agentType];
+        if (sid) {
+          this.currentAgent = { agentType, sessionId: sid };
+        }
+        this.cdr.markForCheck();
+      }
     }
     if (options?.showModeFeedback) {
       this.demoService.showModeSwitchFeedback(value);
@@ -338,19 +376,31 @@ export class AgentScreenComponent
     this._cloudAssistMode = value;
     this.cdr.markForCheck();
     this.scheduleSegmentThumbsLayout();
+    this.notifyRuntimeControlsUpdate();
   }
 
   applyDemoSessionCloudAssistShell(on: boolean): void {
     this._cloudAssistMode = on;
+    this.notifyRuntimeControlsUpdate();
   }
 
   applyDemoSessionSecureShell(on: boolean): void {
     this._secureMode = on;
+    this.notifyRuntimeControlsUpdate();
+  }
+
+  notifyRuntimeControlsUpdate(): void {
+    this.runtimeControls.notifyUpdate();
   }
 
   onCachedReplayComplete(): void {
     this.isAgentWorking = false;
     this.currentDemoCachedRunCount++;
+  }
+
+  onCachedReplayAbort(): void {
+    this.isAgentWorking = false;
+    this.cdr.markForCheck();
   }
 
   onSettingsButtonClick(): void {
@@ -383,11 +433,16 @@ export class AgentScreenComponent
   }
 
   scheduleSegmentThumbsLayout(): void {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
+    if (this.destroyed) return;
+    const outer = requestAnimationFrame(() => {
+      if (this.destroyed) return;
+      const inner = requestAnimationFrame(() => {
+        if (this.destroyed) return;
         this.layoutSegmentThumbs();
       });
+      this.segmentThumbRafIds.push(inner);
     });
+    this.segmentThumbRafIds.push(outer);
   }
 
   private layoutSegmentThumbs(): void {
@@ -448,15 +503,16 @@ export class AgentScreenComponent
     effect(() => {
       const n = this.demoService.cachedMessagesToggle();
       if (n === 0) return;
-      void this.setRunCachedMessages(!this.runCachedMessages, {
-        showModeFeedback: true,
+      untracked(() => {
+        void this.setRunCachedMessages(!this.runCachedMessages, {
+          showModeFeedback: true,
+        });
       });
     });
 
     effect(() => {
       this.resetCounter = this.demoService.reset();
       void this.demoService.activeDemo();
-      void this.demoService.cachedMessagesToggle();
       untracked(() => {
         this.demoSession.runDemoLifecycle(this).catch(err => {
           console.error('Demo lifecycle error:', err);
@@ -468,12 +524,13 @@ export class AgentScreenComponent
   ngOnInit(): void {
     this.simulation.connect(this.cdr);
     this.panelTab.connect(this.cdr, () => {
-      setTimeout(() => this.chatComposer?.autoResize(), 0);
+      this.scheduleTimeout(() => this.chatComposer?.autoResize(), 0);
     });
     this.gatewayAgents.connect(this.cdr);
     this.windowEvents.bind(this);
     this.windowEvents.seedGatewayDumpFlag();
     this.windowEvents.start();
+    this.runtimeControls.register(this);
 
     if (new URLSearchParams(window.location.search).get('loading') === 'true') {
       this._forceLoading = true;
@@ -482,29 +539,73 @@ export class AgentScreenComponent
 
     this.subs.push(
       this.gateway.chat$.subscribe((msg: ChatMessage) => {
+        if (this.destroyed) return;
         const organizerGuid = this.gateway.getOrganizerGuid();
         if (!organizerGuid || msg.guid !== organizerGuid) {
           this.chatMessages = [...this.chatMessages, msg];
         }
         this.processMessageForDisplay(msg);
+        if (
+          msg.msgType === AgentMessageType.MODEL_ERROR &&
+          (!msg.guid || msg.speaker === 'gateway' || msg.speaker === 'system')
+        ) {
+          this.isAgentWorking = false;
+        }
         this.cdr.markForCheck();
         if (this.chatAtBottom) {
-          setTimeout(() => this.scrollChatToBottom(), 0);
+          this.scheduleTimeout(() => this.scrollChatToBottom(), 0);
         }
       }),
     );
+
+    if (this.gateway.agents$) {
+      this.subs.push(
+        this.gateway.agents$.subscribe((sessions) => {
+          if (this.destroyed) return;
+          const activeIds = new Set(sessions.map((s) => s.guid));
+          if (
+            this.currentAgent?.sessionId &&
+            !activeIds.has(this.currentAgent.sessionId) &&
+            !this.runCachedMessages
+          ) {
+            this.currentAgent = null;
+            this.isAgentWorking = false;
+            this.cdr.markForCheck();
+          } else if (sessions.length === 0 && !this.runCachedMessages && this._isAgentWorking) {
+            this.isAgentWorking = false;
+            this.cdr.markForCheck();
+          }
+        }),
+      );
+    }
   }
 
   ngOnDestroy(): void {
-    if (this.dotsTimer) clearInterval(this.dotsTimer);
+    this.destroyed = true;
+    this.demoSession.dispose();
+    this.runtimeControls.unregister(this);
+    for (const t of this.pendingTimeouts) {
+      clearTimeout(t);
+    }
+    this.pendingTimeouts.clear();
+    for (const rafId of this.segmentThumbRafIds) {
+      cancelAnimationFrame(rafId);
+    }
+    this.segmentThumbRafIds = [];
+    if (this.dotsTimer) {
+      clearInterval(this.dotsTimer);
+      this.dotsTimer = undefined;
+    }
     if (this.errorMessageInterval !== null) {
       window.clearInterval(this.errorMessageInterval);
       this.errorMessageInterval = null;
     }
-    this.panelTab.clearAnimationTimers();
+    this.chatDisplay.dispose(this);
+    this.panelTab.dispose();
     this.windowEvents.stop();
     this.simulation.dispose();
     this.subs.forEach((s) => s.unsubscribe());
+    this.subs = [];
     simulationState.deactivate();
     this.removeAllActiveAgents();
     this.stopCachedDataStream();
@@ -516,6 +617,10 @@ export class AgentScreenComponent
 
   stopCachedDataStream(): void {
     this.cachedGatewayReplay.stop();
+    this.isAgentWorking = false;
+    if (!this.destroyed) {
+      this.cdr.markForCheck();
+    }
   }
 
   onSyncPayload(d: SyncPayload): void {
@@ -524,8 +629,8 @@ export class AgentScreenComponent
   }
 
   applyCameraIntroComplete(): void {
-    // Camera intro complete — placeholder route was already imported during
-    // demo init (agent-demo-session.service.ts). No need to re-dispatch.
+    // Camera intro complete — route viewport state is cleared on demo init
+    // until a live route/graph payload arrives from the gateway.
   }
 
   handleRaceStarted(): void {
@@ -588,30 +693,46 @@ export class AgentScreenComponent
     if (!text || !this.canSend || this.isAgentWorking) return;
 
     if (this.runCachedMessages) {
-      const activeDemoKey = this.demoService.activeDemo();
-      const activeDemo = DEMO_CONFIG[activeDemoKey] as any;
-
       const message = {
         guid: '',
         speaker: 'You',
         isUser: true,
         msgType: AgentMessageType.SYSTEM,
-        text: activeDemo.promptPlaceholder,
+        text,
         timestamp: new Date(),
       };
 
       this.chatMessages = [message];
       this.processMessageForDisplay(message);
 
+      this.isAgentWorking = true;
+      this.chatInput = '';
+      this.chatComposer?.resetHeight();
+      this.cdr.markForCheck();
+
       void this.runCachedDataStream();
-    } else {
-      const targetGuid = this.agents[this.currentAgent!.agentType];
-      if (!targetGuid) {
-        console.warn('Agent spawn in-flight or failed; ignoring send.');
-        return;
-      }
-      this.gateway.sendBroadcast(text, [targetGuid]);
+      return;
     }
+
+    const targetGuid = this.agents[this.currentAgent!.agentType];
+    if (!targetGuid) {
+      console.warn('Agent spawn in-flight or failed; ignoring send.');
+      return;
+    }
+    this.gateway.sendBroadcast(text, [targetGuid]).catch((err) => {
+      console.error('Failed to send broadcast:', err);
+      if (this.destroyed) return;
+      this.isAgentWorking = false;
+      this.processMessageForDisplay({
+        guid: targetGuid,
+        speaker: 'System',
+        isUser: false,
+        msgType: AgentMessageType.MODEL_ERROR,
+        text: err instanceof Error && err.message ? err.message : 'Failed to send message to agent.',
+        timestamp: new Date(),
+      });
+      this.cdr.markForCheck();
+    });
 
     this.isAgentWorking = true;
     this.chatInput = '';

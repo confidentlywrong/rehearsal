@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: reject non-finite floats in retry env parsing.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,10 +22,11 @@ with exponential backoff.
 
 Usage in LlmAgent definitions::
 
+    from agents.utils.models import DEFAULT_PLANNER_MODEL
     from agents.utils.retry import resilient_model
 
     agent = LlmAgent(
-        model=resilient_model("gemini-3-flash-preview"),
+        model=resilient_model(DEFAULT_PLANNER_MODEL),
         ...
     )
 
@@ -41,6 +44,7 @@ Environment variables (all optional):
     GEMINI_RETRY_MAX_DELAY     Maximum delay between retries (default: 60.0)
 """
 
+import math
 import os
 
 from google.genai import types
@@ -67,6 +71,8 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         value = float(raw)
     except ValueError:
         raise ValueError(f"{name}={raw!r} is not a valid number") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name}={raw!r} must be a finite number")
     if value < minimum:
         raise ValueError(f"{name}={value} must be >= {minimum}")
     return value
@@ -99,7 +105,7 @@ def resilient_model(
     """Create a GlobalGemini instance with retry protection.
 
     Args:
-        model_name: Gemini model identifier (e.g. "gemini-3-flash-preview").
+        model_name: Gemini model identifier (e.g. ``DEFAULT_PLANNER_MODEL``).
         retry_options: Override retry config. Defaults to default_retry_options().
         location: Vertex AI API location. Defaults to "global" (required for
             Gemini 3 preview models). Set to a region like "us-central1" for

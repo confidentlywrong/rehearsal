@@ -72,7 +72,9 @@ def create_agent_app(
 
     # CORS — read allowed origins from env var (comma-separated).
     # Defaults to "*" for local dev parity; cloud sets specific origins.
-    cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+    cors_origins = [
+        origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",") if origin.strip()
+    ] or ["*"]
     api_app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,

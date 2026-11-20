@@ -69,13 +69,16 @@ class TenantSafeLoopAgent(LoopAgent):
         if session_state is None:
             return self.max_iterations
         raw = session_state.get(key) if hasattr(session_state, "get") else None
-        if raw in (None, 0, "0", ""):
+        if raw in (None, 0, "0", "") or isinstance(raw, bool):
             return self.max_iterations
         try:
-            return int(raw)
+            value = int(raw)
         except (TypeError, ValueError):
             logger.warning("TenantSafeLoopAgent[%s]: ignoring non-int %s=%r", self.name, key, raw)
             return self.max_iterations
+        if value <= 0:
+            return self.max_iterations
+        return value
 
     async def _run_async_impl(  # type: ignore[override]
         self, ctx: InvocationContext

@@ -219,3 +219,73 @@ def test_ensure_runner_count_from_scenario_upgrades_default_to_designed():
     assert upgraded["runner_count"] == 10000
 
 
+@pytest.mark.asyncio
+async def test_submit_plan_propagates_simdata_store_error():
+    """SimDataError on store_simulation_data must return an explicit error dict."""
+    from agents.utils.simdata import SimDataError
+
+    ctx = _make_tool_context()
+    with patch(
+        "agents.utils.simdata.store_simulation_data",
+        new=AsyncMock(side_effect=SimDataError("redis write timeout")),
+    ):
+        result = await submit_plan_to_simulator(action="execute", message="Run", tool_context=ctx)
+    assert result["status"] == "error"
+    assert "redis write timeout" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_submit_plan_propagates_simdata_load_error():
+    """SimDataError on load_simulation_data must return explicit error instead of empty success."""
+    from agents.utils.simdata import SimDataError
+
+    ctx = _make_tool_context()
+    ctx.state["echo_voice_log"] = [{"tick": 1}]
+    with (
+        patch("agents.utils.communication.call_agent", new=AsyncMock(return_value={"status": "success", "response": "OK"})),
+        patch("agents.utils.simdata.store_simulation_data", new=AsyncMock(return_value=True)),
+        patch("agents.utils.simdata.load_simulation_data", new=AsyncMock(side_effect=SimDataError("redis read failed"))),
+    ):
+        result = await submit_plan_to_simulator(action="execute", message="Run", tool_context=ctx)
+    assert result["status"] == "error"
+    assert "redis read failed" in result["message"]
+    assert ctx.state["simulation_result"] is None
+    assert ctx.state["echo_voice_log"] == []
+
+
+def test_load_default_route_geojson_no_hardcoded_cache_and_validates_env(tmp_path, monkeypatch):
+    """_load_default_route_geojson returns None unless state/scenario/env provides it, and errors on bad env path."""
+    from agents.leadership_planner_with_eval.tools import _load_default_route_geojson
+
+    monkeypatch.delenv("DEFAULT_ROUTE_GEOJSON_PATH", raising=False)
+    assert _load_default_route_geojson() is None
+
+    state_route = {"type": "FeatureCollection", "features": []}
+    ctx = MagicMock()
+    ctx.state = {"route_geojson": state_route}
+    assert _load_default_route_geojson(tool_context=ctx) == state_route
+
+    missing = tmp_path / "does_not_exist.json"
+    monkeypatch.setenv("DEFAULT_ROUTE_GEOJSON_PATH", str(missing))
+    with pytest.raises(FileNotFoundError):
+        _load_default_route_geojson()
+
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setenv("DEFAULT_ROUTE_GEOJSON_PATH", str(bad_json))
+    with pytest.raises(ValueError):
+        _load_default_route_geojson()
+
+
+@pytest.mark.asyncio
+async def test_start_simulation_uses_default_runner_count():
+    """start_simulation uses DEFAULT_RUNNER_COUNT when scenario omits stakeholder_count."""
+    from agents.utils.sim_defaults import DEFAULT_RUNNER_COUNT
+
+    ctx = _make_tool_context()
+    ctx.state["leadership_scenario"] = {"title": "No Count"}
+    res = await start_simulation(tool_context=ctx)
+    assert res["status"] == "ready"
+    assert ctx.state["expected_stakeholder_count"] == DEFAULT_RUNNER_COUNT
+
+

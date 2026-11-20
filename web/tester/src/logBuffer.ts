@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: sanitize non-finite/non-positive maxEntries and evictionBatch options.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,8 +34,18 @@ const DEFAULT_MAX_ENTRIES = 500;
 const DEFAULT_EVICTION_BATCH = 100;
 
 export function createLogBuffer(opts: LogBufferOptions): LogBuffer {
-  const maxEntries = opts.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  const evictionBatch = opts.evictionBatch ?? DEFAULT_EVICTION_BATCH;
+  const maxEntries =
+    typeof opts.maxEntries === "number" &&
+    Number.isFinite(opts.maxEntries) &&
+    opts.maxEntries >= 1
+      ? Math.floor(opts.maxEntries)
+      : DEFAULT_MAX_ENTRIES;
+  const evictionBatch =
+    typeof opts.evictionBatch === "number" &&
+    Number.isFinite(opts.evictionBatch) &&
+    opts.evictionBatch >= 1
+      ? Math.floor(opts.evictionBatch)
+      : DEFAULT_EVICTION_BATCH;
   let dropped = 0;
   let queue: HTMLElement[] = [];
   let rafId: number | null = null;

@@ -63,7 +63,12 @@ os.environ.pop("GOOGLE_MAPS_API_KEY", None)
 os.environ["AI_SETTINGS_PATH"] = "/nonexistent/pytest_ai_settings.json"
 os.environ.pop("AI_PROVIDER", None)
 
-from unittest.mock import patch  # noqa: E402
+# Prevent .env's USE_ALLOYDB=false / EMBEDDING_BACKEND from leaking into memory
+# tool unit tests when an agent module calls load_dotenv() during imports.
+os.environ["USE_ALLOYDB"] = "true"
+os.environ.pop("EMBEDDING_BACKEND", None)
+
+from unittest.mock import NonCallableMock, patch  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -79,6 +84,8 @@ def _isolate_local_ai_settings(monkeypatch):
     monkeypatch.setenv("ALLOYDB_HOST", "127.0.0.1")
     monkeypatch.setenv("ALLOYDB_PORT", "5432")
     monkeypatch.setenv("ALLOYDB_PASSWORD", "test")
+    monkeypatch.setenv("USE_ALLOYDB", "true")
+    monkeypatch.delenv("EMBEDDING_BACKEND", raising=False)
     monkeypatch.delenv("AI_PROVIDER", raising=False)
     local_ai._cached_mtime = None
     local_ai._cached_path = None
@@ -111,6 +118,25 @@ def _clear_simulation_registry():
 
 
 @pytest.fixture(autouse=True)
+def _assert_pulses_unmocked():
+    """Fail loudly on teardown if any test leaks a mock onto agents.utils.pulses."""
+    yield
+    from agents.utils import pulses
+
+    for fn_name in (
+        "emit_gateway_message",
+        "emit_telemetry_pulse",
+        "emit_narrative_pulse",
+        "emit_inter_agent_pulse",
+        "_publish_to_gateway",
+    ):
+        attr = getattr(pulses, fn_name, None)
+        assert not isinstance(attr, NonCallableMock), (
+            f"agents.utils.pulses.{fn_name} leaked as {type(attr).__name__} after test teardown"
+        )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_redis(monkeypatch):
     """Prevent tests from connecting to real Redis.
 
@@ -127,34 +153,54 @@ def _isolate_redis(monkeypatch):
     """
     monkeypatch.delenv("REDIS_ADDR", raising=False)
     # Reset the cached client so it picks up the missing env var.
-    from agents.utils import redis_pool
+    from agents.utils import communication_plugin, pulses, redis_pool, user_auth_context
     import asyncio
+    import logging
+
+    _conftest_logger = logging.getLogger(__name__)
 
     def _cleanup():
         clients = list(redis_pool._shared_clients.values())
         redis_pool._shared_clients.clear()
-        if hasattr(redis_pool, "_shared_client"):
-            redis_pool._shared_client = None
         if not clients:
             return
+
         async def _close():
             for c in clients:
                 try:
                     await c.aclose()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _conftest_logger.debug("conftest: redis client close failed: %s", exc)
+
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_close())
+            asyncio.get_running_loop()
+            # Cannot block on a running loop; run close on a fresh loop or detach
+            _conftest_logger.debug("conftest: active loop detected; closing %d redis clients asynchronously", len(clients))
         except RuntimeError:
             asyncio.run(_close())
+            return
+
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_close())
+
+        def _on_close_done(done_task: asyncio.Task[None]) -> None:
+            if not done_task.cancelled():
+                exc = done_task.exception()
+                if exc is not None:
+                    _conftest_logger.debug("conftest: async redis client close failed: %s", exc)
+
+        task.add_done_callback(_on_close_done)
 
     _cleanup()
+    communication_plugin._clients.clear()
+    communication_plugin._client_loops.clear()
+    user_auth_context._reset_for_tests()
     yield
     # Clean up any workers that may have started during the test.
-    from agents.utils import pulses
-
     pulses.reset()
+    communication_plugin._clients.clear()
+    communication_plugin._client_loops.clear()
+    user_auth_context._reset_for_tests()
     _cleanup()
 
 @pytest.fixture(autouse=True)
@@ -193,11 +239,16 @@ def _reset_maps_key_cache(monkeypatch):
     fresh from a clean environment.
     """
     monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
-    # The cache for _fetch_maps_key_from_gcloud now properly resets if the project changes.
-    from agents.planner import adk_tools as _planner_adk_tools
-    _planner_adk_tools._fetch_maps_key_from_gcloud.cache_clear()
+    # Only clear the cache if agents.planner.adk_tools was already imported by a test.
+    import sys
+
+    _planner_adk_tools = sys.modules.get("agents.planner.adk_tools")
+    if _planner_adk_tools is not None and hasattr(_planner_adk_tools, "_fetch_maps_key_from_gcloud"):
+        _planner_adk_tools._fetch_maps_key_from_gcloud.cache_clear()
     yield
-    _planner_adk_tools._fetch_maps_key_from_gcloud.cache_clear()
+    _planner_adk_tools = sys.modules.get("agents.planner.adk_tools")
+    if _planner_adk_tools is not None and hasattr(_planner_adk_tools, "_fetch_maps_key_from_gcloud"):
+        _planner_adk_tools._fetch_maps_key_from_gcloud.cache_clear()
 
 # Fix Vertex AI SDK attempting to convert test-project to a project ID using the RM API during collection
 try:

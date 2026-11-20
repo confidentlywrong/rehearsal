@@ -21,7 +21,6 @@ from agents.utils.env import configure_project_env
 configure_project_env("planner_eval")
 
 import logging
-import os
 
 from a2a.types import AgentSkill
 from google.adk.agents import LlmAgent
@@ -33,6 +32,7 @@ from agents.planner_with_eval.adk_tools import get_tools
 from agents.planner_with_eval.prompts import PLANNER_WITH_EVAL
 from agents.utils import config
 from agents.utils.communication_plugin import SimulationCommunicationPlugin
+from agents.utils.models import DEFAULT_PLANNER_MODEL, get_model
 from agents.utils.retry import resilient_model
 from agents.utils.deployment import create_a2a_deployment
 from agents.utils.factory import create_simulation_runner
@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 AGENT_NAME = "planner_with_eval"
-MODEL = os.getenv("PLANNER_MODEL", "gemini-3-flash-preview")
+MODEL = get_model("PLANNER_MODEL", DEFAULT_PLANNER_MODEL)
 
 # [START planner_eval_agent]
 planner_config = types.GenerateContentConfig(

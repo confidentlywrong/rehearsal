@@ -98,3 +98,17 @@ class TestCapForRunnerType:
         """Defensive default: unknown runner_type gets the lower (safer) LLM cap."""
         monkeypatch.setenv("MAX_RUNNERS_LLM", "10")
         assert cap_for_runner_type("runner_future_variant") == 10
+
+    def test_invalid_and_non_positive_env_logs_warning(self, monkeypatch, caplog):
+        """Invalid or non-positive MAX_RUNNERS_* env vars log warnings rather than failing silently."""
+        import logging
+
+        monkeypatch.setenv("MAX_RUNNERS_AUTOPILOT", "not-an-int")
+        monkeypatch.setenv("MAX_RUNNERS_LLM", "0")
+        with caplog.at_level(logging.WARNING, logger="agents.utils.runner_types"):
+            assert cap_for_runner_type(RUNNER_AUTOPILOT) == 1000
+            assert cap_for_runner_type(RUNNER) == 1
+
+        messages = [r.message for r in caplog.records]
+        assert any("MAX_RUNNERS_AUTOPILOT" in m for m in messages)
+        assert any("MAX_RUNNERS_LLM" in m for m in messages)

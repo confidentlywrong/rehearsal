@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -100,6 +102,7 @@ class TestAssessTrafficImpact:
             result = await module.assess_traffic_impact(tool_context=mock_ctx)
 
         assert result["status"] == "success"
+        assert result["enrichment_status"] == "ok"
         assert "closed_segments" in result
         assert isinstance(result["closed_segments"], list)
 
@@ -155,6 +158,7 @@ class TestAssessTrafficImpact:
             result = await module.assess_traffic_impact(tool_context=mock_ctx)
 
         assert result["status"] == "success"
+        assert result["enrichment_status"] == "degraded"
         assert result["narrative"].startswith("Gemini enrichment unavailable")
 
 

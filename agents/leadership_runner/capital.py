@@ -38,6 +38,7 @@ Disruptors, Diplomats, etc. behave consistently with
 """
 
 import logging
+import math
 
 from google.adk.tools.tool_context import ToolContext
 
@@ -49,6 +50,42 @@ from agents.leadership_runner.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float_or_none(raw: object) -> float | None:
+    """Coerce an int/float value to a finite float, returning None on invalid/overflow."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to float-range int, rejecting bool/None/NaN/Inf/OverflowError."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
+def _sanitize_capital(raw_water: object) -> float:
+    """Coerce raw political capital state value to a finite float in [0.0, 100.0]."""
+    val = _finite_float_or_none(raw_water)
+    return max(0.0, min(100.0, val if val is not None else 100.0))
 
 
 async def deplete_capital(amount: float, tool_context: ToolContext) -> dict:
@@ -65,7 +102,7 @@ async def deplete_capital(amount: float, tool_context: ToolContext) -> dict:
         return {
             "status": "already_finished",
             "message": "Stakeholder has already aligned. No capital changes allowed.",
-            "water": tool_context.state.get("water", 100.0),
+            "water": _sanitize_capital(tool_context.state.get("water", 100.0)),
         }
     # Resolve persona-specific thresholds (matches process_leadership_tick)
     persona = tool_context.state.get("persona", "pragmatist")
@@ -73,9 +110,10 @@ async def deplete_capital(amount: float, tool_context: ToolContext) -> dict:
     stall_threshold = profile["stall_threshold"]
     deadlock_threshold = profile["deadlock_threshold"]
 
-    amount = min(max(0.0, amount), MAX_TOOL_CAPITAL_CHANGE)  # Reject negative inputs
+    parsed_amount = _finite_float_or_none(amount)
+    amount = min(max(0.0, parsed_amount if parsed_amount is not None else 0.0), MAX_TOOL_CAPITAL_CHANGE)  # Reject negative inputs
 
-    current_capital = tool_context.state.get("water", 100.0)
+    current_capital = _sanitize_capital(tool_context.state.get("water", 100.0))
     new_capital = max(0.0, current_capital - amount)
     tool_context.state["water"] = new_capital
 
@@ -122,33 +160,43 @@ async def restore_capital(amount: float, tool_context: ToolContext) -> dict:
         return {
             "status": "already_finished",
             "message": "Stakeholder has already aligned. No capital changes allowed.",
-            "water": tool_context.state.get("water", 100.0),
+            "water": _sanitize_capital(tool_context.state.get("water", 100.0)),
         }
     # Resolve persona-specific thresholds (matches process_leadership_tick)
     persona = tool_context.state.get("persona", "pragmatist")
     profile = get_persona_profile(persona)
     stall_threshold = profile["stall_threshold"]
 
-    amount = min(max(0.0, amount), MAX_TOOL_CAPITAL_CHANGE)  # Reject negative inputs
+    parsed_amount = _finite_float_or_none(amount)
+    amount = min(max(0.0, parsed_amount if parsed_amount is not None else 0.0), MAX_TOOL_CAPITAL_CHANGE)  # Reject negative inputs
 
     # Cooldown: limit total restores within a sliding tick window.
-    tick = tool_context.state.get("_tick_params", {}).get("tick", 0)
-    recent_restores: list = tool_context.state.get("_capital_restored_window", [])
+    tick_params = tool_context.state.get("_tick_params")
+    tick_raw = tick_params.get("tick", 0) if isinstance(tick_params, dict) else 0
+    tick = _finite_int(tick_raw, 0)
+    raw_recent = tool_context.state.get("_capital_restored_window")
+    recent_restores: list = []
+    for r in raw_recent if isinstance(raw_recent, list) else []:
+        if isinstance(r, (list, tuple)) and len(r) == 2:
+            r0 = _finite_float_or_none(r[0])
+            r1 = _finite_float_or_none(r[1])
+            if r0 is not None and r1 is not None:
+                recent_restores.append([r0, r1])
     # Prune entries outside the window
     recent_restores = [r for r in recent_restores if tick - r[0] <= TOOL_RESTORE_WINDOW_TICKS]
-    total_recent = sum(r[1] for r in recent_restores)
+    total_recent = sum(float(r[1]) for r in recent_restores)
     if total_recent + amount > TOOL_RESTORE_WINDOW_MAX:
         amount = max(0.0, TOOL_RESTORE_WINDOW_MAX - total_recent)
+    current_capital = _sanitize_capital(tool_context.state.get("water", 100.0))
     if amount <= 0:
         return {
             "status": "cooldown",
             "message": f"Capital restore on cooldown. {total_recent:.1f}% restored in last {TOOL_RESTORE_WINDOW_TICKS} ticks (max {TOOL_RESTORE_WINDOW_MAX:.0f}%).",
-            "water": tool_context.state.get("water", 100.0),
+            "water": current_capital,
         }
     recent_restores.append([tick, amount])
     tool_context.state["_capital_restored_window"] = recent_restores
 
-    current_capital = tool_context.state.get("water", 100.0)
     new_capital = min(100.0, current_capital + amount)
     tool_context.state["water"] = new_capital
 
@@ -158,7 +206,8 @@ async def restore_capital(amount: float, tool_context: ToolContext) -> dict:
         # H8 fix: Only clear deadlock if it was capital-based. If burnout_risk
         # is still above 0.8, the stakeholder deadlocked from burnout and
         # restoring capital alone shouldn't resurrect them.
-        burnout_risk = tool_context.state.get("injury_risk", 0.0)
+        parsed_risk = _finite_float_or_none(tool_context.state.get("injury_risk", 0.0))
+        burnout_risk = max(0.0, parsed_risk) if parsed_risk is not None else 0.0
         if burnout_risk < 0.8:
             tool_context.state["collapsed"] = False
 
@@ -183,7 +232,7 @@ async def executive_intervention(tool_context: ToolContext) -> dict:
         return {
             "status": "already_finished",
             "message": "Stakeholder has already aligned. No capital changes allowed.",
-            "water": tool_context.state.get("water", 100.0),
+            "water": _sanitize_capital(tool_context.state.get("water", 100.0)),
         }
     if not tool_context.state.get("collapsed", False):
         return {

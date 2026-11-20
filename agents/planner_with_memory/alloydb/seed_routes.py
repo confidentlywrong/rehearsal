@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,9 +55,17 @@ async def seed_routes() -> int:
     """
     import asyncpg  # lazily imported so module loads without extras installed
 
-    from agents.planner_with_memory.memory.store_alloydb import _get_dsn
+    from agents.planner_with_memory.memory.store_alloydb import (
+        _get_dsn,
+        _validate_schema_name,
+    )
 
-    conn = await asyncpg.connect(_get_dsn())
+    schema_name = _validate_schema_name(os.environ.get("ALLOYDB_SCHEMA"), default="public")
+
+    conn = await asyncpg.connect(
+        _get_dsn(),
+        server_settings={"search_path": f"{schema_name}, public"},
+    )
     loaded = 0
     try:
         for filepath in sorted(_SEEDS_DIR.glob("*.json")):
@@ -79,12 +90,13 @@ async def seed_routes() -> int:
                 await conn.execute(
                     """
                     INSERT INTO planned_routes
-                        (route_id, route_data, created_at, eval_score, eval_result)
-                    VALUES ($1, $2::jsonb, $3, $4, $5::jsonb)
+                        (route_id, route_data, created_at, eval_score, eval_result, owner_id)
+                    VALUES ($1, $2::jsonb, $3, $4, $5::jsonb, '__seed__')
                     ON CONFLICT (route_id) DO UPDATE SET
                         route_data = EXCLUDED.route_data,
                         eval_score = EXCLUDED.eval_score,
-                        eval_result = EXCLUDED.eval_result
+                        eval_result = EXCLUDED.eval_result,
+                        owner_id = COALESCE(planned_routes.owner_id, EXCLUDED.owner_id)
                     """,
                     route_id,
                     route_data_json,

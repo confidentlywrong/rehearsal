@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -81,7 +82,15 @@ func exportMeHandler(store meExportStore) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "export_failed"})
 			return
 		}
-		audit, _ := store.ListAudit(ctx, uc.UserID, "", 500, 0)
+		audit, err := store.ListAudit(ctx, uc.UserID, "", 500, 0)
+		if err != nil {
+			log.Printf("GET /api/v1/me/export ListAudit failed user=%s: %v", uc.UserID, err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "export_failed"})
+			return
+		}
+		if audit == nil {
+			audit = []account.AuditEntry{}
+		}
 
 		recordAuditBestEffort(c, account.AuditEntry{
 			UserID: uc.UserID,
@@ -93,11 +102,27 @@ func exportMeHandler(store meExportStore) gin.HandlerFunc {
 			},
 		})
 		c.Header("Content-Disposition",
-			`attachment; filename="me-`+uc.UserID+`-export.json"`)
+			`attachment; filename="me-`+sanitizeExportFilename(uc.UserID)+`-export.json"`)
 		c.JSON(http.StatusOK, meExport{
 			User:     user,
 			Audit:    audit,
 			Exported: time.Now().UTC(),
 		})
 	}
+}
+
+func sanitizeExportFilename(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' {
+			out = append(out, ch)
+		} else {
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "unknown"
+	}
+	return string(out)
 }

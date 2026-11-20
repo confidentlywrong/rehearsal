@@ -428,6 +428,7 @@ module "cloud_run_services" {
   redis_port          = module.redis.port
   database_ip         = local.database_ip
   database_secret_id  = local.database_secret_id
+  database_name       = var.enable_alloydb ? "postgres" : "agent_memory"
   orchestration_topic = module.pubsub.topic_name
   telemetry_topic     = module.pubsub.telemetry_topic_name
   embedding_backend   = var.embedding_backend

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: guard division by zero when computing pool stress-test speedup.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,10 +29,11 @@ Compares "old defaults" (pool_size=5, max_overflow=10) vs "new defaults"
 
 import argparse
 import asyncio
+import os
 import time
 
 
-DB_URL = "postgresql+asyncpg://testuser:testpass@127.0.0.1:8104/testdb"
+DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://testuser:testpass@127.0.0.1:9213/testdb")
 
 
 async def run_scenario(
@@ -116,7 +119,7 @@ async def main() -> None:
     print(f"  Results: {n} sessions")
     print(f"  OLD (pool=5+10=15):   {t_old:.2f}s")
     print(f"  NEW (pool=20+20=40):  {t_new:.2f}s")
-    if t_old > 0:
+    if t_old > 0 and t_new > 0:
         print(f"  Speedup:              {t_old / t_new:.1f}x")
     print(f"{'=' * 60}\n")
 

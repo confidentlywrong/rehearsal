@@ -26,19 +26,19 @@ leadership_planner: PORT=$LEADERSHIP_PLANNER_PORT DISPATCH_MODE=callable .venv/b
 leadership_planner_with_eval: PORT=$LEADERSHIP_PLANNER_WITH_EVAL_PORT DISPATCH_MODE=callable .venv/bin/python3 agents/leadership_planner_with_eval/agent.py
 leadership_planner_with_memory: PORT=$LEADERSHIP_PLANNER_WITH_MEMORY_PORT DISPATCH_MODE=callable .venv/bin/python3 agents/leadership_planner_with_memory/agent.py
 dash: PORT=$DASH_PORT .venv/bin/python3 scripts/core/agent_dash.py
-tester: PORT=$TESTER_PORT go run cmd/tester/main.go
+tester: PORT=$TESTER_PORT go run ./cmd/tester
 admin: PORT=$ADMIN_PORT go run ./cmd/admin
 # Phase 6b: billing webhook receiver. Runs in every environment but
 # refuses every webhook unless BILLING_PROVIDER=stripe AND
 # SAAS_MODE=on. With defaults (stub/off) it only serves /healthz.
-billing: PORT=$BILLING_PORT go run cmd/billing/main.go
+billing: PORT=$BILLING_PORT go run ./cmd/billing
 
 # --- Original Marathon Runners (disabled — leadership_runner replaces these) ---
 # runner: DISPATCH_MODE=subscriber .venv/bin/python3 agents/runner/agent.py
 # runner_autopilot: DISPATCH_MODE=subscriber .venv/bin/python3 agents/runner_autopilot/agent.py
 leadership_runner: PORT=$LEADERSHIP_RUNNER_PORT DISPATCH_MODE=subscriber .venv/bin/python3 agents/leadership_runner/agent.py
 leadership_runner_autopilot: PORT=$LEADERSHIP_RUNNER_AUTOPILOT_PORT DISPATCH_MODE=subscriber .venv/bin/python3 agents/leadership_runner_autopilot/agent.py
-frontend: PORT=${FRONTEND_PORT:-$FRONTEND_BFF_PORT} GATEWAY_INTERNAL_URL=http://localhost:$GATEWAY_PORT FRONTEND_DEV_URL=http://localhost:$FRONTEND_APP_PORT go run cmd/frontend/main.go
+frontend: PORT=${FRONTEND_PORT:-$FRONTEND_BFF_PORT} GATEWAY_INTERNAL_URL=http://localhost:$GATEWAY_PORT FRONTEND_DEV_URL=http://localhost:$FRONTEND_APP_PORT go run ./cmd/frontend
 frontend-app: if lsof -i :$FRONTEND_APP_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then echo "Port $FRONTEND_APP_PORT already in use — reusing existing Angular dev server"; tail -f /dev/null; else cd web/frontend && npm start; fi
 ai_echo: PORT=$AI_ECHO_PORT DISPATCH_MODE=subscriber .venv/bin/python3 agents/ai_echo/agent.py
 ai_echo_reactive: PORT=$AI_ECHO_REACTIVE_PORT DISPATCH_MODE=subscriber .venv/bin/python3 agents/ai_echo_reactive/agent.py

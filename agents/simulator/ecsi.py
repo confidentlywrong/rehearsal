@@ -19,7 +19,7 @@ contention and emits Synchronicity Alerts.  No LLM dependency — pure
 Python pattern matching on the aggregated tick snapshot.
 
 Follows the ``compute_tick_traffic()`` pattern in
-``agents/simulator/skills/advancing-race-ticks/tools.py:310-338``:
+``agents/simulator/skills/advancing-race-ticks/tools.py:1014-1038``:
 runs as a pure function after tick aggregation, appending results to
 the snapshot.
 
@@ -31,6 +31,7 @@ Detection rules:
 """
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +39,28 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 StateLike = Any
+
+
+def _finite_float(value: Any, default: float) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    """Coerce non-bool int/float to finite int, falling back to default."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(value) if math.isfinite(num) else default
 
 
 @dataclass
@@ -69,34 +92,41 @@ def _detect_threshold_breaches(
     previous_resources: dict[str, dict] | None,
 ) -> list[SynchronicityAlert]:
     """Detect when resources cross their critical thresholds."""
-    alerts = []
+    alerts: list[SynchronicityAlert] = []
+    if not isinstance(resources, dict):
+        return alerts
     for name, pool in resources.items():
-        current = pool.get("current", 0)
-        threshold = pool.get("critical_threshold", 20)
+        if not isinstance(pool, dict) or not name:
+            continue
+        current = _finite_float(pool.get("current"), 100.0)
+        threshold = _finite_float(pool.get("critical_threshold"), 20.0)
 
         if current <= threshold:
             # Check if this is a new breach (wasn't below threshold before)
             was_above = True
-            if previous_resources and name in previous_resources:
-                prev_val = previous_resources[name].get("current", 0)
-                was_above = prev_val > threshold
+            if isinstance(previous_resources, dict):
+                prev_pool = previous_resources.get(name)
+                if isinstance(prev_pool, dict):
+                    prev_val = _finite_float(prev_pool.get("current"), 100.0)
+                    was_above = prev_val > threshold
 
             if was_above:
                 severity = "critical" if current <= threshold * 0.5 else "warning"
+                name_upper = str(name).upper()
                 alerts.append(
                     SynchronicityAlert(
                         severity=severity,
                         alert_type="threshold",
                         description=(
-                            f"THRESHOLD BREACH: {name.upper()} has dropped to {current:.0f} "
+                            f"THRESHOLD BREACH: {name_upper} has dropped to {current:.0f} "
                             f"(critical threshold: {threshold:.0f}). "
                             f"Immediate attention required to prevent organizational failure."
                         ),
-                        affected_resources=[name.upper()],
+                        affected_resources=[name_upper],
                         recommended_guardrails=[
-                            f"Prioritize {name.upper()} recovery in next decision",
+                            f"Prioritize {name_upper} recovery in next decision",
                             "Consider reallocating from other resource pools",
-                            f"Engage stakeholders most affected by {name.upper()} depletion",
+                            f"Engage stakeholders most affected by {name_upper} depletion",
                         ],
                     )
                 )
@@ -108,13 +138,17 @@ def _detect_sentiment_cascade(
     echo_sentiments: dict[str, dict],
 ) -> list[SynchronicityAlert]:
     """Detect when 3+ Echoes are in hostile stance simultaneously."""
-    hostile_echoes = []
+    if not isinstance(echo_sentiments, dict):
+        return []
+    hostile_echoes: list[str] = []
     for echo_id, data in echo_sentiments.items():
+        if not isinstance(data, dict):
+            continue
         stance = data.get("stance", "neutral")
         if stance == "hostile":
-            hostile_echoes.append(data.get("role", echo_id))
+            hostile_echoes.append(str(data.get("role") or echo_id))
 
-    alerts = []
+    alerts: list[SynchronicityAlert] = []
     if len(hostile_echoes) >= 3:
         alerts.append(
             SynchronicityAlert(
@@ -141,30 +175,44 @@ def _detect_resource_contention(
     echo_actions: list[dict],
 ) -> list[SynchronicityAlert]:
     """Detect when 2+ Echo autonomous actions target the same resource pool."""
+    if not isinstance(echo_actions, list):
+        return []
     resource_claims: dict[str, list[str]] = {}
 
     for action in echo_actions:
-        claimed_resources = action.get("resource_claims", [])
-        echo_role = action.get("role", "unknown")
+        if not isinstance(action, dict):
+            continue
+        claimed_resources = action.get("resource_claims") or []
+        if not isinstance(claimed_resources, (list, tuple, set)):
+            continue
+        echo_role = str(action.get("role") or "unknown")
+        seen_for_action: set[str] = set()
         for resource in claimed_resources:
-            resource_claims.setdefault(resource, []).append(echo_role)
+            if not isinstance(resource, str) or not resource.strip():
+                continue
+            res_norm = resource.strip()
+            if res_norm in seen_for_action:
+                continue
+            seen_for_action.add(res_norm)
+            resource_claims.setdefault(res_norm, []).append(echo_role)
 
-    alerts = []
+    alerts: list[SynchronicityAlert] = []
     for resource, claimants in resource_claims.items():
         if len(claimants) >= 2:
+            res_upper = resource.upper()
             alerts.append(
                 SynchronicityAlert(
                     severity="warning",
                     alert_type="contention",
                     description=(
                         f"RESOURCE CONTENTION: {len(claimants)} stakeholders "
-                        f"({', '.join(claimants)}) are competing for {resource.upper()}. "
+                        f"({', '.join(claimants)}) are competing for {res_upper}. "
                         f"Without mediation, this will create organizational deadlock."
                     ),
                     conflicting_initiatives=claimants,
-                    affected_resources=[resource.upper()],
+                    affected_resources=[res_upper],
                     recommended_guardrails=[
-                        f"Arbitrate {resource.upper()} allocation between competing parties",
+                        f"Arbitrate {res_upper} allocation between competing parties",
                         "Establish clear priority criteria for resource distribution",
                         "Consider creating a shared resource pool or phased allocation",
                     ],
@@ -180,28 +228,40 @@ def _detect_hidden_agenda_triggers(
     revealed_agendas: set[str],
 ) -> list[SynchronicityAlert]:
     """Detect when an Echo's hidden agenda trigger tick is reached."""
-    alerts = []
+    if not isinstance(echo_configs, list):
+        return []
+    alerts: list[SynchronicityAlert] = []
     for config in echo_configs:
-        role = config.get("role", "unknown")
+        if not isinstance(config, dict):
+            continue
+        role = str(config.get("role") or "unknown")
         if role in revealed_agendas:
             continue
 
-        has_agenda = config.get("has_hidden_agenda", False)
+        has_agenda = bool(config.get("has_hidden_agenda", False))
         trigger_tick = config.get("agenda_trigger_tick")
-
-        if has_agenda and trigger_tick is not None and current_tick >= trigger_tick:
+        trigger_num: float | None = None
+        if isinstance(trigger_tick, (int, float)) and not isinstance(trigger_tick, bool):
+            try:
+                cand = float(trigger_tick)
+                if math.isfinite(cand):
+                    trigger_num = cand
+            except (TypeError, ValueError, OverflowError):
+                trigger_num = None
+        if trigger_num is not None and has_agenda and current_tick >= trigger_num:
+            role_label = role.replace("_", " ").title()
             alerts.append(
                 SynchronicityAlert(
                     severity="critical",
                     alert_type="agenda",
                     description=(
-                        f"HIDDEN AGENDA REVEALED: {role.replace('_', ' ').title()} "
+                        f"HIDDEN AGENDA REVEALED: {role_label} "
                         f"has revealed a previously undisclosed agenda. "
                         f"Their true priorities may conflict with the stated organizational goals."
                     ),
                     conflicting_initiatives=[role],
                     recommended_guardrails=[
-                        f"Engage {role.replace('_', ' ').title()} in direct, transparent dialogue",
+                        f"Engage {role_label} in direct, transparent dialogue",
                         "Reassess alignment assumptions with all stakeholders",
                         "Consider how this changes the power dynamics in ongoing initiatives",
                     ],
@@ -231,40 +291,53 @@ def detect_contention(
     Returns:
         List of SynchronicityAlert instances (may be empty).
     """
-    current_tick = tick_snapshot.get("tick", 0)
+    safe_snapshot = tick_snapshot if isinstance(tick_snapshot, dict) else {}
+    safe_quest = quest_config if isinstance(quest_config, dict) else {}
+    raw_tick = safe_snapshot.get("tick")
+    current_tick = _finite_int(raw_tick, 0)
     alerts: list[SynchronicityAlert] = []
 
     # 1. Threshold breaches
-    # NOTE: previous_resources is read from tick_snapshots[-2] intentionally.
-    # It is ONLY used for deduplication (was the resource already breached
-    # last tick?), NOT for the threshold comparison itself. The live
-    # resource_state parameter is always the current-tick value.
+    # NOTE: previous_resources is read from the prior tick's snapshot.
+    # detect_contention is called before the current tick's snapshot is
+    # appended to state["tick_snapshots"], so snapshots[-1] is normally T-1
+    # (fall back to snapshots[-2] if the caller already appended T).
     previous_resources = None
-    if state:
-        snapshots = state.get("tick_snapshots", [])
-        if len(snapshots) >= 2:
-            prev_snap = snapshots[-2]
-            previous_resources = prev_snap.get("organizational_state", {}).get("resources")
+    if state is not None:
+        snapshots = state.get("tick_snapshots") or []
+        if isinstance(snapshots, list) and snapshots:
+            last_snap = snapshots[-1] if isinstance(snapshots[-1], dict) else None
+            if last_snap is not None and last_snap.get("tick") != current_tick:
+                prev_snap = last_snap
+            elif len(snapshots) >= 2 and isinstance(snapshots[-2], dict):
+                prev_snap = snapshots[-2]
+            else:
+                prev_snap = None
+            if prev_snap is not None:
+                org_state = prev_snap.get("organizational_state")
+                if isinstance(org_state, dict):
+                    previous_resources = org_state.get("resources")
 
     alerts.extend(_detect_threshold_breaches(resource_state, previous_resources))
 
     # 2. Sentiment cascade
-    echo_sentiments = tick_snapshot.get("echo_sentiments", {})
+    echo_sentiments = safe_snapshot.get("echo_sentiments") or {}
     alerts.extend(_detect_sentiment_cascade(echo_sentiments))
 
     # 3. Resource contention (from Echo autonomous actions this tick)
-    echo_actions = tick_snapshot.get("echo_actions", [])
+    echo_actions = safe_snapshot.get("echo_actions") or []
     alerts.extend(_detect_resource_contention(echo_actions))
 
     # 4. Hidden agenda triggers
     # Check state first (populated by inject_quest_into_state), then quest_config
     echo_configs = []
     if state is not None:
-        echo_configs = state.get("echo_configs", [])
+        echo_configs = state.get("echo_configs") or []
     if not echo_configs:
-        echo_configs = quest_config.get("echoes", quest_config.get("echo_configs", []))
+        echo_configs = safe_quest.get("echoes") or safe_quest.get("echo_configs") or []
 
-    revealed = set(state.get("revealed_agendas", [])) if state else set()
+    raw_revealed = state.get("revealed_agendas") if state is not None else None
+    revealed = {r for r in raw_revealed if isinstance(r, str)} if isinstance(raw_revealed, (list, tuple, set)) else set()
     agenda_alerts = _detect_hidden_agenda_triggers(current_tick, echo_configs, revealed)
     if agenda_alerts and state is not None:
         # Mark agendas as revealed so they don't fire again

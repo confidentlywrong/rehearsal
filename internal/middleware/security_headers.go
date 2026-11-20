@@ -165,7 +165,7 @@ func DefaultPermissionsPolicy() string {
 //                         dev so localhost doesn't get pinned to https.
 func SecurityHeadersFromEnv() SecurityHeadersConfig {
 	csp := DefaultCSP()
-	if v := os.Getenv("CSP_OVERRIDE"); v != "" {
+	if v := strings.TrimSpace(stripASCIIControlChars(os.Getenv("CSP_OVERRIDE"))); v != "" {
 		csp = v
 	}
 	if strings.EqualFold(os.Getenv("CSP_DISABLE"), "true") {
@@ -227,15 +227,46 @@ func SecurityHeaders(cfg SecurityHeadersConfig) gin.HandlerFunc {
 // when an upstream LB has tagged X-Forwarded-Proto: https. We never
 // emit HSTS on a plaintext request \u2014 that would silently misadvise
 // clients to https:// for the same host.
-func requestIsHTTPS(r *http.Request) bool {
+// RequestIsHTTPS reports whether r arrived over TLS or via a trusted HTTPS
+// proxy chain. Multi-hop X-Forwarded-Proto headers (for example
+// "https, https" or multiple X-Forwarded-Proto header lines) are split on
+// commas and accepted only when at least one non-empty token is present and
+// every non-empty token case-insensitively equals "https".
+func RequestIsHTTPS(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	if strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return true
+	if r.Header == nil {
+		return false
 	}
-	return false
+	seen := 0
+	for _, hdr := range r.Header.Values("X-Forwarded-Proto") {
+		for _, part := range strings.Split(hdr, ",") {
+			tok := strings.TrimSpace(part)
+			if tok == "" {
+				continue
+			}
+			if !strings.EqualFold(tok, "https") {
+				return false
+			}
+			seen++
+		}
+	}
+	return seen > 0
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	return RequestIsHTTPS(r)
+}
+
+func stripASCIIControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }

@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS rules (
     embedding   VECTOR(3072)
 );
 
+DELETE FROM rules a
+USING rules b
+WHERE a.ctid < b.ctid
+  AND a.source_file = b.source_file
+  AND a.chunk_id = b.chunk_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_source_chunk
+    ON rules (source_file, chunk_id);
+
 -- ============================================================
 -- 2. PLANNED ROUTES TABLE  (full fidelity locally)
 -- ============================================================
@@ -49,6 +58,11 @@ CREATE TABLE IF NOT EXISTS planned_routes (
     eval_score  FLOAT,
     eval_result JSONB
 );
+
+ALTER TABLE planned_routes
+    ADD COLUMN IF NOT EXISTS owner_id VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_planned_routes_owner_created
+    ON planned_routes (owner_id, created_at DESC);
 
 -- ============================================================
 -- 3. SIMULATION RECORDS TABLE  (full fidelity locally)
@@ -86,3 +100,8 @@ CREATE TABLE IF NOT EXISTS simulation_summaries (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     embedding   VECTOR(3072)
 );
+
+ALTER TABLE simulation_summaries
+    ADD COLUMN IF NOT EXISTS owner_id VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_simulation_summaries_owner_created
+    ON simulation_summaries (owner_id, created_at DESC);

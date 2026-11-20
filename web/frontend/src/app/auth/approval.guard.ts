@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: catch unexpected identity initialization rejections cleanly and fail closed to /pending-approval.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,7 +55,12 @@ export const approvalGuard: CanActivateFn = async () => {
   // For a brand-new signup it creates the users row server-side
   // (which lands in StatusPending), then re-fetches /me so the
   // status field is populated here.
-  const snap = await identity.ensureInitialized();
+  let snap;
+  try {
+    snap = await identity.ensureInitialized();
+  } catch {
+    return router.createUrlTree(['/pending-approval']);
+  }
 
   // Gateway unreachable or returned a non-2xx (other than needs_init
   // which the service resolves internally): fail open so a backend

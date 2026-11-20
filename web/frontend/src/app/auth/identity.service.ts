@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate JSON object payloads from /api/v1/me and return explicit failure snapshots from ensureInitialized.
  * Licensed under the Apache License, Version 2.0.
  */
 
@@ -73,8 +75,11 @@ export class IdentityService {
       if (!resp.ok) {
         return { available: false, status: resp.status };
       }
-      const data = (await resp.json()) as MeResponse;
-      return { available: true, status: resp.status, data };
+      const data: unknown = await resp.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { available: false, status: resp.status };
+      }
+      return { available: true, status: resp.status, data: data as MeResponse };
     } catch {
       return { available: false, status: 0 };
     }
@@ -124,14 +129,14 @@ export class IdentityService {
         console.warn(
           '[IdentityService] /me/init returned',
           resp.status,
-          '— SPA will retry on next page load',
+          '— propagating init failure',
         );
-        return first;
+        return { available: false, status: resp.status };
       }
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn('[IdentityService] /me/init request failed:', err);
-      return first;
+      return { available: false, status: 0 };
     }
     // Re-fetch so the caller sees the user row created above.
     return this.fetchMe();

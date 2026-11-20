@@ -36,16 +36,24 @@ Five-phase state machine:
 
 import asyncio
 import logging
+import math
 
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
+from agents.utils import simulation_registry
+from agents.utils import tenant_keys
+from agents.utils.communication import resolve_tool_context_user_id
 from agents.utils.pulses import emit_gateway_message
 from agents.utils.runner_types import cap_for_runner_type, DEFAULT_RUNNER_TYPE
 
 logger = logging.getLogger(__name__)
+
+# Keep strong references to background emit tasks until completion so GC cannot
+# destroy pending coroutines before the event loop finishes them.
+_background_tasks: set[asyncio.Task[object]] = set()
 
 # Ordered sequence of tool calls.  Phase detection works by finding the
 # last function_response name and advancing to the next tool in this list.
@@ -96,18 +104,54 @@ def _broadcast_pre_race_error(callback_context: CallbackContext, failed_tool: st
     if running_loop is None:
         return
 
-    session_id = getattr(getattr(callback_context, "session", None), "id", "") or "system"
-    simulation_id = None
+    raw_sid_val = getattr(getattr(callback_context, "session", None), "id", None)
+    raw_sid = raw_sid_val.strip() if isinstance(raw_sid_val, str) and raw_sid_val.strip() else None
+    simulation_id: str | None = None
     try:
-        simulation_id = callback_context.state.get("simulation_id")
+        raw_sim_val = callback_context.state.get("simulation_id")
+        if isinstance(raw_sim_val, str):
+            cleaned_sim = raw_sim_val.strip()
+            if cleaned_sim and cleaned_sim != "\u2014":
+                simulation_id = cleaned_sim
     except Exception:
         simulation_id = None
 
+    try:
+        uid = resolve_tool_context_user_id(callback_context, require_when_saas=False)
+    except ValueError as exc:
+        logger.warning("pre_race_callback: invalid user_id context for error emit: %s", exc)
+        uid = None
+
+    saas_anon_guard = tenant_keys._saas_mode_enabled() and uid is None
+
     async def _emit() -> None:
+        async def _safe_get_context_id(sid: str) -> str | None:
+            try:
+                if uid is not None:
+                    return await simulation_registry.get_context_id(sid, user_id=uid)
+                return await simulation_registry.get_context_id(sid)
+            except ValueError as exc:
+                logger.debug("pre_race_callback: skipped context_id lookup for %s (%s)", sid, exc)
+                return None
+
+        emit_session_id: str | None = None
+        if raw_sid and raw_sid not in ("default", "system"):
+            emit_session_id = await _safe_get_context_id(raw_sid)
+        if not emit_session_id and simulation_id and simulation_id != raw_sid:
+            emit_session_id = await _safe_get_context_id(simulation_id)
+        if not emit_session_id:
+            if simulation_id and (not saas_anon_guard or not raw_sid or raw_sid in ("default", "system")):
+                emit_session_id = simulation_id
+            else:
+                emit_session_id = raw_sid or "system"
+
+        destination = [emit_session_id] if emit_session_id and emit_session_id != "system" else []
+        emit_kwargs: dict[str, object] = {"user_id": uid} if uid is not None else {}
+
         try:
             await emit_gateway_message(
-                origin={"type": "agent", "id": "simulator", "session_id": session_id},
-                destination=[],
+                origin={"type": "agent", "id": "simulator", "session_id": emit_session_id},
+                destination=destination,
                 status="error",
                 msg_type="error",
                 event="pre_race_aborted",
@@ -116,6 +160,7 @@ def _broadcast_pre_race_error(callback_context: CallbackContext, failed_tool: st
                     "message": failure_msg,
                 },
                 simulation_id=simulation_id,
+                **emit_kwargs,  # type: ignore[arg-type]
             )
         except Exception:
             logger.warning(
@@ -123,7 +168,9 @@ def _broadcast_pre_race_error(callback_context: CallbackContext, failed_tool: st
                 exc_info=True,
             )
 
-    running_loop.create_task(_emit())
+    task = running_loop.create_task(_emit())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _extract_plan_json(llm_request: LlmRequest) -> str:
@@ -152,11 +199,23 @@ def _extract_plan_json(llm_request: LlmRequest) -> str:
         import ast
 
         try:
-            text = ast.literal_eval(text)
+            unescaped = ast.literal_eval(text)
+            if isinstance(unescaped, str):
+                text = unescaped
         except Exception:
             pass
 
     return text.strip()
+
+
+def _is_finite_number(value: object) -> bool:
+    """Return True if value is a non-bool int/float that converts to a finite float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _detect_phase(llm_request: LlmRequest) -> str:
@@ -176,15 +235,19 @@ def _detect_phase(llm_request: LlmRequest) -> str:
         if part.function_response is not None:
             name = part.function_response.name
 
-            # Check for tool errors
+            # Check for tool errors (explicit status="error" or ADK {"error": ...})
             response_dict = part.function_response.response
-            if isinstance(response_dict, dict) and response_dict.get("status") == "error":
-                msg = response_dict.get("message")
-                logger.error(f"pre_race_callback: tool {name} failed with {msg}")
+            if isinstance(response_dict, dict) and (
+                response_dict.get("status") == "error"
+                or ("error" in response_dict and "status" not in response_dict)
+            ):
+                msg = response_dict.get("message") or response_dict.get("error")
+                tool_name = str(name or "unknown")
+                logger.error("pre_race_callback: tool %s failed with %s", tool_name, msg)
                 # Stash the failure details so pre_race_callback() can
                 # surface them to the frontend (instead of the UI stalling
                 # silently while runners freeze on the map).
-                return f"error::{name}::{msg or 'unknown error'}"
+                return f"error::{tool_name}::{msg or 'unknown error'}"
 
             if name == "prepare_simulation":
                 return "spawn"
@@ -219,6 +282,7 @@ def pre_race_callback(
     if phase.startswith("error::"):
         _, failed_tool, failure_msg = phase.split("::", 2)
         callback_context.state["simulation_ready"] = False
+        callback_context.state["simulation_in_progress"] = False
         _broadcast_pre_race_error(callback_context, failed_tool, failure_msg)
         return _text(f"Simulation initialization sequence aborted: {failed_tool} failed ({failure_msg}).")
 
@@ -239,16 +303,26 @@ def pre_race_callback(
         # (defaults to MAX_RUNNERS_AUTOPILOT=1000). This prevents the
         # "1 runner" bug if state propagation fails across ADK sub-agents.
         if count is None:
-            runner_type = callback_context.state.get("runner_type", DEFAULT_RUNNER_TYPE)
-            count = cap_for_runner_type(runner_type)
+            runner_type = callback_context.state.get("runner_type") or DEFAULT_RUNNER_TYPE
+            count = cap_for_runner_type(str(runner_type))
             logger.warning(
                 "pre_race_callback: runner_count NOT in state, falling back to cap_for_runner_type(%s)=%d",
                 runner_type,
                 count,
             )
 
-        logger.info("pre_race_callback: SPAWN phase, count=%d", count)
-        return _function_call("spawn_runners", {"count": count})
+        if not _is_finite_number(count):
+            runner_type = callback_context.state.get("runner_type") or DEFAULT_RUNNER_TYPE
+            safe_count = cap_for_runner_type(str(runner_type))
+        else:
+            try:
+                safe_count = max(1, int(count))
+            except (TypeError, ValueError, OverflowError):
+                runner_type = callback_context.state.get("runner_type") or DEFAULT_RUNNER_TYPE
+                safe_count = cap_for_runner_type(str(runner_type))
+
+        logger.info("pre_race_callback: SPAWN phase, count=%d", safe_count)
+        return _function_call("spawn_runners", {"count": safe_count})
 
     if phase == "collect":
         logger.debug("pre_race_callback: COLLECT phase")
@@ -259,8 +333,15 @@ def pre_race_callback(
         return _function_call("fire_start_gun")
 
     # DONE: all tools complete, end the agent
-    runner_count = callback_context.state.get("runner_count", 0)
-    simulation_id = callback_context.state.get("simulation_id", "unknown")
+    raw_count = callback_context.state.get("runner_count")
+    if _is_finite_number(raw_count):
+        try:
+            runner_count = int(raw_count)
+        except (TypeError, ValueError, OverflowError):
+            runner_count = 0
+    else:
+        runner_count = 0
+    simulation_id = callback_context.state.get("simulation_id") or "unknown"
     logger.debug(
         "pre_race_callback: DONE phase, %d runners, sim %s",
         runner_count,

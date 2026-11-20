@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from unittest.mock import MagicMock
 
+import pytest
 from google.genai import types
 
 from agents.runner_autopilot.autopilot import (
@@ -330,6 +332,27 @@ class TestHandleTick:
         response = handle_tick(state, {"tick": 5, "max_ticks": 24})
         fc = _get_fc(response)
         assert fc.name == "process_tick"
+
+    def test_missing_runner_count_defaults_to_wave_zero_and_logs_critical_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Omitting runner_count from both data and state must default to 1 (wave 0) and warn."""
+        state: dict = {}
+        with caplog.at_level(logging.WARNING, logger="agents.runner_autopilot.autopilot"):
+            response = handle_tick(
+                state,
+                {
+                    "_session_id": "test-missing-runner-count",
+                    "tick": 0,
+                    "minutes_per_tick": 0.0,
+                    "elapsed_minutes": 0.0,
+                    "race_distance_mi": 26.2,
+                },
+            )
+        fc = _get_fc(response)
+        assert fc.name == "process_tick"
+        assert state["wave_number"] == 0
+        assert "CRITICAL: runner_count is missing/invalid" in caplog.text
 
 
 class TestBuildSummary:

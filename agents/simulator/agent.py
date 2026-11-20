@@ -37,6 +37,7 @@ import inspect
 import json
 import logging
 import os
+from collections.abc import Mapping
 from typing import Callable, List, cast
 
 from a2a.types import AgentSkill
@@ -59,6 +60,7 @@ from google.genai import types
 
 from agents.utils import config
 from agents.utils.communication_plugin import SimulationCommunicationPlugin
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model
 from agents.utils.retry import resilient_model
 from agents.utils.deployment import create_a2a_deployment
 from agents.utils.factory import create_simulation_runner
@@ -72,8 +74,8 @@ AGENT_DIR = os.path.dirname(__file__)
 # Defaults to a GA flash-lite model: the `gemini-flash-lite-latest` alias and
 # `gemini-3.1-flash-lite-preview` return 404 NOT_FOUND on Vertex AI for some
 # projects, which aborts the simulation on its first LLM call.
-DEFAULT_SIMULATOR_MODEL = "gemini-3.5-flash-lite"
-SIMULATOR_MODEL = os.environ.get("SIMULATOR_MODEL") or DEFAULT_SIMULATOR_MODEL
+DEFAULT_SIMULATOR_MODEL = DEFAULT_FLASH_LITE_MODEL
+SIMULATOR_MODEL = get_model("SIMULATOR_MODEL", DEFAULT_SIMULATOR_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -156,19 +158,29 @@ async def verify_plan(plan_json: str) -> dict:
         plan = json.loads(plan_json)
     except (json.JSONDecodeError, TypeError) as e:
         return {"status": "error", "message": f"Invalid plan JSON: {e}"}
+    if not isinstance(plan, dict):
+        return {"status": "error", "message": "Invalid plan JSON: top-level payload must be a JSON object."}
 
     issues = []
 
     # Route is included in the A2A payload for traffic model building.
     # Validate its structure if present.
     route = plan.get("route")
-    if route:
+    if route is not None and not isinstance(route, dict):
+        issues.append("Route must be a GeoJSON FeatureCollection object.")
+    elif route:
         features = route.get("features", [])
-        if not features:
+        if not isinstance(features, list) or not features:
             issues.append("Route has no features.")
-        line_features = [f for f in features if f.get("geometry", {}).get("type") in ("LineString", "MultiLineString")]
-        if not line_features:
-            issues.append("Route has no LineString geometry — no path to run.")
+        else:
+            line_features = [
+                f
+                for f in features
+                if isinstance(f, dict) and isinstance(f.get("geometry"), dict)
+                and f.get("geometry", {}).get("type") in ("LineString", "MultiLineString")
+            ]
+            if not line_features:
+                issues.append("Route has no LineString geometry — no path to run.")
 
     if not plan.get("narrative"):
         issues.append("Missing 'narrative' field — no plan summary.")
@@ -182,7 +194,8 @@ async def verify_plan(plan_json: str) -> dict:
         }
 
     # Check optional simulation_config
-    sim_config = plan.get("simulation_config", {})
+    raw_sim_config = plan.get("simulation_config")
+    sim_config = raw_sim_config if isinstance(raw_sim_config, dict) else {}
     config_summary = {
         "duration_seconds": sim_config.get("duration_seconds", f"default ({DEFAULT_DURATION_SECONDS})"),
         "tick_interval_seconds": sim_config.get(
@@ -384,11 +397,42 @@ def _configure_race_engine(callback_context):
 
 race_engine.before_agent_callback = _configure_race_engine
 
+
+async def _configure_post_race(callback_context):
+    """Skip post-race debrief when pre-race setup did not complete.
+
+    Prevents running compile_results (which writes empty longitudinal run
+    records and overwrites Redis simdata) after a pre-race abort or failure,
+    and ensures any partially-started RaceCollector is stopped cleanly.
+    """
+    if not callback_context.state.get("simulation_ready"):
+        logger.warning("post_race: simulation_ready not set, skipping debrief")
+        callback_context.state["simulation_in_progress"] = False
+        sim_id = callback_context.state.get("simulation_id") or getattr(
+            getattr(callback_context, "session", None), "id", None
+        )
+        if sim_id:
+            from agents.simulator.collector import RaceCollector
+
+            collector = RaceCollector.get(str(sim_id))
+            if collector is not None:
+                try:
+                    await collector.stop()
+                except Exception:
+                    logger.debug("post_race: best-effort collector cleanup failed", exc_info=True)
+        return types.Content(
+            role="model",
+            parts=[types.Part.from_text(text="Post-race debrief skipped: pre-race setup did not complete.")],
+        )
+    return None
+
+
 post_race_agent = LlmAgent(
     name="post_race",
     model=resilient_model(SIMULATOR_MODEL),
     instruction=DEBRIEF_INSTRUCTION,
     tools=cast(list, post_race_tools + [post_race_skillset]),
+    before_agent_callback=_configure_post_race,
     generate_content_config=types.GenerateContentConfig(
         temperature=0.1,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -422,6 +466,46 @@ simulation_pipeline = SequentialAgent(
 # ---------------------------------------------------------------------------
 
 
+_ANONYMOUS_USER_IDS = frozenset({"simulation", "simulation_user", "anonymous", "default", "user"})
+
+
+def _resolve_callback_user_id(callback_context: object) -> str | None:
+    """Extract an authenticated non-anonymous str user_id from callback_context."""
+    if callback_context is None:
+        return None
+    candidates: list[object] = []
+    try:
+        ctx_state = getattr(callback_context, "state", None)
+        if ctx_state is None:
+            session_obj = getattr(callback_context, "session", None)
+            if session_obj is not None:
+                ctx_state = getattr(session_obj, "state", None)
+        if ctx_state is not None and hasattr(ctx_state, "get"):
+            for key in ("user_id", "acting_user_id", "userId"):
+                candidates.append(ctx_state.get(key))
+            tenant = ctx_state.get("tenant")
+            if isinstance(tenant, Mapping):
+                candidates.append(tenant.get("user_id"))
+    except Exception:
+        pass
+    inv_ctx = getattr(callback_context, "_invocation_context", None)
+    if inv_ctx is not None:
+        candidates.append(getattr(inv_ctx, "user_id", None))
+    candidates.append(getattr(callback_context, "user_id", None))
+    session_obj = getattr(callback_context, "session", None)
+    if session_obj is not None:
+        candidates.append(getattr(session_obj, "user_id", None))
+
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            continue
+        return cleaned
+    return None
+
+
 async def _capture_root_simulation_id(callback_context):
     """Capture simulation_id from the session for sub-agent propagation.
 
@@ -438,8 +522,22 @@ async def _capture_root_simulation_id(callback_context):
         session_id = str(callback_context.session.id)
         from agents.utils.simulation_registry import get_context_id
 
-        original_id = await get_context_id(session_id)
+        cb_user_id = _resolve_callback_user_id(callback_context)
+        try:
+            original_id = (
+                await get_context_id(session_id, user_id=cb_user_id)
+                if cb_user_id is not None
+                else await get_context_id(session_id)
+            )
+        except ValueError as exc:
+            logger.debug("simulator: skipped context_id lookup (%s)", exc)
+            original_id = None
         callback_context.state["simulation_id"] = original_id or session_id
+    # Reset the per-turn re-execution guard at the start of a new root-agent
+    # turn when no simulation is actively running, allowing multi-round
+    # simulations that reuse the same simulator session.
+    if "_pipeline_executed" in callback_context.state and not callback_context.state.get("simulation_in_progress"):
+        callback_context.state["_pipeline_executed"] = False
     return None
 
 
@@ -545,6 +643,7 @@ def _build_custom_pipeline(
         model=resilient_model(SIMULATOR_MODEL),
         instruction=DEBRIEF_INSTRUCTION,
         tools=cast(list, post_race_tools + [post_race_skillset]),
+        before_agent_callback=_configure_post_race,
         generate_content_config=types.GenerateContentConfig(
             temperature=0.1,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -659,11 +758,19 @@ simulator_a2a_agent, agent_card = create_a2a_deployment(
     skills=simulator_skills,
 )
 
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("SIMULATOR_PORT", "").strip()
+        or "9104"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("SIMULATOR_PORT", "9104")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info(f"Starting simulator agent server on port {port}")
 

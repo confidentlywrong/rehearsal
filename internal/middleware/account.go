@@ -3,10 +3,9 @@
 // Package middleware (account.go) provides the per-user identity
 // middleware that replaces the previous multi-org tenant middleware.
 //
-// In the per-user model there is no org concept and no SAAS_MODE
-// flag — every deployment is always Firebase Auth + per-user data.
-// Local development uses LocalResolver, which is refused in cloud
-// runtimes unless ALLOW_LOCAL_AUTH=1 is explicitly set.
+// Every deployment resolves per-user identity via Firebase Auth (or
+// LocalResolver in local dev, which is refused in cloud runtimes
+// unless ALLOW_LOCAL_AUTH=1 is explicitly set).
 package middleware
 
 import (
@@ -15,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -114,8 +114,7 @@ type AccountOptions struct {
 // Account returns a gin middleware that resolves a UserContext and
 // attaches it to the request's context.Context.
 //
-// Unlike the legacy Tenant middleware there is no SAAS_MODE check —
-// this middleware is ALWAYS mounted. Local development uses
+// This middleware is ALWAYS mounted. Local development uses
 // LocalResolver (refused in cloud runtimes unless ALLOW_LOCAL_AUTH=1).
 func Account(opts AccountOptions) gin.HandlerFunc {
 	if opts.Resolver == nil {
@@ -143,8 +142,10 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 		paymentHandler = defaultAccountPaymentFailed
 	}
 	paymentGrace := opts.PaymentFailedGracePeriod
-	if paymentGrace <= 0 {
+	if paymentGrace == 0 {
 		paymentGrace = 7 * 24 * time.Hour
+	} else if paymentGrace < 0 {
+		paymentGrace = 0
 	}
 	paymentExempt := append([]string{
 		"/api/v1/billing",
@@ -162,29 +163,19 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		path := c.Request.URL.Path
-		for _, p := range skips {
-			// Skip entries that already end in "/" are explicit
-			// subtree prefixes (e.g. "/__/auth/"); match by
-			// HasPrefix as written. Entries without a trailing
-			// slash must match the path exactly OR be followed by
-			// "/" so "/login" doesn't accidentally skip auth on a
-			// future "/logins" route (audit 2026-06-22, B-8).
-			if strings.HasSuffix(p, "/") {
-				if strings.HasPrefix(path, p) {
-					c.Next()
-					return
-				}
-			} else if path == p || strings.HasPrefix(path, p+"/") {
-				c.Next()
-				return
-			}
+		reqPath := "/"
+		if c.Request.URL != nil && c.Request.URL.Path != "" {
+			reqPath = path.Clean(c.Request.URL.Path)
+		}
+		if hasPathPrefix(reqPath, skips) {
+			c.Next()
+			return
 		}
 
 		uc, err := opts.Resolver.Resolve(c.Request)
 		if err != nil {
 			log.Printf("ACCOUNT: %s %s rejected: %v",
-				c.Request.Method, c.Request.URL.Path, err)
+				c.Request.Method, reqPath, err)
 			// P3 #17: surface revoked-token rejections with a distinct
 			// error code so the SPA can clear localStorage and bounce
 			// to /login instead of silently retrying.
@@ -222,13 +213,7 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 		// Identity verified, but user has no DB row yet: allow the
 		// /api/v1/me/init endpoint through and 409 everything else.
 		if uc.NeedsInit {
-			allowed := false
-			for _, p := range initPaths {
-				if path == p || strings.HasPrefix(path, p+"/") {
-					allowed = true
-					break
-				}
-			}
+			allowed := hasPathPrefix(reqPath, initPaths)
 			c.Set("account", uc)
 			c.Request = c.Request.WithContext(account.WithContext(c.Request.Context(), uc))
 			if !allowed {
@@ -259,20 +244,8 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 		// SAAS_MODE is off restores byte-identical legacy behaviour
 		// for local dev; the flow only fires under SAAS_MODE=on
 		// where a real admin queue exists.
-		if len(approvedPaths) > 0 && !uc.IsApproved() && uc.Status != "" && account.SaaSModeEnabled() {
-			allowed := false
-			for _, p := range approvedPaths {
-				if strings.HasSuffix(p, "/") {
-					if strings.HasPrefix(path, p) {
-						allowed = true
-						break
-					}
-				} else if path == p || strings.HasPrefix(path, p+"/") {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
+		if len(approvedPaths) > 0 && !uc.IsApproved() && account.SaaSModeEnabled() {
+			if !hasPathPrefix(reqPath, approvedPaths) {
 				notApprovedHandler(c, uc.Status)
 				return
 			}
@@ -281,7 +254,7 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 		// Payment-failed gate. Same fail-open semantics as
 		// DeletedUserCheck. Only fires on state-changing methods
 		// against non-exempt paths.
-		if paymentCheck != nil && uc.UserID != "" && isWriteMethod(c.Request.Method) && !hasPathPrefix(path, paymentExempt) {
+		if paymentCheck != nil && uc.UserID != "" && isWriteMethod(c.Request.Method) && !hasPathPrefix(reqPath, paymentExempt) {
 			failedAt, perr := paymentCheck(c.Request.Context(), uc.UserID)
 			if perr != nil {
 				log.Printf("ACCOUNT: payment-failed check errored user=%s: %v", uc.UserID, perr)
@@ -308,7 +281,7 @@ func Account(opts AccountOptions) gin.HandlerFunc {
 // unless ALLOW_LOCAL_AUTH=1 is explicitly set. This protects against
 // accidentally shipping the fixture to production.
 func AccountResolverFromEnv() (account.Resolver, error) {
-	provider := strings.TrimSpace(os.Getenv("IDENTITY_PROVIDER"))
+	provider := strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_PROVIDER")))
 	if provider == "" {
 		provider = "local"
 	}
@@ -341,15 +314,10 @@ func AccountResolverFromEnv() (account.Resolver, error) {
 // 403 unless the UserContext attached to the request has
 // IsSuperadmin=true.
 //
-// Unlike the legacy tenant.RequireSuperadmin there is no escalation
-// hook — IsSuperadmin is a boolean column on the users table and
+// IsSuperadmin is a boolean column on the users table and
 // the resolver always carries the current value (FirebaseResolver
 // reads it from Store.GetUser; LocalResolver reads it from the
 // X-Local-Dev-Superadmin header).
-//
-// TEMPORARY NAME: will be renamed to RequireSuperadmin once the
-// legacy tenant middleware is deleted (the two functions can't
-// coexist with the same name in the same package).
 func RequireSuperadmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		v, ok := c.Get("account")

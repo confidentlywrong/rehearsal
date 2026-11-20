@@ -23,30 +23,35 @@ No LLM dependency — pure Python logic using the coaching_prompts library.
 """
 
 import logging
+import math
+from typing import Any
 
-try:
-    from agents.ai_echo.coaching_prompts import (
-        get_coaching_prompt,
-        get_contradiction_prompt,
-        get_resource_crisis_prompt,
-    )
-except ImportError:
-    # Graceful degradation: if ai_echo is removed or renamed, the simulator
-    # continues to function with generic coaching prompts instead of crashing.
-    logger = logging.getLogger(__name__)
-    logger.warning("ai_echo.coaching_prompts unavailable; using generic coaching fallbacks")
-
-    def get_coaching_prompt(principle: str, tick: int, affected_echo: str = "") -> str:  # type: ignore[misc]
-        return f"Consider how {principle} applies to your current situation (tick {tick})."
-
-    def get_contradiction_prompt(commitment: str, tick: int) -> str:  # type: ignore[misc]
-        return f"Your actions may conflict with your commitment to {commitment} (tick {tick})."
-
-    def get_resource_crisis_prompt(resource: str, tick: int) -> str:  # type: ignore[misc]
-        return f"Resource {resource} is critically low — consider reallocating (tick {tick})."
-
+from agents.ai_echo.coaching_prompts import (
+    get_coaching_prompt,
+    get_contradiction_prompt,
+    get_resource_crisis_prompt,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: Any, default: float) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _str_list(raw: Any) -> list[str]:
+    """Extract non-empty strings from a list-like value safely."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, str) and item.strip()]
+
 
 # Resource names for display
 _RESOURCE_NAMES = {
@@ -80,16 +85,18 @@ def generate_micro_feedback(
         A single-line feedback string with emoji indicators.
     """
     parts: list[str] = []
+    safe_tags = decision_tags if isinstance(decision_tags, dict) else {}
+    safe_resources = resource_state if isinstance(resource_state, dict) else {}
 
     # 1. Acknowledge applied principles (strength-based)
-    applied = decision_tags.get("principles_applied", [])
+    applied = _str_list(safe_tags.get("principles_applied"))
     if applied:
         # Show the first applied principle, shortened
         principle_short = applied[0].split("&")[0].strip()
         parts.append(f"✅ Strong: {principle_short}")
 
     # 2. Flag neglected principles
-    neglected = decision_tags.get("principles_neglected", [])
+    neglected = _str_list(safe_tags.get("principles_neglected"))
     if neglected:
         neglected_short = neglected[0].split("&")[0].strip()
         parts.append(f"💭 Consider: {neglected_short}")
@@ -101,26 +108,28 @@ def generate_micro_feedback(
     # 4. Resource warnings (lowest resource approaching threshold)
     lowest_name = ""
     lowest_ratio = float("inf")
-    for name, pool in resource_state.items():
-        current = pool.get("current", 100)
-        threshold = pool.get("critical_threshold", 20)
+    lowest_val = 0.0
+    for name, pool in safe_resources.items():
+        if not isinstance(pool, dict) or not name:
+            continue
+        current = _finite_float(pool.get("current"), 100.0)
+        threshold = _finite_float(pool.get("critical_threshold"), 20.0)
         if threshold > 0:
             ratio = current / threshold
             if ratio < lowest_ratio:
                 lowest_ratio = ratio
-                lowest_name = name
+                lowest_name = str(name)
+                lowest_val = current
 
     if lowest_ratio < 1.0:
         display_name = _RESOURCE_NAMES.get(lowest_name, lowest_name.upper())
-        current_val = resource_state[lowest_name].get("current", 0)
-        parts.append(f"🔴 CRITICAL: {display_name} at {current_val:.0f}")
+        parts.append(f"🔴 CRITICAL: {display_name} at {lowest_val:.0f}")
     elif lowest_ratio < 1.5:
         display_name = _RESOURCE_NAMES.get(lowest_name, lowest_name.upper())
-        current_val = resource_state[lowest_name].get("current", 0)
-        parts.append(f"⚠️ Watch: {display_name} at {current_val:.0f}")
+        parts.append(f"⚠️ Watch: {display_name} at {lowest_val:.0f}")
 
     # 5. Active ECSI alerts
-    if alerts:
+    if isinstance(alerts, (list, tuple, set)) and alerts:
         parts.append(f"🔔 {len(alerts)} alert(s)")
 
     if not parts:
@@ -141,7 +150,8 @@ def _severity_bucket(current: float, threshold: float) -> str:
         return "ok"
     if current <= threshold:
         return "critical"
-    if current <= threshold * 1.5:
+    warn_limit = threshold * 1.5
+    if current <= warn_limit if math.isfinite(warn_limit) else (current / 1.5) <= threshold:
         return "warning"
     return "ok"
 
@@ -190,35 +200,48 @@ def build_coaching_card(
         caller should persist), or ``None`` when no card should be
         emitted.
     """
+    safe_resources = resource_state if isinstance(resource_state, dict) else {}
+    safe_tags = decision_tags if isinstance(decision_tags, dict) else {}
+    safe_tick = int(_finite_float(tick, 0))
+    safe_max_ticks = int(_finite_float(max_ticks, 0))
+
     # Determine the coaching trigger
     trigger_resource = None
     trigger_principle = None
     coaching_text = ""
 
     # Priority 1: Contradiction coaching
-    if contradiction_alert:
-        commitment = contradiction_alert.get("commitment_text", "a prior commitment")
-        coaching_text = get_contradiction_prompt(commitment, tick)
-        trigger_principle = contradiction_alert.get("violated_principle", "")
+    if isinstance(contradiction_alert, dict) and contradiction_alert:
+        commitment = str(contradiction_alert.get("commitment_text") or "a prior commitment")
+        coaching_text = get_contradiction_prompt(commitment, safe_tick)
+        trigger_principle = str(contradiction_alert.get("violated_principle") or "")
 
     # Priority 2: Resource crisis coaching
     if not coaching_text:
-        for name, pool in resource_state.items():
-            current = pool.get("current", 100)
-            threshold = pool.get("critical_threshold", 20)
-            # Early warning zone: between threshold and threshold * 1.5
-            if current < threshold * 1.5 and current > 0:
-                trigger_resource = name
-                coaching_text = get_resource_crisis_prompt(name, tick)
+        for name, pool in safe_resources.items():
+            if not isinstance(pool, dict) or not name:
+                continue
+            current = _finite_float(pool.get("current"), 100.0)
+            threshold = _finite_float(pool.get("critical_threshold"), 20.0)
+            # Early warning, critical, or depleted zone: below threshold * 1.5
+            warn_limit = threshold * 1.5
+            in_warn_zone = (
+                current < warn_limit
+                if math.isfinite(warn_limit)
+                else (current / 1.5) < threshold
+            )
+            if threshold > 0 and in_warn_zone:
+                trigger_resource = str(name)
+                coaching_text = get_resource_crisis_prompt(trigger_resource, safe_tick)
                 break
 
     # Priority 3: Principle coaching (if neglected principles detected)
     if not coaching_text:
-        neglected = decision_tags.get("principles_neglected", [])
+        neglected = _str_list(safe_tags.get("principles_neglected"))
         if neglected:
             trigger_principle = neglected[0]
             # Find which echo is most affected
-            coaching_text = get_coaching_prompt(trigger_principle, tick)
+            coaching_text = get_coaching_prompt(trigger_principle, safe_tick)
 
     if not coaching_text:
         return None
@@ -230,9 +253,12 @@ def build_coaching_card(
     # --------------------------------------------------------------
     severity_bucket = "info"
     if trigger_resource:
-        pool = resource_state.get(trigger_resource, {})
-        severity_bucket = _severity_bucket(pool.get("current", 100), pool.get("critical_threshold", 20))
-    elif contradiction_alert:
+        pool = safe_resources.get(trigger_resource, {})
+        severity_bucket = _severity_bucket(
+            _finite_float(pool.get("current"), 100.0),
+            _finite_float(pool.get("critical_threshold"), 20.0),
+        )
+    elif isinstance(contradiction_alert, dict) and contradiction_alert:
         severity_bucket = "contradiction"
     elif trigger_principle:
         severity_bucket = "principle"
@@ -244,7 +270,13 @@ def build_coaching_card(
         bool(contradiction_alert),
     )
 
-    if last_coaching_signature is not None and signature == last_coaching_signature:
+    # Normalize list-vs-tuple since JSON round-tripping converts tuples to lists.
+    normalized_prev_sig = (
+        tuple(last_coaching_signature)
+        if isinstance(last_coaching_signature, (list, tuple))
+        else last_coaching_signature
+    )
+    if normalized_prev_sig is not None and signature == normalized_prev_sig:
         # Nothing material has changed since the last card — stay quiet.
         return None
 
@@ -253,6 +285,7 @@ def build_coaching_card(
     # _severity_bucket scale: critical/contradiction -> red, warning/principle
     # -> amber, info -> neutral.
     _SEVERITY_PILL = {
+        "depleted": "severity-major",
         "critical": "severity-major",
         "contradiction": "severity-major",
         "warning": "severity-moderate",
@@ -262,43 +295,44 @@ def build_coaching_card(
     severity_pill_hint = _SEVERITY_PILL.get(severity_bucket, "severity-minor")
     resource_score_value: int | None = None
     resource_score_label: str | None = None
-    if contradiction_alert:
+    if isinstance(contradiction_alert, dict) and contradiction_alert:
         card_title = "💡 Integrity Check"
         severity = "Say-Do Gap Detected"
         severity_pill_hint = "severity-major"
     elif trigger_resource:
         display_name = _RESOURCE_NAMES.get(trigger_resource, trigger_resource.upper())
-        current_val = resource_state[trigger_resource].get("current", 0)
+        current_val = _finite_float(safe_resources[trigger_resource].get("current"), 0.0)
         card_title = "💡 Resource Advisory"
         # Pill carries only the severity word; the numeric value moves to
         # a ScoreBar below so the user sees the bar fill at a glance.
         severity = severity_bucket.upper()
-        resource_score_value = int(round(float(current_val)))
+        resource_score_value = int(round(current_val))
         resource_score_label = display_name
     else:
         card_title = "💡 Leadership Insight"
-        severity = f"Tick {tick}/{max_ticks}"
+        severity = f"Tick {safe_tick}/{safe_max_ticks}"
         severity_pill_hint = "severity-minor"
 
     # --------------------------------------------------------------
     # Causal context: what changed and why we're surfacing this now.
     # --------------------------------------------------------------
     cause_lines: list[str] = []
-    if trigger_resource and previous_resource_state:
+    if trigger_resource and isinstance(previous_resource_state, dict):
         prev_pool = previous_resource_state.get(trigger_resource, {})
-        prev_val = prev_pool.get("current")
-        if prev_val is not None:
-            curr_val = resource_state[trigger_resource].get("current", 0)
+        prev_raw = prev_pool.get("current") if isinstance(prev_pool, dict) else None
+        prev_val = _finite_float(prev_raw, float("nan"))
+        if math.isfinite(prev_val):
+            curr_val = _finite_float(safe_resources[trigger_resource].get("current"), 0.0)
             delta = curr_val - prev_val
-            if abs(delta) >= 0.5:
+            if math.isfinite(delta) and abs(delta) >= 0.5:
                 arrow = "▼" if delta < 0 else "▲"
                 display_name = _RESOURCE_NAMES.get(trigger_resource, trigger_resource.upper())
                 cause_lines.append(
                     f"{display_name} {arrow} {abs(delta):.0f} since last tick ({prev_val:.0f} → {curr_val:.0f})."
                 )
 
-    applied = decision_tags.get("principles_applied", []) or []
-    neglected = decision_tags.get("principles_neglected", []) or []
+    applied = _str_list(safe_tags.get("principles_applied"))
+    neglected = _str_list(safe_tags.get("principles_neglected"))
     if neglected:
         neglected_short = neglected[0].split("&")[0].strip()
         cause_lines.append(f"Last decision underweighted: {neglected_short}.")
