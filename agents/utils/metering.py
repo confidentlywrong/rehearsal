@@ -51,6 +51,7 @@ import os
 import sqlite3
 import sys
 import threading
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -240,7 +241,8 @@ class SqliteSink:
         # do this in __init__ (not on first emit) so configuration
         # errors surface at boot rather than on the first model call.
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, sqlite3.connect(self._path) as conn:
+        with self._lock, sqlite3.connect(self._path, timeout=10.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
             conn.executescript(_SQLITE_SCHEMA)
             # Run additive migrations for existing local DBs. SQLite has
             # no `ADD COLUMN IF NOT EXISTS`, so we swallow the
@@ -258,7 +260,8 @@ class SqliteSink:
         return self._path
 
     def emit(self, event: MeteringEvent) -> None:
-        with self._lock, sqlite3.connect(self._path) as conn:
+        with self._lock, sqlite3.connect(self._path, timeout=10.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute(
                 """
                 INSERT INTO metering_ledger
@@ -268,7 +271,7 @@ class SqliteSink:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    event.user_id,
+                    event.user_id or "unknown",
                     event.sim_id,
                     event.agent_type,
                     event.model,
@@ -399,9 +402,8 @@ def build_sink_from_env() -> MeteringSink:
     or ``none``. This is the guard that makes the metering pipeline a
     true no-op when nothing has explicitly opted in.
 
-    Unknown sink names log a warning and fall back to :class:`NullSink`
-    rather than raise — a typo in a deployment env var must not
-    break the simulation.
+    Raises:
+        ValueError: When ``METERING_SINK`` is set to an unrecognized value.
     """
     name = _sink_name()
     if name in ("", "none"):
@@ -412,11 +414,9 @@ def build_sink_from_env() -> MeteringSink:
         return SqliteSink()
     if name == "pubsub":
         return PubSubSink()
-    logger.warning(
-        "METERING_SINK=%r is not recognised; falling back to NullSink",
-        name,
+    raise ValueError(
+        f"Unrecognized METERING_SINK={name!r}; expected one of: none, stdout, sqlite, pubsub"
     )
-    return NullSink()
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +504,8 @@ def build_event(
     Exposed for tests; the plugin uses this internally.
     """
     state = _state_from_context(callback_context)
-    tenant_state: dict[str, Any] = state.get("tenant") or {}
+    raw_tenant = state.get("tenant")
+    tenant_state: dict[str, Any] = raw_tenant if isinstance(raw_tenant, dict) else {}
     prompt, completion, total = _usage_fields(llm_response)
     return MeteringEvent(
         user_id=_user_id(callback_context, tenant_state),
@@ -554,6 +555,7 @@ class MeteringPlugin:
     """
 
     name = "metering"
+    _MAX_TRACKED_INVOCATIONS = 4096
 
     def __init__(self, sink: MeteringSink | None = None) -> None:
         # ADK BasePlugin wants a ``name`` kwarg; we wrap to avoid a
@@ -569,9 +571,9 @@ class MeteringPlugin:
             pass
         self._sink: MeteringSink = sink or build_sink_from_env()
         # Map invocation_id -> model name, captured in before_model_callback
-        # so after_model_callback can stamp it on the event. ADK doesn't
-        # put the model on the response side.
-        self._model_for_invocation: dict[str, str] = {}
+        # so after_model_callback can stamp it on the event. Bounded via FIFO
+        # eviction so failed/cancelled invocations never leak unboundedly.
+        self._model_for_invocation: OrderedDict[str, str] = OrderedDict()
 
     @property
     def sink(self) -> MeteringSink:
@@ -592,9 +594,27 @@ class MeteringPlugin:
             model = getattr(llm_request, "model", None)
             inv_id = getattr(callback_context, "invocation_id", None)
             if model and inv_id:
-                self._model_for_invocation[str(inv_id)] = str(model)
+                key = str(inv_id)
+                if key in self._model_for_invocation:
+                    self._model_for_invocation.move_to_end(key)
+                self._model_for_invocation[key] = str(model)
+                while len(self._model_for_invocation) > self._MAX_TRACKED_INVOCATIONS:
+                    self._model_for_invocation.popitem(last=False)
         except Exception:  # noqa: BLE001
             logger.debug("METERING_BEFORE_MODEL_NOTE", exc_info=True)
+        return None
+
+    async def on_model_error_callback(
+        self,
+        *,
+        callback_context: Any,
+        llm_request: Any,
+        error: Exception,
+    ) -> None:
+        """Clean up cached model entry when a model call errors out."""
+        inv_id = getattr(callback_context, "invocation_id", None)
+        if inv_id:
+            self._model_for_invocation.pop(str(inv_id), None)
         return None
 
     async def after_model_callback(

@@ -63,8 +63,17 @@ func NewLocalResolver() *LocalResolver { return &LocalResolver{} }
 // remote-addr check makes that misuse impossible by construction.
 // Disable with LOCAL_RESOLVER_ALLOW_NON_LOOPBACK=true (only for
 // rare CI scenarios where the test client is on a different host).
-func (LocalResolver) Resolve(r *http.Request) (UserContext, error) {
-	if r != nil && !strings.EqualFold(os.Getenv("LOCAL_RESOLVER_ALLOW_NON_LOOPBACK"), "true") {
+func (lr *LocalResolver) Resolve(r *http.Request) (UserContext, error) {
+	if lr == nil {
+		return UserContext{}, errors.New("account: nil local resolver")
+	}
+	if isGCPRuntime() && os.Getenv("ALLOW_LOCAL_AUTH") != "1" {
+		return UserContext{}, errors.New("account: LocalResolver refuses GCP runtime without ALLOW_LOCAL_AUTH=1")
+	}
+	if r == nil {
+		return UserContext{}, ErrNoIdentity
+	}
+	if !strings.EqualFold(os.Getenv("LOCAL_RESOLVER_ALLOW_NON_LOOPBACK"), "true") {
 		if !isLoopbackRequest(r) {
 			return UserContext{}, errors.New("account: LocalResolver refuses non-loopback peer (set LOCAL_RESOLVER_ALLOW_NON_LOOPBACK=true to override)")
 		}
@@ -75,7 +84,7 @@ func (LocalResolver) Resolve(r *http.Request) (UserContext, error) {
 	}
 	uid := LocalDevUserID(email)
 	isAdmin := false
-	if r != nil && r.Header.Get(LocalSuperadminHeader) == "1" {
+	if r.Header.Get(LocalSuperadminHeader) == "1" {
 		isAdmin = true
 	}
 	return UserContext{
@@ -100,8 +109,8 @@ func (LocalResolver) Resolve(r *http.Request) (UserContext, error) {
 func isLoopbackRequest(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		// Unix socket or otherwise non-host:port — treat as local.
-		host = r.RemoteAddr
+		// Unix socket or bare host (including bracketed IPv6 like "[::1]").
+		host = strings.TrimSuffix(strings.TrimPrefix(r.RemoteAddr, "["), "]")
 	}
 	if host == "" {
 		return false
@@ -124,6 +133,17 @@ func LocalDevUserID(email string) string {
 	}
 	sum := sha256.Sum256([]byte(email))
 	return "local-dev-" + hex.EncodeToString(sum[:])[:12]
+}
+
+// isGCPRuntime reports whether Cloud Run / App Engine / Cloud Functions
+// runtime environment markers are set.
+func isGCPRuntime() bool {
+	for _, k := range []string{"K_SERVICE", "GAE_SERVICE", "FUNCTION_TARGET", "CLOUD_RUN_JOB"} {
+		if strings.TrimSpace(os.Getenv(k)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // Compile-time guard.

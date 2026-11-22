@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate JSON object payloads returned from /api/v1/usage.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -106,8 +108,11 @@ export class UsageService {
       if (!resp.ok) {
         return { available: false, status: resp.status };
       }
-      const data = (await resp.json()) as UsageResponse;
-      return { available: true, data, status: resp.status };
+      const data: unknown = await resp.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { available: false, status: resp.status };
+      }
+      return { available: true, data: data as UsageResponse, status: resp.status };
     } catch {
       // Network error — treat the same as disabled. The tile shows
       // "unavailable" rather than crashing the dashboard.

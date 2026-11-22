@@ -465,3 +465,40 @@ class TestL1CacheBound:
             sr._context_map.clear()
             monkeypatch.delenv("SIMREG_L1_MAX_ENTRIES", raising=False)
             importlib.reload(sr)
+
+
+class TestTenantL1Isolation:
+    """Verify L1 caches are isolated per DISPATCHER_USER_ID when SAAS_MODE=on."""
+
+    @pytest.fixture(autouse=True)
+    async def _clear(self, monkeypatch):
+        _local.clear()
+        _context_map.clear()
+        monkeypatch.delenv("SAAS_MODE", raising=False)
+        monkeypatch.delenv("DISPATCHER_USER_ID", raising=False)
+        yield
+        _local.clear()
+        _context_map.clear()
+
+    @pytest.mark.asyncio
+    async def test_simulation_registry_l1_isolated_by_dispatcher_user_id(self, monkeypatch):
+        monkeypatch.setenv("SAAS_MODE", "on")
+
+        monkeypatch.setenv("DISPATCHER_USER_ID", "alice")
+        await register("shared-sess", "sim-alice")
+        await register_context("shared-vertex", "ctx-alice")
+        assert await lookup("shared-sess") == "sim-alice"
+        assert await get_context_id("shared-vertex") == "ctx-alice"
+
+        monkeypatch.setenv("DISPATCHER_USER_ID", "bob")
+        assert await lookup("shared-sess") is None
+        assert await get_context_id("shared-vertex") is None
+
+        await register("shared-sess", "sim-bob")
+        await register_context("shared-vertex", "ctx-bob")
+        assert await lookup("shared-sess") == "sim-bob"
+        assert await get_context_id("shared-vertex") == "ctx-bob"
+
+        monkeypatch.setenv("DISPATCHER_USER_ID", "alice")
+        assert await lookup("shared-sess") == "sim-alice"
+        assert await get_context_id("shared-vertex") == "ctx-alice"

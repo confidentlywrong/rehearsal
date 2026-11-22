@@ -15,12 +15,14 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import time
 import httpx
 import logging
 import asyncio
 import re
+from collections.abc import Mapping
 from typing import Optional, Dict, Any, Union
 from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 from a2a.client.client import ClientConfig as A2AClientConfig
@@ -36,10 +38,162 @@ from a2a.types import (
 )
 from agents.utils import auth as oidc_auth
 from agents.utils import config
+from agents.utils import tenant_keys
+from agents.utils import user_auth_context
+from agents.utils.gateway import get_gateway_url
 from google.adk.tools.tool_context import ToolContext
 from agents.utils.pulses import emit_inter_agent_pulse
 
 logger = logging.getLogger(__name__)
+
+_ANONYMOUS_USER_IDS = frozenset({"simulation", "simulation_user", "anonymous", "default", "user"})
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def strict_json_dumps(obj: object, **kwargs: Any) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON, replacing non-finite floats with null."""
+    try:
+        return json.dumps(obj, allow_nan=False, **kwargs)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, **kwargs)
+
+
+def _extract_str_field(mapping: Any, *keys: str) -> Optional[str]:
+    """Extract the first non-empty stripped string value for *keys* from *mapping*."""
+    if not isinstance(mapping, Mapping):
+        return None
+    for key in keys:
+        val = mapping.get(key)
+        if isinstance(val, str):
+            stripped = val.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def resolve_tool_context_user_id(
+    tool_context: Any,
+    *,
+    require_when_saas: bool = True,
+) -> Optional[str]:
+    """Resolve the acting user_id from a ToolContext.
+
+    Inspection order:
+      1. ``tool_context.state``: ``user_id``, ``acting_user_id``, ``userId``,
+         or ``state["tenant"]["user_id"]``.
+      2. ``tool_context._invocation_context.user_id`` (if present).
+      3. ``tool_context.user_id`` (ADK ReadonlyContext property).
+      4. ``tool_context.session.user_id`` (if present).
+
+    When ``SAAS_MODE=on``, raises ``ValueError`` if an explicit anonymous
+    ``user_id`` (e.g. ``"simulation_user"``) is encountered in ``state``, if
+    ``tenant_keys._validate_component`` fails, or (when ``require_when_saas``
+    is True) if no valid authenticated ``user_id`` can be resolved.
+    When ``SAAS_MODE=off``, returns ``None`` if absent or anonymous so legacy
+    single-tenant workflows remain backward-compatible.
+    """
+    saas_on = tenant_keys._saas_mode_enabled()
+    if tool_context is None:
+        if saas_on and require_when_saas:
+            raise ValueError("Authenticated user_id is required when SAAS_MODE=on")
+        return None
+
+    candidates: list[tuple[str, Any]] = []
+    state = getattr(tool_context, "state", None)
+    if state is not None and hasattr(state, "get"):
+        for key in ("user_id", "acting_user_id", "userId"):
+            candidates.append((f"state.{key}", state.get(key)))
+        tenant = state.get("tenant")
+        if isinstance(tenant, Mapping):
+            candidates.append(("state.tenant.user_id", tenant.get("user_id")))
+
+    inv_ctx = getattr(tool_context, "_invocation_context", None)
+    if inv_ctx is not None:
+        candidates.append(("_invocation_context.user_id", getattr(inv_ctx, "user_id", None)))
+
+    candidates.append(("tool_context.user_id", getattr(tool_context, "user_id", None)))
+
+    session = getattr(tool_context, "session", None)
+    if session is not None:
+        candidates.append(("session.user_id", getattr(session, "user_id", None)))
+
+    for source, raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        if cleaned.lower() in _ANONYMOUS_USER_IDS:
+            if saas_on and source.startswith("state."):
+                raise ValueError(f"Authenticated user_id is required when SAAS_MODE=on (got {cleaned!r})")
+            continue
+        if saas_on:
+            return tenant_keys._validate_component(cleaned, "user_id")
+        return cleaned
+
+    if saas_on and require_when_saas:
+        raise ValueError("Authenticated user_id is required when SAAS_MODE=on")
+    return None
+
+
+def _resolve_a2a_user_id(
+    message: Union[str, Dict[str, Any]],
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve user_id from explicit argument or JSON payload for A2AMessage.metadata."""
+    saas_on = tenant_keys._saas_mode_enabled()
+
+    raw_uid: Optional[str] = None
+    if user_id is not None:
+        if not isinstance(user_id, str):
+            raise ValueError(f"Invalid user_id type: {type(user_id).__name__}")
+        cleaned = user_id.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            if saas_on:
+                raise ValueError("Authenticated user_id is required when SAAS_MODE=on")
+            return None
+        raw_uid = cleaned
+    else:
+        data: Optional[Mapping[str, Any]] = None
+        if isinstance(message, Mapping):
+            data = message
+        elif isinstance(message, str) and message.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(message)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, Mapping):
+                data = parsed
+
+        if data is not None:
+            candidate = _extract_str_field(data, "user_id", "acting_user_id", "userId")
+            if not candidate:
+                candidate = _extract_str_field(data.get("payload"), "acting_user_id", "user_id", "userId")
+            if candidate:
+                if candidate.lower() in _ANONYMOUS_USER_IDS:
+                    if saas_on:
+                        raise ValueError("Authenticated user_id is required when SAAS_MODE=on")
+                    return None
+                raw_uid = candidate
+
+    if not raw_uid:
+        if saas_on:
+            raise ValueError("Authenticated user_id is required when SAAS_MODE=on")
+        return None
+
+    if saas_on:
+        return tenant_keys._validate_component(raw_uid, "user_id")
+    return raw_uid
 
 # Module-level discovery cache (shared across all SimulationA2AClient instances).
 # M4: keyed by gateway_url so processes that serve multiple tenants with
@@ -49,21 +203,34 @@ _discovery_cache: dict[str, dict[str, Any]] = {}
 _discovery_cache_ts: dict[str, float] = {}
 _DISCOVERY_CACHE_TTL: float = 30.0  # Match gateway's 30s TTL
 
-# Shared httpx client for agent discovery
+# Shared httpx client for agent discovery (scoped to the running event loop)
 _discovery_client: httpx.AsyncClient | None = None
+_discovery_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_discovery_client() -> httpx.AsyncClient:
     """Get or create a shared httpx client for discovery calls.
 
-    Thread-safety: This runs on a single asyncio event loop. The check-and-set
-    has no `await` in between, so there is no concurrent initialization risk
-    within the same event loop. The client intentionally lives for the process
-    lifetime (no close).
+    Recreates the client if it has been closed or if the running asyncio
+    event loop has changed (or the previously recorded loop was closed).
     """
-    global _discovery_client
-    if _discovery_client is None:
+    global _discovery_client, _discovery_client_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if (
+        _discovery_client is None
+        or getattr(_discovery_client, "is_closed", False)
+        or (_discovery_client_loop is not None and _discovery_client_loop.is_closed())
+        or (
+            _discovery_client_loop is not None
+            and current_loop is not None
+            and _discovery_client_loop is not current_loop
+        )
+    ):
         _discovery_client = httpx.AsyncClient(timeout=5.0)
+        _discovery_client_loop = current_loop
     return _discovery_client
 
 
@@ -114,7 +281,7 @@ class _OIDCAuth(httpx.Auth):
 
 class SimulationA2AClient:
     """
-    Standardized client for inter-agent communication in the N26 Simulation.
+    Standardized client for inter-agent communication in the Leadership Simulation.
     Handles discovery via the Gateway and resilience for scale-to-zero.
     """
 
@@ -123,13 +290,10 @@ class SimulationA2AClient:
         # Prefer GATEWAY_INTERNAL_URL (Cloud Run internal, bypasses IAP) over
         # GATEWAY_URL (public/IAP-fronted). AE agents can reach the internal
         # URL via VPC/PSC but cannot authenticate through IAP.
-        self.gateway_url = (
-            gateway_url
-            or os.environ.get("GATEWAY_INTERNAL_URL")
-            or config.optional("GATEWAY_URL", "http://localhost:8101")
-        )
+        self.gateway_url = get_gateway_url(gateway_url)
         self._registry_cache: Dict[str, AgentCard] = {}
         self._agents: Dict[str, RemoteA2aAgent] = {}
+        self._http_clients: list[httpx.AsyncClient] = []
 
     # [START a2a_discovery]
     async def _discover_agents(self) -> Dict[str, AgentCard]:
@@ -175,7 +339,10 @@ class SimulationA2AClient:
             return cards
         except Exception as e:
             logger.error(f"A2A_DISCOVERY_ERROR: Failed to fetch agent types from {url}: {e}")
-            return self._registry_cache
+            if self._registry_cache:
+                logger.warning("A2A_DISCOVERY: Returning stale registry cache after Gateway fetch failure")
+                return self._registry_cache
+            raise RuntimeError(f"Agent discovery failed from {url}: {e}") from e
 
     # [END a2a_discovery]
 
@@ -189,7 +356,10 @@ class SimulationA2AClient:
             # Fallback to env var if not in registry.
             # Check both {NAME}_URL and {NAME}_INTERNAL_URL (AE deployments
             # use INTERNAL_URL format).
-            url = os.environ.get(f"{name.upper()}_URL") or os.environ.get(f"{name.upper()}_INTERNAL_URL")
+            url = (
+                (os.environ.get(f"{name.upper()}_URL") or "").strip()
+                or (os.environ.get(f"{name.upper()}_INTERNAL_URL") or "").strip()
+            )
             if not url:
                 raise ValueError(f"Agent '{name}' not found in registry and no {name.upper()}_URL provided.")
 
@@ -246,10 +416,19 @@ class SimulationA2AClient:
             # IAP-fronted dev/prod). This is what unblocks OSS deploys
             # where the cloud-run-iam module enforces roles/run.invoker.
             client_auth = _OIDCAuth(audience=oidc_auth.resolve_audience(card.url or ""))
+        raw_a2a_timeout = (os.environ.get("A2A_CALL_TIMEOUT_SECONDS") or "").strip()
+        try:
+            a2a_timeout_secs = float(raw_a2a_timeout) if raw_a2a_timeout else 900.0
+        except ValueError:
+            a2a_timeout_secs = 900.0
+        if not math.isfinite(a2a_timeout_secs) or a2a_timeout_secs <= 0:
+            a2a_timeout_secs = 900.0
+
         httpx_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout=300.0),
+            timeout=httpx.Timeout(timeout=a2a_timeout_secs, connect=30.0),
             auth=client_auth,
         )
+        self._http_clients.append(httpx_client)
         # AE agents MUST use http_json (REST) transport — AE's RESTHandler
         # rejects JSON-RPC payloads with a protobuf ParseError on the "id"
         # field, returning a sporadic 400 FAILED_PRECONDITION.
@@ -271,7 +450,7 @@ class SimulationA2AClient:
             name=name,
             agent_card=card,
             a2a_client_factory=factory,
-            timeout=300.0,  # Long timeout: simulation pipelines take minutes
+            timeout=a2a_timeout_secs,  # Long timeout: simulation pipelines take minutes
         )
         self._agents[name] = agent
         return agent
@@ -283,6 +462,8 @@ class SimulationA2AClient:
         retries: int = 3,
         backoff: float = 1.5,
         session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        user_auth_token: Optional[str] = None,
     ) -> Any:
         """
         Call a remote agent with retry logic for scale-to-zero resilience.
@@ -292,12 +473,24 @@ class SimulationA2AClient:
             message: The message string or JSON dict to send.
             retries: Number of retries for 5xx or connection errors.
             backoff: Backoff multiplier for retries.
+            session_id: Optional A2A context_id.
+            user_id: Optional authenticated user_id to attach as A2A message metadata.
+            user_auth_token: Optional per-user bearer token to attach as A2A message metadata.
         """
+        resolved_user_id = _resolve_a2a_user_id(message, user_id=user_id)
+        resolved_token: Optional[str] = None
+        if isinstance(user_auth_token, str):
+            cleaned_tok = user_auth_token.strip()
+            if cleaned_tok and user_auth_context._is_valid_bearer_token(cleaned_tok):
+                resolved_token = cleaned_tok
+        if resolved_token is None and session_id:
+            resolved_token = user_auth_context.get_session_token(session_id)
+
         agent = await self.get_agent(agent_name)
 
         # Prepare parts
         if isinstance(message, dict):
-            text = json.dumps(message)
+            text = strict_json_dumps(message)
         else:
             text = str(message)
 
@@ -317,20 +510,29 @@ class SimulationA2AClient:
                 from uuid import uuid4
 
                 msg_id = str(uuid4())
+                msg_metadata: dict[str, Any] = {}
+                if resolved_user_id:
+                    msg_metadata["user_id"] = resolved_user_id
+                if resolved_token:
+                    msg_metadata["user_auth_token"] = resolved_token
+
                 a2a_msg = A2AMessage(
                     message_id=msg_id,
                     parts=[Part(root=TextPart(text=text))],
                     role=Role.user,
                     context_id=session_id,
+                    metadata=msg_metadata or None,
                 )
 
-                # DIAGNOSTIC: Log the context_id being sent
+                # DIAGNOSTIC: Log the context_id being sent (never log raw tokens).
                 logger.info(
-                    "A2A_CALL_IDS: sending to %s msg_id=%s context_id=%s session_id=%s",
+                    "A2A_CALL_IDS: sending to %s msg_id=%s context_id=%s session_id=%s user_id=%s has_auth_token=%s",
                     agent_name,
                     msg_id,
                     a2a_msg.context_id,
                     session_id,
+                    resolved_user_id,
+                    bool(resolved_token),
                 )
 
                 # Ensure resolved (resolves HTTPS client etc)
@@ -466,23 +668,28 @@ class SimulationA2AClient:
         raise RuntimeError(f"A2A_CALL_FAILED: All {attempt} attempts failed for {agent_name}")
 
     async def close(self):
-        """Best-effort cleanup of cached RemoteA2aAgent instances.
-
-        Note: RemoteA2aAgent does not currently expose a cleanup/close method,
-        so this only clears the local cache. The underlying httpx connections
-        managed by RemoteA2aAgent will be garbage-collected.
-        """
-        for agent in self._agents.values():
+        """Close cached RemoteA2aAgent instances and underlying httpx connection pools."""
+        for name, agent in list(self._agents.items()):
             try:
                 if hasattr(agent, "cleanup"):
                     await agent.cleanup()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("A2A_CLIENT_CLOSE: agent cleanup failed for %s: %s", name, exc)
         self._agents.clear()
+        for hc in self._http_clients:
+            try:
+                await hc.aclose()
+            except Exception as exc:
+                logger.warning("A2A_CLIENT_CLOSE: httpx client close failed: %s", exc)
+        self._http_clients.clear()
 
 
 async def call_agent(
-    agent_name: str, message: str, tool_context: ToolContext, session_id: Optional[str] = None
+    agent_name: str,
+    message: str,
+    tool_context: ToolContext,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> dict:
     """Proactively send a message or instruction to another agent via A2A.
 
@@ -495,8 +702,16 @@ async def call_agent(
         session_id: Optional explicit session ID for the target agent. If not
             provided, a fresh UUID is generated per call to avoid session reuse
             between caller and callee.
+        user_id: Optional authenticated user_id for tenant-scoped A2A metadata.
     """
     logger.info(f"A2A_CALL: Agent calling {agent_name} with: {message}")
+
+    try:
+        ctx_user_id = resolve_tool_context_user_id(tool_context, require_when_saas=False)
+        resolved_user_id = _resolve_a2a_user_id(message, user_id=ctx_user_id or user_id)
+    except ValueError as e:
+        logger.error(f"A2A_CALL_ERROR: Invalid or missing user_id calling {agent_name}: {e}")
+        return {"status": "error", "message": str(e)}
 
     # Access the shared client via the plugin's registry
     from agents.utils.communication_plugin import get_client
@@ -510,12 +725,30 @@ async def call_agent(
         # original context_id so the frontend's session-based filters match.
         from agents.utils.simulation_registry import get_context_id
 
-        origin_session = str(tool_context.session.id)
-        mapped = await get_context_id(origin_session)
+        raw_session = getattr(tool_context, "session", None)
+        raw_session_id = getattr(raw_session, "id", None)
+        origin_session = str(raw_session_id or "default")
+        mapped = (
+            await get_context_id(origin_session, user_id=resolved_user_id)
+            if resolved_user_id is not None
+            else await get_context_id(origin_session)
+        )
         if mapped:
             origin_session = mapped
 
-        simulation_id = tool_context.state.get("simulation_id")
+        caller_token: Optional[str] = None
+        if isinstance(raw_session_id, str) and raw_session_id:
+            caller_token = user_auth_context.get_session_token(raw_session_id)
+        if (
+            caller_token is None
+            and origin_session
+            and origin_session != "default"
+            and origin_session != raw_session_id
+        ):
+            caller_token = user_auth_context.get_session_token(origin_session)
+
+        state_obj = getattr(tool_context, "state", None)
+        simulation_id = state_obj.get("simulation_id") if state_obj is not None and hasattr(state_obj, "get") else None
 
         # Emit a pulse to show inter-agent communication (Request)
         await emit_inter_agent_pulse(
@@ -524,6 +757,7 @@ async def call_agent(
             to_agent=agent_name,
             message=message,
             simulation_id=simulation_id,
+            user_id=resolved_user_id,
         )
 
         # Use explicit session_id if provided, otherwise generate a fresh UUID
@@ -531,7 +765,16 @@ async def call_agent(
         from uuid import uuid4
 
         target_session_id = session_id or str(uuid4())
-        response = await a2a_client.call_agent(agent_name, message, session_id=target_session_id)
+        call_kwargs: dict[str, Any] = {"session_id": target_session_id}
+        if resolved_user_id is not None:
+            call_kwargs["user_id"] = resolved_user_id
+        if caller_token is not None:
+            call_kwargs["user_auth_token"] = caller_token
+        response = await a2a_client.call_agent(
+            agent_name,
+            message,
+            **call_kwargs,
+        )
 
         # Emit a pulse for the response
         resp_prefix = str(response)[:100] + ("..." if len(str(response)) > 100 else "")
@@ -542,6 +785,7 @@ async def call_agent(
             message=resp_prefix,
             direction="response",
             simulation_id=simulation_id,
+            user_id=resolved_user_id,
         )
         return {"status": "success", "agent": agent_name, "response": response}
     except Exception as e:

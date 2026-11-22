@@ -38,8 +38,14 @@ func ChunkDocument(text string, maxTokens int) []string {
 	paragraphs := splitParagraphs(text)
 
 	// Merge short paragraphs / split long ones into word-counted
-	// segments of roughly maxTokens words each.
-	segments := mergeAndSplit(paragraphs, maxTokens)
+	// segments. When maxTokens > chunkOverlap, leave headroom for
+	// trailing overlap from the previous segment so applyOverlap
+	// preserves context without exceeding maxTokens.
+	segmentMax := maxTokens
+	if maxTokens > chunkOverlap {
+		segmentMax = maxTokens - chunkOverlap
+	}
+	segments := mergeAndSplit(paragraphs, segmentMax)
 
 	if len(segments) <= 1 {
 		return segments

@@ -14,7 +14,7 @@ license: Apache-2.0
 A2UI is a declarative JSON protocol for delivering rich UI from agents
 to client surfaces. UI is composed as a flat list of components where
 layout containers reference children by ID. The protocol enforces typed
-value wrappers and a fixed catalog of 18 primitives.
+value wrappers and a fixed catalog of 20 primitives.
 
 ## When to Compose A2UI
 
@@ -143,7 +143,7 @@ belong to the collapsible body (no auto-rip).
 
 ## Component Catalog
 
-For the full catalog of 18 primitives, with required and optional
+For the full catalog of 20 primitives, with required and optional
 props plus per-type notes, see [components.md](components.md).
 
 ## Examples

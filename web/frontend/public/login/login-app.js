@@ -26,27 +26,33 @@
 // three <script> tags in index.html in their current order.
 (function () {
   var qs = new URLSearchParams(location.search);
-  var redirectTarget = qs.get('redirect') || '/';
+  var rawRedirect = qs.get('redirect') || qs.get('next') || '/';
+  var redirectTarget = '/';
   // Defense against open-redirect (2026-06-21 audit P2):
   // - reject anything not starting with '/'
-  // - reject '//' (protocol-relative URL → cross-origin)
-  // - reject '/\' (browsers normalize backslash to '/' in URLs, so
-  //   '/\evil.com' becomes '//evil.com' at navigation time)
-  // - normalize via the URL constructor and only keep pathname +
-  //   search so encoded tricks like '/%2f%2fevil.com' can't
-  //   smuggle a cross-origin redirect either.
+  // - reject '//' or multi-slash prefixes (protocol-relative URL -> cross-origin)
+  // - reject backslashes and ASCII control characters
+  // - normalize via the URL constructor and enforce same origin
+  // - preserve hash-route when no explicit hash is present in target
   try {
-    if (typeof redirectTarget !== 'string' ||
-        !redirectTarget.startsWith('/') ||
-        redirectTarget.startsWith('//') ||
-        redirectTarget.startsWith('/\\')) {
-      redirectTarget = '/';
-    } else {
-      var parsed = new URL(redirectTarget, location.origin);
-      if (parsed.origin !== location.origin) {
-        redirectTarget = '/';
-      } else {
-        redirectTarget = parsed.pathname + parsed.search + parsed.hash;
+    var trimmedRedirect = typeof rawRedirect === 'string' ? rawRedirect.trim() : '';
+    var hasUnsafeChars = /[\u0000-\u001f\u007f\\]/.test(trimmedRedirect);
+    if (
+      trimmedRedirect &&
+      !hasUnsafeChars &&
+      trimmedRedirect.startsWith('/') &&
+      !trimmedRedirect.startsWith('//')
+    ) {
+      var parsed = new URL(trimmedRedirect, location.origin);
+      if (
+        parsed.origin === location.origin &&
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        parsed.pathname.startsWith('/') &&
+        !parsed.pathname.startsWith('//')
+      ) {
+        var preservedHash =
+          !parsed.hash && location.hash && location.hash.startsWith('#/') ? location.hash : '';
+        redirectTarget = parsed.pathname + parsed.search + (parsed.hash || preservedHash);
       }
     }
   } catch (e) {
@@ -222,9 +228,14 @@
     // gstatic origins) -- see P3.E + P2.A (2026-06-22 audit).
     // Previously this was an inline `script.textContent = [...]`
     // module, which blocked enabling CSP enforcement.
+    var scriptLoadFailed = false;
     var script = document.createElement('script');
     script.type = 'module';
     script.src = '/login/firebase-bootstrap.js';
+    script.onerror = function () {
+      scriptLoadFailed = true;
+      showError('Failed to load authentication service. Please reload the page and try again.');
+    };
     document.head.appendChild(script);
 
     setMode('signin');
@@ -267,11 +278,15 @@
       // window.__rcSignIn is still undefined — without this guard
       // the call would throw a cryptic TypeError. Show a clear,
       // actionable message instead and let them retry.
-      if (mode !== 'reset' && typeof window.__rcSignIn !== 'function') {
-        showError('Authentication is still loading. Please wait a moment and try again.');
+      if (scriptLoadFailed) {
+        showError('Failed to load authentication service. Please reload the page and try again.');
         return;
       }
-      if (mode === 'reset' && typeof window.__rcResetPassword !== 'function') {
+      if (
+        (mode === 'signin' && typeof window.__rcSignIn !== 'function') ||
+        (mode === 'signup' && typeof window.__rcSignUp !== 'function') ||
+        (mode === 'reset' && typeof window.__rcResetPassword !== 'function')
+      ) {
         showError('Authentication is still loading. Please wait a moment and try again.');
         return;
       }

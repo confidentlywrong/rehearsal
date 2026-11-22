@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard NaN/non-finite progress, distance, and finisher metrics, add configurable simulation timing inputs, and add button types/accessibility labels in SimulationPanelComponent.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,11 +42,16 @@ import {
       <div class="simulation-running-panel">
         <div class="top-bar">
           <h1>Simulation progress</h1>
-          <button class="expand-btn sim" (click)="expand.emit()">
-            <span class="material-icons">unfold_more</span>
+          <button
+            type="button"
+            class="expand-btn sim"
+            aria-label="Expand simulation panel"
+            (click)="expand.emit()"
+          >
+            <span class="material-icons" aria-hidden="true">unfold_more</span>
           </button>
         </div>
-        <div class="progress-container" [style.--progress]="simulationProgress">
+        <div class="progress-container" [style.--progress]="safeProgress">
           <p class="time">
             <span class="time-part">
               <span class="time-num" [countUp]="hours"></span>
@@ -61,13 +68,13 @@ import {
 
         <div class="distance">
           <div class="stat">
-            <p class="value">{{ averageDistance | number : '1.1-1' }}</p>
+            <p class="value">{{ safeAverageDistance | number : '1.1-1' }}</p>
             <p class="label">AVG. DECISIONS <span>(rounds)</span></p>
           </div>
         </div>
         <div class="statistics">
           <div class="stat">
-            <p class="value" [countUp]="numberOfFinishers"></p>
+            <p class="value" [countUp]="safeFinishers"></p>
             <p class="label">ALIGNED STAKEHOLDERS</p>
           </div>
           <div class="stat">
@@ -76,14 +83,22 @@ import {
           </div>
         </div>
         <div class="button-container">
-          <button [disabled]="isFollowingLeader" (click)="followLeader.emit()" class="followButton">
+          <button
+            type="button"
+            [disabled]="isFollowingLeader"
+            (click)="followLeader.emit()"
+            class="followButton"
+          >
             Follow the leader
           </button>
-          <button class="followButton" (click)="followRandomRunner.emit()">
+          <button
+            type="button"
+            class="followButton"
+            (click)="followRandomRunner.emit()"
+          >
             I'm feeling lucky
           </button>
         </div>
-
       </div>
     </div>
   `,
@@ -94,17 +109,52 @@ export class SimulationPanelComponent {
   @Input() numberOfFinishers = 0;
   @Input() averagePace = '0:00';
   @Input() isFollowingLeader = false;
+  @Input() maxTicks = HARDCODED_SIM_MAX_TICKS;
+  @Input() tickIntervalSec = HARDCODED_SIM_TICK_INTERVAL_SEC;
+  @Input() totalSimHours = HARDCODED_SIM_TOTAL_RACE_HOURS;
 
   @Output() followLeader = new EventEmitter<void>();
   @Output() followRandomRunner = new EventEmitter<void>();
   @Output() expand = new EventEmitter<void>();
 
+  get safeProgress(): number {
+    return typeof this.simulationProgress === 'number' && Number.isFinite(this.simulationProgress)
+      ? Math.max(0, Math.min(100, this.simulationProgress))
+      : 0;
+  }
+
+  get safeAverageDistance(): number {
+    const val =
+      typeof this.averageDistance === 'number'
+        ? this.averageDistance
+        : Number(this.averageDistance);
+    return Number.isFinite(val) ? Math.max(0, val) : 0;
+  }
+
+  get safeFinishers(): number {
+    return typeof this.numberOfFinishers === 'number' && Number.isFinite(this.numberOfFinishers)
+      ? Math.max(0, Math.floor(this.numberOfFinishers))
+      : 0;
+  }
+
   private getSimulationElapsedTimeParts(): { hours: number; mins: number } {
-    const wallSec = HARDCODED_SIM_MAX_TICKS * HARDCODED_SIM_TICK_INTERVAL_SEC;
-    const elapsedWallSec = (this.simulationProgress / 100) * wallSec;
+    const ticks = typeof this.maxTicks === 'number' && Number.isFinite(this.maxTicks) && this.maxTicks > 0
+      ? this.maxTicks
+      : HARDCODED_SIM_MAX_TICKS;
+    const interval = typeof this.tickIntervalSec === 'number' && Number.isFinite(this.tickIntervalSec) && this.tickIntervalSec > 0
+      ? this.tickIntervalSec
+      : HARDCODED_SIM_TICK_INTERVAL_SEC;
+    const simHours = typeof this.totalSimHours === 'number' && Number.isFinite(this.totalSimHours) && this.totalSimHours > 0
+      ? this.totalSimHours
+      : HARDCODED_SIM_TOTAL_RACE_HOURS;
+    const wallSec = ticks * interval;
+    if (!Number.isFinite(wallSec) || wallSec <= 0) {
+      return { hours: 0, mins: 0 };
+    }
+    const elapsedWallSec = (this.safeProgress / 100) * wallSec;
     const total = Math.max(
       0,
-      Math.floor((elapsedWallSec / wallSec) * HARDCODED_SIM_TOTAL_RACE_HOURS * 60),
+      Math.floor((elapsedWallSec / wallSec) * simHours * 60),
     );
     return {
       hours: Math.floor(total / 60),

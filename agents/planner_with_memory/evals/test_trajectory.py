@@ -24,7 +24,9 @@ Requires Gemini API access. Run with: make eval
 
 import pytest
 
-_EVAL_MODEL = "gemini-3.5-flash-lite"
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL
+
+_EVAL_MODEL = DEFAULT_FLASH_LITE_MODEL
 
 
 def _collect_tool_calls(events) -> list[str]:

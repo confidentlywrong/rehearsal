@@ -85,9 +85,13 @@ func WithPortalAPIBase(base string) StripePortalOption {
 	return func(s *StripePortalCreator) { s.apiBase = strings.TrimRight(base, "/") }
 }
 
-// WithPortalHTTPClient injects a custom http.Client.
+// WithPortalHTTPClient injects a custom http.Client. Ignores nil.
 func WithPortalHTTPClient(c *http.Client) StripePortalOption {
-	return func(s *StripePortalCreator) { s.httpClient = c }
+	return func(s *StripePortalCreator) {
+		if c != nil {
+			s.httpClient = c
+		}
+	}
 }
 
 // NewStripePortalCreator constructs a real Stripe-backed portal
@@ -113,6 +117,9 @@ func (s *StripePortalCreator) Name() string { return "stripe" }
 // Create implements PortalCreator. Single POST to
 // /v1/billing_portal/sessions; returns the hosted-portal URL.
 func (s *StripePortalCreator) Create(ctx context.Context, customerID, returnURL string) (string, error) {
+	if s == nil || s.httpClient == nil || s.apiKey == "" || s.apiBase == "" {
+		return "", errors.New("billing: StripePortalCreator not initialized")
+	}
 	if customerID == "" {
 		// Caller should have short-circuited with a 409 before
 		// reaching us; returning unavailable here gives the
@@ -139,7 +146,7 @@ func (s *StripePortalCreator) Create(ctx context.Context, customerID, returnURL 
 		return "", fmt.Errorf("billing: portal request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, readErr := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
 		return "", fmt.Errorf("billing: read portal response: %w", readErr)
 	}

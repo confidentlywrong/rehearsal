@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -87,3 +89,48 @@ async def test_compute_embedding_raises_on_api_failure() -> None:
     with patch.object(embeddings, "_get_genai_client", return_value=fake_client):
         with pytest.raises(RuntimeError, match="quota exceeded"):
             await embeddings.compute_embedding("hello")
+
+
+@pytest.mark.asyncio
+async def test_compute_embedding_defaults_when_env_unset_or_whitespace(monkeypatch) -> None:
+    """Unset or whitespace-only EMBEDDING_MODEL falls back to DEFAULT_EMBEDDING_MODEL."""
+    from agents.utils.models import DEFAULT_EMBEDDING_MODEL
+
+    fake_client = MagicMock()
+    fake_client.aio.models.embed_content = AsyncMock(
+        return_value=MagicMock(embeddings=[MagicMock(values=[0.1] * 3072)])
+    )
+    monkeypatch.setenv("EMBEDDING_MODEL", "   ")
+    with (
+        patch("agents.utils.local_ai.is_local_gemma_active", return_value=False),
+        patch.object(embeddings, "_get_genai_client", return_value=fake_client),
+    ):
+        await embeddings.compute_embedding("hello")
+
+    await_args = fake_client.aio.models.embed_content.await_args
+    assert await_args is not None
+    assert await_args.kwargs["model"] == DEFAULT_EMBEDDING_MODEL
+
+
+def test_get_genai_client_treats_whitespace_project_as_unset(monkeypatch) -> None:
+    """Whitespace-only GOOGLE_CLOUD_PROJECT must not activate vertexai=True."""
+    embeddings._clear_genai_client_cache()
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "   ")
+    monkeypatch.delenv("PROJECT_ID", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", " test-api-key ")
+
+    created_kwargs: list[dict] = []
+
+    def fake_client(**kwargs):
+        created_kwargs.append(kwargs)
+        return MagicMock()
+
+    try:
+        with patch.object(embeddings.genai, "Client", side_effect=fake_client):
+            embeddings._get_genai_client()
+    finally:
+        embeddings._clear_genai_client_cache()
+
+    assert len(created_kwargs) == 1
+    assert created_kwargs[0]["vertexai"] is False
+    assert created_kwargs[0]["api_key"] == "test-api-key"

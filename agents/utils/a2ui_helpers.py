@@ -13,6 +13,8 @@
 # limitations under the License.
 
 def parse_markdown_blocks(text: str, prefix_id: str) -> tuple[list[dict], list[str]]:
+    if not text or not text.strip():
+        return [], []
     lines = text.strip().split("\n")
     components = []
     child_ids = []
@@ -25,6 +27,7 @@ def parse_markdown_blocks(text: str, prefix_id: str) -> tuple[list[dict], list[s
             return
         text_str = "\n".join(current_text).strip()
         if not text_str:
+            current_text = []
             return
         c_id = f"{prefix_id}-block-{block_id}"
         block_id += 1

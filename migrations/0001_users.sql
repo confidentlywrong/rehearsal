@@ -117,8 +117,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM information_schema.constraint_column_usage
-         WHERE table_name = 'users' AND constraint_name = 'users_status_check'
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'users_status_check'
+           AND conrelid = 'users'::regclass
     ) THEN
         ALTER TABLE users
             ADD CONSTRAINT users_status_check

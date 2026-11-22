@@ -145,29 +145,41 @@ cat <<'EOF'
 📝 Tear down with: ./scripts/teardown.sh
 ====================================================
 EOF
-read -p "Proceed? (y/n) " -n 1 -r REPLY
+REPLY=""
+read -p "Proceed? (y/n) " -n 1 -r REPLY || { echo ""; echo "Cancelled."; exit 1; }
 echo
-[[ $REPLY =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 1; }
+[[ "${REPLY}" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 1; }
 
 # --- Phase 2: project selection ------------------------------------------
 PROJECT_ID=""
+OPT=""
 echo ""
 echo "📁 Project Selection:"
 PS3="Choose: "
 select OPT in "Enter project ID" "Pick from list (gcloud projects list)"; do
   case "$OPT" in
     "Enter project ID")
-      read -p "Project ID: " PROJECT_ID
+      read -r -p "Project ID: " PROJECT_ID || { echo "Cancelled."; exit 1; }
       break
       ;;
     "Pick from list (gcloud projects list)")
-      mapfile -t PROJS < <(gcloud projects list --limit=20 --format="value(projectId)")
+      PROJS=()
+      projs_out=""
+      if projs_out=$(gcloud projects list --limit=20 --format="value(projectId)" 2>/dev/null); then
+        while IFS= read -r line; do
+          if [[ -n "$line" ]]; then
+            PROJS+=("$line")
+          fi
+        done <<EOF
+${projs_out}
+EOF
+      fi
       if [[ ${#PROJS[@]} -eq 0 ]]; then
         echo "No projects accessible to current gcloud auth. Falling back to manual entry."
-        read -p "Project ID: " PROJECT_ID
+        read -r -p "Project ID: " PROJECT_ID || { echo "Cancelled."; exit 1; }
       else
         select PROJECT_ID in "${PROJS[@]}"; do
-          [[ -n "$PROJECT_ID" ]] && break
+          [[ -n "${PROJECT_ID:-}" ]] && break
         done
       fi
       break
@@ -182,11 +194,22 @@ done
 # --- Phase 3: region selection -------------------------------------------
 echo ""
 echo "🌐 Region Selection:"
-mapfile -t REGIONS < <(allowed_regions)
+REGIONS=()
+regions_out=$(allowed_regions)
+while IFS= read -r line; do
+  if [[ -n "$line" ]]; then
+    REGIONS+=("$line")
+  fi
+done <<EOF
+${regions_out}
+EOF
+[[ ${#REGIONS[@]} -gt 0 ]] || { echo "ERROR: no allowed regions configured" >&2; exit 1; }
+REGION=""
 PS3="Choose: "
 select REGION in "${REGIONS[@]}"; do
-  [[ -n "$REGION" ]] && break
+  [[ -n "${REGION:-}" ]] && break
 done
+[[ -n "$REGION" ]] || { echo "ERROR: region is required" >&2; exit 1; }
 
 # --- Phase 4: final confirmation -----------------------------------------
 echo ""
@@ -195,14 +218,24 @@ echo "🚀 About to deploy:"
 echo "   Project: $PROJECT_ID"
 echo "   Region:  $REGION"
 echo "===================================================="
-read -p "Confirm? (y/n) " -n 1 -r REPLY
+REPLY=""
+read -p "Confirm? (y/n) " -n 1 -r REPLY || { echo ""; echo "Cancelled."; exit 1; }
 echo
-[[ $REPLY =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 1; }
+[[ "${REPLY}" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 1; }
 
 # --- Phase 5: submit -----------------------------------------------------
 echo ""
 preflight_project "$PROJECT_ID"
 echo "📦 Submitting Cloud Build job..."
-mapfile -t ARGV < <(build_submit_argv "$PROJECT_ID" "$REGION")
+ARGV=()
+argv_out=$(build_submit_argv "$PROJECT_ID" "$REGION")
+while IFS= read -r line; do
+  if [[ -n "$line" ]]; then
+    ARGV+=("$line")
+  fi
+done <<EOF
+${argv_out}
+EOF
+[[ ${#ARGV[@]} -gt 0 ]] || { echo "ERROR: build_submit_argv produced no arguments" >&2; exit 1; }
 echo "Running: ${ARGV[*]}"
 exec "${ARGV[@]}"

@@ -27,10 +27,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import re
+import threading
 import time
+import urllib.parse
 import uuid
+import weakref
 from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 from google.cloud import secretmanager
@@ -80,7 +86,8 @@ def _resolve_password() -> str:
     if _cached is not None and (now - _cached[1]) < _SECRET_TTL_SECONDS:
         return _cached[0]
 
-    secret_name = f"projects/{_resolve_sm_project()}/secrets/{_SM_SECRET}/versions/latest"
+    secret_id = os.environ.get("ALLOYDB_SECRET_NAME", _SM_SECRET).strip() or _SM_SECRET
+    secret_name = f"projects/{_resolve_sm_project()}/secrets/{secret_id}/versions/latest"
     try:
         response = _get_sm_client().access_secret_version(name=secret_name)
         password = response.payload.data.decode("utf-8").strip()
@@ -96,19 +103,121 @@ def _resolve_password() -> str:
         raise ValueError(f"Could not fetch AlloyDB password from Secret Manager ({secret_name}).")
 
 
+def _parse_int_env(
+    name: str,
+    default: int,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    """Safely parse an integer environment variable with optional bounds clamping."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; falling back to %d", name, raw, default)
+        return default
+    if min_value is not None and value < min_value:
+        if max_value is not None:
+            logger.warning("Out-of-range %s=%d; falling back to %d", name, value, default)
+            return default
+        return min_value
+    if max_value is not None and value > max_value:
+        logger.warning("Out-of-range %s=%d; falling back to %d", name, value, default)
+        return default
+    return value
+
+
+def _validate_schema_name(raw_schema: str | None, default: str = "public") -> str:
+    """Validate ALLOYDB_SCHEMA as a safe PostgreSQL identifier."""
+    schema_name = (raw_schema or default).strip() or default
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema_name):
+        raise ValueError(f"Invalid ALLOYDB_SCHEMA identifier: {schema_name!r}")
+    return schema_name
+
+
+def _sanitize_score(score: float | None) -> float | None:
+    """Return a finite float score or None if missing/invalid/non-finite."""
+    if score is None or isinstance(score, bool):
+        return None
+    try:
+        val = float(score)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(val):
+        logger.warning("Ignoring non-finite evaluation_score: %r", score)
+        return None
+    return val
+
+
+def _clamp_non_negative_limit(raw: object, default: int, max_limit: int = 500) -> int:
+    """Safely coerce and clamp a limit parameter to [0, max_limit]."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return default
+        val = int(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return default
+        try:
+            val = int(s)
+        except ValueError:
+            try:
+                fv = float(s)
+            except (ValueError, OverflowError):
+                return default
+            if not math.isfinite(fv):
+                return default
+            val = int(fv)
+    else:
+        return default
+    if val <= 0:
+        return 0
+    return min(val, max_limit)
+
+
+def _strip_nonfinite(obj: Any) -> Any:
+    """Recursively convert NaN/Inf floats to None so JSONB payloads remain valid RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nonfinite(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def _json_dumps(obj: Any, *, default: Any = None) -> str:
+    """Serialize *obj* to strict JSON without NaN/Infinity tokens rejected by PostgreSQL JSONB."""
+    try:
+        return json.dumps(obj, allow_nan=False, default=default)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, default=default)
+
+
 def _get_dsn() -> str:
-    """Build a DSN from environment variables."""
-    host = os.environ.get("ALLOYDB_HOST")
+    """Build a DSN from environment variables with URL-encoded credentials."""
+    host = os.environ.get("ALLOYDB_HOST", "").strip()
     if not host:
         raise ValueError(
             "ALLOYDB_HOST environment variable is required for AlloyDBScenarioStore. "
             "Set it to the private IP of the AlloyDB instance."
         )
-    database = os.environ.get("ALLOYDB_DATABASE", "postgres")
-    user = os.environ.get("ALLOYDB_USER", "postgres")
-    password = _resolve_password()
-    port = int(os.environ.get("ALLOYDB_PORT", "5432"))
-    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    database = urllib.parse.quote(os.environ.get("ALLOYDB_DATABASE", "postgres"), safe="")
+    user = urllib.parse.quote(os.environ.get("ALLOYDB_USER", "postgres"), safe="")
+    password = urllib.parse.quote(_resolve_password(), safe="")
+    port = _parse_int_env("ALLOYDB_PORT", 5432, min_value=1, max_value=65535)
+    host_str = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"postgresql://{user}:{password}@{host_str}:{port}/{database}"
 
 
 # _get_conn() was removed — all queries now use the connection pool
@@ -118,57 +227,132 @@ def _get_dsn() -> str:
 # ---------------------------------------------------------------------------
 # Connection pool (replaces per-query asyncpg.connect for stability)
 # ---------------------------------------------------------------------------
+_state_lock = threading.Lock()
+_pools: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncpg.Pool] = weakref.WeakKeyDictionary()
+_pool_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 _pool: asyncpg.Pool | None = None
-_pool_lock = asyncio.Lock()
+_pool_lock: asyncio.Lock | None = None
+_pool_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _cleanup_closed_loop_pools() -> None:
+    """Terminate and remove cached pools whose event loop is already closed.
+
+    Caller must hold ``_state_lock``.
+    """
+    global _pool, _pool_lock, _pool_loop
+    for loop_key in [lp for lp in list(_pools) if lp.is_closed()]:
+        stale_pool = _pools.pop(loop_key, None)
+        _pool_locks.pop(loop_key, None)
+        if stale_pool is not None and hasattr(stale_pool, "terminate"):
+            try:
+                stale_pool.terminate()
+            except Exception:
+                logger.debug("Failed terminating stale AlloyDB pool for closed loop", exc_info=True)
+        if _pool is stale_pool:
+            _pool = None
+            _pool_lock = None
+            _pool_loop = None
 
 
 async def _get_pool() -> asyncpg.Pool:
-    """Lazy-init a connection pool for AlloyDB.
+    """Lazy-init a per-event-loop connection pool for AlloyDB.
 
     Mirrors agents/planner_with_memory/memory/store_alloydb.py.
     Using a pool avoids the TCP connect/TLS handshake overhead per query
     that previously caused connection storms and AlloyDB proxy crashes.
     """
-    global _pool
-    if _pool is not None and not _pool.is_closing():
-        return _pool
-    async with _pool_lock:
-        # Double-check after acquiring lock
-        if _pool is not None and not _pool.is_closing():
+    global _pool, _pool_lock, _pool_loop
+    current_loop = asyncio.get_running_loop()
+
+    with _state_lock:
+        # Honor explicit test resets of module globals (`_pool = None; _pool_lock = None; _pool_loop = None`)
+        if _pool is None and _pool_lock is None and _pool_loop is None:
+            _pools.pop(current_loop, None)
+            _pool_locks.pop(current_loop, None)
+        _cleanup_closed_loop_pools()
+
+        existing = _pools.get(current_loop)
+        if existing is not None and not existing.is_closing():
+            return existing
+        if _pool is not None and _pool_loop is None and not _pool.is_closing():
             return _pool
-        schema_name = os.environ.get("ALLOYDB_SCHEMA", "public")
-        min_size = int(os.environ.get("ALLOYDB_POOL_MIN", "2"))
-        max_size = int(os.environ.get("ALLOYDB_POOL_MAX", "10"))
-        _pool = await asyncpg.create_pool(
+
+        lock = _pool_locks.get(current_loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            _pool_locks[current_loop] = lock
+            if _pool_loop is None or _pool_loop is current_loop or _pool_loop.is_closed():
+                _pool_lock = lock
+                _pool_loop = current_loop
+
+    async with lock:
+        with _state_lock:
+            existing = _pools.get(current_loop)
+            if existing is not None and not existing.is_closing():
+                return existing
+            if _pool is not None and _pool_loop is None and not _pool.is_closing():
+                return _pool
+
+        schema_name = _validate_schema_name(os.environ.get("ALLOYDB_SCHEMA"), default="public")
+        min_size = _parse_int_env("ALLOYDB_POOL_MIN", 2, min_value=1)
+        max_size = _parse_int_env("ALLOYDB_POOL_MAX", 10, min_value=min_size)
+        new_pool = await asyncpg.create_pool(
             _get_dsn(),
             min_size=min_size,
             max_size=max_size,
             server_settings={"search_path": f"{schema_name}, public"},
             command_timeout=10,
         )
+        with _state_lock:
+            _pools[current_loop] = new_pool
+            _pool = new_pool
+            _pool_lock = lock
+            _pool_loop = current_loop
         logger.info("AlloyDB connection pool created (min=%d, max=%d)", min_size, max_size)
-        return _pool
+        return new_pool
 
 
 def _row_to_scenario(row: asyncpg.Record) -> PlannedScenario:
     """Convert an asyncpg row from leadership_scenarios to a PlannedScenario.
 
-    Uses ``.get()`` for ``persona`` and ``owner_id`` because these
-    columns were added in later migrations and some SELECT statements
-    don't project them.
+    Checks ``"persona" in row.keys()`` and ``"owner_id" in row.keys()``
+    rather than calling ``row.get(...)`` so ``Record`` stubs lacking
+    ``.get()`` work reliably alongside ``asyncpg.Record``.
     """
+    raw_sd = row["scenario_data"]
+    if raw_sd is None:
+        raise ValueError("scenario_data must not be NULL in leadership_scenarios")
+    if isinstance(raw_sd, (str, bytes, bytearray)):
+        try:
+            scenario_data = json.loads(raw_sd)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Corrupt scenario_data JSONB: {exc}") from exc
+    else:
+        scenario_data = raw_sd
+    if not isinstance(scenario_data, dict):
+        raise ValueError("scenario_data JSONB must decode to a dict")
+
+    decoded_eval = _decode_jsonb(row["eval_result"])
+    if decoded_eval is not None and not isinstance(decoded_eval, dict):
+        logger.warning(
+            "Ignoring non-dict eval_result JSONB (%s) for scenario %s",
+            type(decoded_eval).__name__,
+            row["scenario_id"],
+        )
+        decoded_eval = None
+
+    row_keys = row.keys()
     return PlannedScenario(
         scenario_id=row["scenario_id"],
-        scenario_data=json.loads(row["scenario_data"])
-        if isinstance(row["scenario_data"], str)
-        else row["scenario_data"],
+        scenario_data=scenario_data,
         created_at=row["created_at"].replace(tzinfo=timezone.utc)
         if row["created_at"].tzinfo is None
         else row["created_at"],
         evaluation_score=row["eval_score"],
-        evaluation_result=json.loads(row["eval_result"]) if isinstance(row["eval_result"], str) else row["eval_result"],
-        persona=row.get("persona"),
-        owner_id=row.get("owner_id"),
+        evaluation_result=decoded_eval,
+        persona=(row["persona"] if "persona" in row_keys else None),
+        owner_id=(row["owner_id"] if "owner_id" in row_keys else None),
     )
 
 
@@ -178,17 +362,26 @@ async def _load_simulations(conn: asyncpg.Connection, scenario_id: str) -> list[
         "FROM leadership_simulation_records WHERE scenario_id = $1 ORDER BY simulated_at ASC",
         scenario_id,
     )
-    return [
-        SimulationRecord(
-            simulation_id=r["simulation_id"],
-            scenario_id=r["scenario_id"],
-            simulation_result=json.loads(r["sim_result"]) if isinstance(r["sim_result"], str) else r["sim_result"],
-            simulated_at=r["simulated_at"].replace(tzinfo=timezone.utc)
-            if r["simulated_at"].tzinfo is None
-            else r["simulated_at"],
+    records: list[SimulationRecord] = []
+    for r in rows:
+        decoded_sim = _decode_jsonb(r["sim_result"])
+        if decoded_sim is not None and not isinstance(decoded_sim, dict):
+            logger.warning(
+                "Unexpected non-dict sim_result type %s; falling back to empty dict",
+                type(decoded_sim).__name__,
+            )
+        sim_result: dict = decoded_sim if isinstance(decoded_sim, dict) else {}
+        records.append(
+            SimulationRecord(
+                simulation_id=r["simulation_id"],
+                scenario_id=r["scenario_id"],
+                simulation_result=sim_result,
+                simulated_at=r["simulated_at"].replace(tzinfo=timezone.utc)
+                if r["simulated_at"].tzinfo is None
+                else r["simulated_at"],
+            )
         )
-        for r in rows
-    ]
+    return records
 
 
 class AlloyDBScenarioStore:
@@ -212,6 +405,7 @@ class AlloyDBScenarioStore:
         which keeps the single-tenant call path byte-identical.
         """
         scenario_id = str(uuid.uuid4())
+        safe_score = _sanitize_score(evaluation_score)
         pool = await _get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -220,9 +414,9 @@ class AlloyDBScenarioStore:
                 VALUES ($1, $2::jsonb, now(), $3, $4::jsonb, $5, $6)
                 """,
                 scenario_id,
-                json.dumps(scenario_data),
-                evaluation_score,
-                json.dumps(evaluation_result) if evaluation_result is not None else None,
+                _json_dumps(scenario_data),
+                safe_score,
+                _json_dumps(evaluation_result) if evaluation_result is not None else None,
                 persona,
                 owner_id,
             )
@@ -292,11 +486,13 @@ class AlloyDBScenarioStore:
                     """,
                     sim_id,
                     scenario_id,
-                    json.dumps(simulation_result),
+                    _json_dumps(simulation_result),
                 )
                 return sim_id
+            except asyncpg.ForeignKeyViolationError:
+                return None
             except Exception as e:
-                # asyncpg raises ForeignKeyViolationError for missing scenario_id
+                # Fallback for driver/stub exceptions representing a foreign-key violation
                 if "foreign key" in str(e).lower() or "ForeignKeyViolation" in type(e).__name__:
                     return None
                 raise
@@ -312,6 +508,9 @@ class AlloyDBScenarioStore:
         When ``owner_id`` is set, only rows owned by that user are
         returned; unowned legacy rows are excluded.
         """
+        safe_count = _clamp_non_negative_limit(count, default=10, max_limit=500)
+        if safe_count == 0:
+            return []
         order = "created_at DESC" if sort_by != "best_score" else "eval_score DESC NULLS LAST"
         pool = await _get_pool()
         async with pool.acquire() as conn:
@@ -319,14 +518,14 @@ class AlloyDBScenarioStore:
                 rows = await conn.fetch(
                     f"SELECT scenario_id, scenario_data, created_at, eval_score, eval_result, persona, owner_id "
                     f"FROM leadership_scenarios ORDER BY {order} LIMIT $1",
-                    count,
+                    safe_count,
                 )
             else:
                 rows = await conn.fetch(
                     f"SELECT scenario_id, scenario_data, created_at, eval_score, eval_result, persona, owner_id "
                     f"FROM leadership_scenarios WHERE owner_id = $1 ORDER BY {order} LIMIT $2",
                     owner_id,
-                    count,
+                    safe_count,
                 )
             return [_row_to_scenario(r) for r in rows]
 
@@ -370,6 +569,7 @@ class AlloyDBScenarioStore:
         owner_id: str | None = None,
     ) -> None:
         """Insert a scenario preserving its original scenario_id (used by seed loader)."""
+        safe_score = _sanitize_score(evaluation_score)
         pool = await _get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
@@ -379,10 +579,10 @@ class AlloyDBScenarioStore:
                 ON CONFLICT (scenario_id) DO NOTHING
                 """,
                 scenario_id,
-                json.dumps(scenario_data),
+                _json_dumps(scenario_data),
                 created_at,
-                evaluation_score,
-                json.dumps(evaluation_result) if evaluation_result is not None else None,
+                safe_score,
+                _json_dumps(evaluation_result) if evaluation_result is not None else None,
                 owner_id,
             )
 
@@ -401,9 +601,11 @@ class AlloyDBScenarioStore:
         row was updated (i.e., at least one field was eligible for write
         AND the caller owns the scenario when ``owner_id`` is set).
         """
+        safe_score = _sanitize_score(evaluation_score)
         # No-op if caller has nothing to offer.
-        if evaluation_score is None and evaluation_result is None:
+        if safe_score is None and evaluation_result is None:
             return False
+        serialized_result = _json_dumps(evaluation_result) if evaluation_result is not None else None
         pool = await _get_pool()
         async with pool.acquire() as conn:
             if owner_id is None:
@@ -417,8 +619,8 @@ class AlloyDBScenarioStore:
                      RETURNING scenario_id
                     """,
                     scenario_id,
-                    evaluation_score,
-                    json.dumps(evaluation_result) if evaluation_result is not None else None,
+                    safe_score,
+                    serialized_result,
                 )
             else:
                 row = await conn.fetchrow(
@@ -432,8 +634,8 @@ class AlloyDBScenarioStore:
                      RETURNING scenario_id
                     """,
                     scenario_id,
-                    evaluation_score,
-                    json.dumps(evaluation_result) if evaluation_result is not None else None,
+                    safe_score,
+                    serialized_result,
                     owner_id,
                 )
             return row is not None
@@ -467,7 +669,7 @@ class AlloyDBScenarioStore:
         is owned by the caller).
         """
         encoded = {
-            key: (json.dumps(artifacts[key]) if artifacts.get(key) is not None else None)
+            key: (_json_dumps(artifacts[key]) if artifacts.get(key) is not None else None)
             for key in self._ARTIFACT_KEYS
         }
         pool = await _get_pool()
@@ -611,18 +813,10 @@ class AlloyDBScenarioStore:
                 return None
             result: dict = {}
             for key in self._ARTIFACT_KEYS:
-                value = row[key]
-                if value is None:
+                decoded = _decode_jsonb(row[key])
+                if decoded is None:
                     continue
-                # asyncpg returns JSONB as str unless a codec is registered;
-                # decode defensively so callers see Python objects either way.
-                if isinstance(value, (str, bytes, bytearray)):
-                    try:
-                        result[key] = json.loads(value)
-                    except (TypeError, ValueError):
-                        result[key] = value
-                else:
-                    result[key] = value
+                result[key] = decoded
             return result if result else None
 
     # ------------------------------------------------------------------
@@ -648,9 +842,14 @@ class AlloyDBScenarioStore:
         **Return-shape contract** (shared with :class:`ScenarioMemoryStore`):
         each dict has keys ``scenario_id``, ``eval_score``, ``created_at``,
         ``stakeholder_graph``, ``stakeholder_personas``,
-        ``stakeholder_reactions``. Artifact values are ``dict | None``;
-        AlloyDB decodes via ``_decode_jsonb``, in-memory returns raw dicts.
+        ``stakeholder_reactions``, ``simulation_timeline``,
+        ``simulation_report``, and ``stakeholder_interview``. Artifact
+        values are ``dict | list | None``; AlloyDB decodes via
+        ``_decode_jsonb``, in-memory returns raw Python objects.
         """
+        safe_limit = _clamp_non_negative_limit(limit, default=100, max_limit=500)
+        if safe_limit == 0:
+            return []
         pool = await _get_pool()
         async with pool.acquire() as conn:
             if owner_id is None:
@@ -671,7 +870,7 @@ class AlloyDBScenarioStore:
                      ORDER BY ls.created_at DESC
                      LIMIT $1
                     """,
-                    limit,
+                    safe_limit,
                 )
             else:
                 rows = await conn.fetch(
@@ -694,13 +893,17 @@ class AlloyDBScenarioStore:
                      LIMIT $2
                     """,
                     owner_id,
-                    limit,
+                    safe_limit,
                 )
             return [
                 {
                     "scenario_id": row["scenario_id"],
                     "eval_score": row["eval_score"],
-                    "created_at": row["created_at"],
+                    "created_at": (
+                        row["created_at"].replace(tzinfo=timezone.utc)
+                        if row["created_at"] is not None and row["created_at"].tzinfo is None
+                        else row["created_at"]
+                    ),
                     "stakeholder_graph": _decode_jsonb(row["stakeholder_graph"]),
                     "stakeholder_personas": _decode_jsonb(row["stakeholder_personas"]),
                     "stakeholder_reactions": _decode_jsonb(row["stakeholder_reactions"]),
@@ -721,10 +924,20 @@ class AlloyDBScenarioStore:
         Call from the ADK agent's shutdown hook so local-dev restarts
         don't leak TCP connections to the AlloyDB proxy.
         """
-        global _pool
-        if _pool is not None:
-            await _pool.close()
-            _pool = None
+        global _pool, _pool_lock, _pool_loop
+        current_loop = asyncio.get_running_loop()
+        with _state_lock:
+            _cleanup_closed_loop_pools()
+            pool = _pools.pop(current_loop, None)
+            _pool_locks.pop(current_loop, None)
+            if pool is None and _pool is not None and _pool_loop in (None, current_loop):
+                pool = _pool
+            if _pool is pool or _pool_loop in (None, current_loop):
+                _pool = None
+                _pool_lock = None
+                _pool_loop = None
+        if pool is not None:
+            await pool.close()
             logger.info("AlloyDB connection pool closed.")
 
 

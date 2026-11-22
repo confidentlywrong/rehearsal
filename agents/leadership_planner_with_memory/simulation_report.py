@@ -34,9 +34,9 @@ Design choices (locked 2026-06-28 by the operator):
   `state["stakeholder_personas"]` + the user's plan and supplies the
   structured report as one JSON payload. The tool only validates +
   stashes.
-* **No persistence yet.** Report lives in `tool_context.state`.
-  Postgres rows come later when the user starts wanting to look back
-  across past simulations.
+* **Persisted via artifact bundle.** Report lives in `tool_context.state`
+  during the run and is persisted alongside the other stakeholder
+  artifacts via `store_stakeholder_artifacts()` / `store_scenario()`.
 * **Invented data is allowed here** — simulation layer. Default
   `inferred: true` and the UI tags the card as a synthetic report.
 * **Stakeholder ids match personas when available.** When personas
@@ -52,11 +52,17 @@ Downstream consumers:
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_citations,
+    validate_optional_rationale,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -277,15 +283,9 @@ async def emit_simulation_report(
         On failure: ``{"status": "error", "field": "...", "message": "..."}``.
     """
     # 1. Parse the JSON envelope (lenient: accept a dict directly).
-    if isinstance(report_json, dict):
-        data = report_json
-    else:
-        try:
-            data = json.loads(report_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(report_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Required top-level fields.
     headline, err = _validate_short_string("headline", data.get("headline"), MAX_HEADLINE_CHARS)
@@ -319,9 +319,8 @@ async def emit_simulation_report(
     findings: list[dict[str, Any]] = []
     for i, raw in enumerate(findings_raw):
         normalized, err = _validate_finding(i, raw)
-        if err:
-            return _err(err, field="key_findings")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid key finding", field="key_findings")
         findings.append(normalized)
 
     # 4. Resolve known persona ids (permissive when absent).
@@ -356,9 +355,8 @@ async def emit_simulation_report(
         seen_sids: set[str] = set()
         for i, raw in enumerate(summaries_raw):
             normalized, err = _validate_stakeholder_summary(i, raw, known_ids)
-            if err:
-                return _err(err, field="stakeholder_summaries")
-            assert normalized is not None
+            if err or normalized is None:
+                return _err(err or "invalid stakeholder summary", field="stakeholder_summaries")
             sid = normalized["stakeholder_id"]
             if sid in seen_sids:
                 return _err(
@@ -381,17 +379,21 @@ async def emit_simulation_report(
             )
         for i, raw in enumerate(recs_raw):
             normalized, err = _validate_recommendation(i, raw, known_ids)
-            if err:
-                return _err(err, field="recommendations")
-            assert normalized is not None
+            if err or normalized is None:
+                return _err(err or "invalid recommendation", field="recommendations")
             recs.append(normalized)
 
+    # 8. Optional rationale + citations + inferred flag.
+    rationale_clean, rationale_err = validate_optional_rationale(
+        data.get("rationale"),
+        max_chars=MAX_RATIONALE_CHARS,
+    )
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
-    # 8. Optional rationale + inferred flag.
-    rationale = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale, str) and rationale.strip():
-        rationale_clean = rationale.strip()[:MAX_RATIONALE_CHARS]
+    citations_clean, citations_err = validate_citations(data.get("citations"))
+    if citations_err:
+        return _err(citations_err, field="citations")
 
     inferred = data.get("inferred", True)
     if not isinstance(inferred, bool):
@@ -410,8 +412,13 @@ async def emit_simulation_report(
         payload["recommendations"] = recs
     if rationale_clean:
         payload["rationale"] = rationale_clean
-    if "citations" in data:
-        payload["citations"] = data["citations"]
+    if citations_clean is not None:
+        payload["citations"] = citations_clean
+
+    clean_payload, json_err = sanitize_json_value(payload, path=STATE_KEY)
+    if json_err or not isinstance(clean_payload, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    payload = clean_payload
 
     # 9. Stash for downstream interview tool.
     try:

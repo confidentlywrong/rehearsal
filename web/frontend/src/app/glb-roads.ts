@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: dispose superseded GLB root resources and handle disposal during async load.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,18 +39,37 @@ export class GLBRoadsLoader {
   private scene: THREE.Scene;
   private root: THREE.Group | null = null;
   private loaded = false;
+  private disposed = false;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
   }
 
+  private disposeGroup(group: THREE.Group): void {
+    this.scene.remove(group);
+    group.traverse((child) => {
+      if ((child as THREE.Mesh).isMesh) {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose();
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach((m) => m?.dispose());
+      }
+    });
+  }
+
   async load(url: string): Promise<void> {
+    this.disposed = false;
     const loader = new GLTFLoader();
     return new Promise((resolve) => {
       loader.load(
         url,
         (gltf) => {
-          if (this.root) this.scene.remove(this.root);
+          if (this.disposed) {
+            this.disposeGroup(gltf.scene);
+            resolve();
+            return;
+          }
+          if (this.root) this.disposeGroup(this.root);
           this.root = gltf.scene;
 
           this.root.traverse((child) => {
@@ -89,16 +110,10 @@ export class GLBRoadsLoader {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.loaded = false;
     if (this.root) {
-      this.scene.remove(this.root);
-      this.root.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh) {
-          const mesh = child as THREE.Mesh;
-          mesh.geometry?.dispose();
-          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-          mats.forEach(m => m?.dispose());
-        }
-      });
+      this.disposeGroup(this.root);
       this.root = null;
     }
   }

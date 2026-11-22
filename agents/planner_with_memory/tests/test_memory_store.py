@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -301,3 +303,15 @@ class TestStoreAutoSeeding:
         ]
         for route_id in expected_ids:
             assert store.get_route(route_id) is not None, f"Seed {route_id} not found"
+
+    def test_recall_routes_handles_non_finite_and_overflow_count(self):
+        """Regression: count=float('inf'), nan, huge int, or invalid types must not raise OverflowError."""
+        store = RouteMemoryStore()
+        store._routes.clear()
+        store.store_route(route_data={"name": "only"}, evaluation_score=10**400)
+
+        for bad_count in (float("inf"), float("nan"), 10**400, "bad", True, None):
+            routes = store.recall_routes(count=bad_count)  # type: ignore[arg-type]
+            assert len(routes) == 1
+            assert routes[0].evaluation_score is None
+

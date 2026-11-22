@@ -19,11 +19,11 @@
 Provides the evaluate_plan FunctionTool using Vertex AI Evaluation with
 7 metrics (6 LLM metrics + 1 deterministic check), plus a single
 GenerateContent call for LLM-generated improvement suggestions and summary.
-Falls back to heuristic evaluation if the Eval API is unavailable.
 """
 
 import asyncio
 import json
+import math
 import os
 import re
 from typing import Any
@@ -42,6 +42,44 @@ from agents.utils.retry import resilient_http_options
 logger = logging.getLogger(__name__)
 
 
+def _strip_nonfinite(obj: object, seen: set[int] | None = None) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool, type(None))):
+        return obj
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return f"<CircularReference: {type(obj).__name__}>"
+    seen.add(obj_id)
+    try:
+        if isinstance(obj, dict):
+            return {
+                (
+                    k
+                    if isinstance(k, (str, int, bool, type(None)))
+                    or (isinstance(k, float) and math.isfinite(k))
+                    else str(k)
+                ): _strip_nonfinite(v, seen)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, (list, tuple)):
+            return [_strip_nonfinite(v, seen) for v in obj]
+        return obj
+    finally:
+        seen.remove(obj_id)
+
+
+def _strict_json_dumps(obj: object) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON with default=str fallback."""
+    try:
+        return json.dumps(obj, allow_nan=False, default=str)
+    except (ValueError, TypeError):
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, default=str)
+
+
 def _normalize_score(raw_score: float) -> int:
     """Normalize a raw evaluation score to 0-100 range.
 
@@ -55,17 +93,29 @@ def _normalize_score(raw_score: float) -> int:
     (a) a 1/5 from the LLM judge is extremely rare, and (b) the high-severity
     gate in _build_result blocks plans with any criterion below 40.
     """
-    if raw_score > 1.0:
-        normalized = raw_score * 20
+    if isinstance(raw_score, bool):
+        return 0
+    try:
+        val = float(raw_score)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(val):
+        return 0
+    if val <= 0.0:
+        return 0
+    if val > 1.0:
+        normalized = val * 20
     else:
-        normalized = raw_score * 100
+        normalized = val * 100
+    if not math.isfinite(normalized) or normalized >= 100.0:
+        return 100
     return min(max(round(normalized), 0), 100)
 
 
 def _get_model_resource() -> str:
     """Get the full resource path for the Vertex AI evaluation model."""
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+    project_id = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
     return f"projects/{project_id}/locations/{location}/publishers/google/models/{MODEL}" if project_id else MODEL
 
 
@@ -82,7 +132,7 @@ async def evaluate_plan(
 
     Uses Vertex AI Evaluation with 7 metrics: 6 LLM metrics for individual
     quality criteria and a deterministic distance compliance check.
-    Falls back to heuristic evaluation if Vertex AI Eval API fails.
+    Raises RuntimeError if GOOGLE_CLOUD_PROJECT is unset when using Vertex AI.
 
     Args:
         evaluation_request: JSON string with user_intent and proposed_plan
@@ -91,9 +141,21 @@ async def evaluate_plan(
     Returns:
         dict with evaluation results
     """
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is not None and not hasattr(state, "get"):
+        state = None
+
     try:
-        request_data = json.loads(evaluation_request)
-    except json.JSONDecodeError as e:
+        request_data = (
+            evaluation_request
+            if isinstance(evaluation_request, dict)
+            else json.loads(evaluation_request)
+        )
+        if not isinstance(request_data, dict):
+            raise TypeError(
+                f"Expected JSON object, got {type(request_data).__name__}"
+            )
+    except (json.JSONDecodeError, TypeError) as e:
         parse_error_result = {
             "passed": False,
             "scores": {},
@@ -108,33 +170,39 @@ async def evaluate_plan(
             "overall_score": 0,
             "eval_method": "error",
         }
-        if tool_context is not None:
-            tool_context.state["evaluation_result"] = parse_error_result
+        if state is not None:
+            state["evaluation_result"] = parse_error_result
         return parse_error_result
 
     user_intent_raw = request_data.get("user_intent", "Unknown intent")
+    if user_intent_raw is None:
+        user_intent_raw = "Unknown intent"
     proposed_plan_raw = request_data.get("proposed_plan", "No plan provided")
+    if proposed_plan_raw is None:
+        proposed_plan_raw = "No plan provided"
+    elif isinstance(proposed_plan_raw, dict):
+        proposed_plan_raw = dict(proposed_plan_raw)
 
     # Enrich plan context from session state
-    if tool_context:
-        if "marathon_route" in tool_context.state:
-            route = tool_context.state["marathon_route"]
+    if state is not None:
+        if "marathon_route" in state:
+            route = state["marathon_route"]
             if isinstance(proposed_plan_raw, dict):
                 proposed_plan_raw["route_geometry_details"] = route
             else:
-                proposed_plan_raw = f"{proposed_plan_raw}\n\n[Route Geometry (from session state)]: {json.dumps(route)}"
+                proposed_plan_raw = f"{proposed_plan_raw}\n\n[Route Geometry (from session state)]: {_strict_json_dumps(route)}"
 
-        if "traffic_assessment" in tool_context.state:
-            traffic = tool_context.state["traffic_assessment"]
+        if "traffic_assessment" in state:
+            traffic = state["traffic_assessment"]
             if isinstance(proposed_plan_raw, dict):
                 proposed_plan_raw["traffic_assessment_details"] = traffic
             else:
                 proposed_plan_raw = (
-                    f"{proposed_plan_raw}\n\n[Traffic Assessment (from session state)]: {json.dumps(traffic)}"
+                    f"{proposed_plan_raw}\n\n[Traffic Assessment (from session state)]: {_strict_json_dumps(traffic)}"
                 )
 
-    user_intent = json.dumps(user_intent_raw) if not isinstance(user_intent_raw, str) else user_intent_raw
-    proposed_plan = json.dumps(proposed_plan_raw) if not isinstance(proposed_plan_raw, str) else proposed_plan_raw
+    user_intent = _strict_json_dumps(user_intent_raw) if not isinstance(user_intent_raw, str) else user_intent_raw
+    proposed_plan = _strict_json_dumps(proposed_plan_raw) if not isinstance(proposed_plan_raw, str) else proposed_plan_raw
 
     from agents.utils.local_ai import generate_local_json_async, is_local_gemma_active
 
@@ -146,16 +214,21 @@ async def evaluate_plan(
         details: dict[str, str] = {
             "distance_compliance": str(dc["explanation"]),
         }
-        combined_prompt = (
-            _build_combined_prompt()
-            .replace("{prompt}", user_intent)
-            .replace("{response}", proposed_plan)
+        replacements = {"{prompt}": user_intent, "{response}": proposed_plan}
+        combined_prompt = re.sub(
+            r"\{(?:prompt|response)\}",
+            lambda m: replacements[m.group(0)],
+            _build_combined_prompt(),
         )
         try:
+            import inspect as _inspect
+
+            _lg_kwargs: dict[str, Any] = {"temperature": 0.3, "max_tokens": 2048}
+            if "timeout" in _inspect.signature(generate_local_json_async).parameters:
+                _lg_kwargs["timeout"] = 360.0
             raw_eval = await generate_local_json_async(
                 combined_prompt,
-                temperature=0.3,
-                max_tokens=2048,
+                **_lg_kwargs,
             )
             cleaned_eval = raw_eval.strip()
             if cleaned_eval.startswith("```"):
@@ -186,8 +259,8 @@ async def evaluate_plan(
                 "summary": "Evaluation failed because the local Gemma model did not return valid scores.",
                 "eval_method": "error",
             }
-            if tool_context is not None:
-                tool_context.state["evaluation_result"] = err_result
+            if state is not None:
+                state["evaluation_result"] = err_result
             return err_result
 
         explanation_raw = parsed.get("explanation", parsed) if isinstance(parsed, dict) else {}
@@ -206,20 +279,19 @@ async def evaluate_plan(
                     if match:
                         explanation_dict[criterion_name] = float(match.group(1))
 
-        overall_fallback = parsed.get("score") if isinstance(parsed, dict) else None
         for criterion_name in _LLM_CRITERION_SPECS:
             raw_val = None
             if criterion_name in explanation_dict:
                 raw_val = explanation_dict[criterion_name]
             elif isinstance(parsed, dict) and criterion_name in parsed:
                 raw_val = parsed[criterion_name]
-            elif overall_fallback is not None:
-                raw_val = overall_fallback
-            if raw_val is None:
+            if raw_val is None or isinstance(raw_val, bool):
                 continue
             try:
                 val = float(raw_val)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not math.isfinite(val):
                 continue
             scores[criterion_name] = _normalize_score(val)
             details[criterion_name] = f"Score {int(round(val))}/5"
@@ -244,8 +316,8 @@ async def evaluate_plan(
                 "summary": f"Evaluation incomplete: missing scores for {', '.join(sorted(missing))}.",
                 "eval_method": "error",
             }
-            if tool_context is not None:
-                tool_context.state["evaluation_result"] = err_result
+            if state is not None:
+                state["evaluation_result"] = err_result
             return err_result
 
         try:
@@ -257,12 +329,26 @@ async def evaluate_plan(
             )
         except Exception as exc:
             logger.warning("Local Gemma feedback generation failed: %s", exc)
-            suggestions = [
-                f"Improve {c.replace('_', ' ')} (scored {s}/100)."
-                for c, s in scores.items()
-                if s < 80
-            ] or ["Maintain current route alignment and safety provisions."]
-            summary = "Evaluation completed using local Gemma model."
+            err_result = {
+                "passed": False,
+                "scores": scores,
+                "findings": [
+                    {
+                        "criterion": "feedback_generation",
+                        "description": f"Local Gemma feedback generation failed: {exc}",
+                        "severity": "high",
+                    }
+                ],
+                "improvement_suggestions": [
+                    "Ensure the local Ollama server and Gemma model are running and retry evaluation."
+                ],
+                "overall_score": 0,
+                "summary": f"Local Gemma feedback generation failed: {exc}",
+                "eval_method": "error",
+            }
+            if state is not None:
+                state["evaluation_result"] = err_result
+            return err_result
 
         local_result = _build_result(
             scores,
@@ -271,12 +357,12 @@ async def evaluate_plan(
             suggestions=suggestions,
             summary=summary,
         )
-        if tool_context is not None:
-            tool_context.state["evaluation_result"] = local_result
+        if state is not None:
+            state["evaluation_result"] = local_result
         return local_result
 
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+    project_id = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
 
     if project_id:
         scores, details = await _run_custom_eval(
@@ -298,8 +384,8 @@ async def evaluate_plan(
             suggestions=suggestions,
             summary=summary,
         )
-        if tool_context is not None:
-            tool_context.state["evaluation_result"] = vertex_result
+        if state is not None:
+            state["evaluation_result"] = vertex_result
         return vertex_result
 
     raise RuntimeError("GOOGLE_CLOUD_PROJECT is not set; cannot run Vertex AI Eval.")
@@ -478,7 +564,12 @@ def _check_distance_compliance_logic(response_text: str) -> dict:
     mile_matches = re.findall(mile_pattern, text_lower)
 
     for distance_str in mile_matches:
-        distance = float(distance_str)
+        try:
+            distance = float(distance_str)
+        except (ValueError, OverflowError):
+            continue
+        if not math.isfinite(distance):
+            continue
         if 20 <= distance <= 30:
             deviation = abs(distance - 26.2)
             if deviation > 0.5:
@@ -595,9 +686,17 @@ async def _run_custom_eval(
                         for criterion_name in _LLM_CRITERION_SPECS:
                             if criterion_name in parsed:
                                 raw = parsed[criterion_name]
-                                scores[criterion_name] = _normalize_score(float(raw))
+                                if isinstance(raw, bool):
+                                    continue
+                                try:
+                                    val = float(raw)
+                                except (TypeError, ValueError, OverflowError):
+                                    continue
+                                if not math.isfinite(val):
+                                    continue
+                                scores[criterion_name] = _normalize_score(val)
                                 details[criterion_name] = f"Score {raw}/5"
-                except (json.JSONDecodeError, ValueError, TypeError):
+                except (json.JSONDecodeError, ValueError, TypeError, OverflowError):
                     # Explanation might not be valid JSON (e.g. free text
                     # with scores). Try regex extraction as fallback.
                     for criterion_name in _LLM_CRITERION_SPECS:
@@ -655,8 +754,8 @@ async def _generate_feedback(
 ) -> tuple[list[str], str]:
     """Generate LLM-powered improvement suggestions and summary.
 
-    Makes a single GenerateContent call using EVALUATOR_MODEL. Falls back
-    to deterministic suggestions if the call fails.
+    Makes a single GenerateContent call using EVALUATOR_MODEL (or local Gemma).
+    Raises ValueError or API errors if generation fails or returns empty feedback.
     """
     scores_text = "\n".join(f"- {k}: {v}" for k, v in scores.items())
     details_text = "\n".join(f"- {k}: {v}" for k, v in details.items())
@@ -672,16 +771,26 @@ async def _generate_feedback(
     from agents.utils.local_ai import generate_local_json_async, is_local_gemma_active
 
     if is_local_gemma_active():
+        import inspect as _inspect
+
+        _fb_kwargs: dict[str, Any] = {"temperature": 0.3, "max_tokens": 1024}
+        if "timeout" in _inspect.signature(generate_local_json_async).parameters:
+            _fb_kwargs["timeout"] = 240.0
         response_text = await generate_local_json_async(
             prompt,
-            temperature=0.3,
-            max_tokens=1024,
+            **_fb_kwargs,
         )
     else:
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID") or ""
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in ("0", "false", "no")
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+        project_id = (
+            (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+            or (os.environ.get("PROJECT_ID") or "").strip()
+        )
+        location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
+        use_vertex = (os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") or "").strip().lower() not in ("0", "false", "no")
+        api_key = (
+            (os.environ.get("GEMINI_API_KEY") or "").strip()
+            or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+        )
         client_kwargs: dict = {
             "http_options": resilient_http_options(api_version="v1beta1"),
         }
@@ -716,6 +825,8 @@ async def _generate_feedback(
         if cleaned_text.endswith("```"):
             cleaned_text = cleaned_text[:-3]
     result = json.loads(cleaned_text.strip())
+    if not isinstance(result, dict):
+        raise ValueError(f"Expected JSON object for feedback, got {type(result).__name__}")
     raw_suggestions = result.get("suggestions", [])
     suggestions: list[str] = []
     if isinstance(raw_suggestions, list):
@@ -744,6 +855,27 @@ async def _generate_feedback(
 # ============================================================================
 
 
+def _coerce_result_score(raw_score: Any) -> int:
+    """Safely coerce an already-normalized score to an int in [0, 100].
+
+    Mirrors ``agents/leadership_planner_with_eval/evaluator/tools.py``:
+    direct callers of ``_build_result`` with small 0-100 scores keep their
+    exact values while non-numeric / bool / NaN / Inf / overflowing inputs
+    clamp safely without raising ValueError or OverflowError.
+    """
+    if raw_score is None or isinstance(raw_score, bool):
+        return 0
+    if isinstance(raw_score, int):
+        return max(0, min(100, raw_score))
+    try:
+        val = float(raw_score)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(val):
+        return 0
+    return max(0, min(100, round(val)))
+
+
 def _build_result(
     scores: dict[str, int],
     details: dict[str, str],
@@ -752,9 +884,14 @@ def _build_result(
     summary: str = "",
 ) -> dict[str, Any]:
     """Build the final evaluation result from scores, details, and LLM feedback."""
+    safe_scores: dict[str, int] = (
+        {str(k): _coerce_result_score(v) for k, v in scores.items()}
+        if isinstance(scores, dict)
+        else {}
+    )
     findings = []
 
-    for criterion, score in scores.items():
+    for criterion, score in safe_scores.items():
         if score < 80:
             if score < SEVERITY_THRESHOLDS["high"]:
                 severity = "high"
@@ -771,16 +908,17 @@ def _build_result(
                 }
             )
 
-    overall_score = 0
-    for criterion, weight in CRITERION_WEIGHTS.items():
-        overall_score += scores.get(criterion, 50) * weight
-    overall_score = round(overall_score)
+    missing_criteria = [c for c in CRITERION_WEIGHTS if c not in safe_scores]
+    if missing_criteria:
+        raise ValueError(f"Missing evaluation score(s) for criteria: {', '.join(missing_criteria)}")
+
+    overall_score = round(sum(safe_scores[criterion] * weight for criterion, weight in CRITERION_WEIGHTS.items()))
 
     passed = overall_score >= PASS_THRESHOLD and not any(f["severity"] == "high" for f in findings)
 
     return {
         "passed": passed,
-        "scores": scores,
+        "scores": safe_scores,
         "findings": findings,
         "improvement_suggestions": suggestions or [],
         "overall_score": overall_score,

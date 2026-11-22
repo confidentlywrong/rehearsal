@@ -98,6 +98,13 @@ RESOURCE_CRISIS_PROMPTS: dict[str, list[str]] = {
 }
 
 
+def _safe_tick_idx(tick: object) -> int:
+    """Coerce tick to a non-negative integer index safely."""
+    if isinstance(tick, int) and not isinstance(tick, bool):
+        return tick
+    return 0
+
+
 def get_coaching_prompt(
     principle: str,
     tick: int,
@@ -115,13 +122,19 @@ def get_coaching_prompt(
     Returns:
         A coaching prompt string.
     """
-    prompts = COACHING_PROMPTS.get(principle, [])
+    safe_principle = principle if isinstance(principle, str) else ""
+    prompts = COACHING_PROMPTS.get(safe_principle, [])
     if not prompts:
-        return f"How does this decision connect to {principle}?"
+        return f"How does this decision connect to {safe_principle or 'leadership strategy'}?"
 
-    prompt = prompts[tick % len(prompts)]
-    if affected_echo and "{affected_echo}" in prompt:
-        prompt = prompt.replace("{affected_echo}", affected_echo.replace("_", " ").title())
+    prompt = prompts[_safe_tick_idx(tick) % len(prompts)]
+    if "{affected_echo}" in prompt:
+        replacement = (
+            affected_echo.replace("_", " ").title()
+            if isinstance(affected_echo, str) and affected_echo
+            else "the affected stakeholder"
+        )
+        prompt = prompt.replace("{affected_echo}", replacement)
     return prompt
 
 
@@ -138,8 +151,9 @@ def get_contradiction_prompt(
     Returns:
         A contradiction-specific coaching prompt.
     """
-    prompt = CONTRADICTION_PROMPTS[tick % len(CONTRADICTION_PROMPTS)]
-    return prompt.replace("{commitment}", commitment)
+    safe_commitment = commitment if isinstance(commitment, str) else str(commitment or "your earlier commitment")
+    prompt = CONTRADICTION_PROMPTS[_safe_tick_idx(tick) % len(CONTRADICTION_PROMPTS)]
+    return prompt.replace("{commitment}", safe_commitment)
 
 
 def get_resource_crisis_prompt(
@@ -155,7 +169,8 @@ def get_resource_crisis_prompt(
     Returns:
         A resource-crisis coaching prompt.
     """
-    prompts = RESOURCE_CRISIS_PROMPTS.get(resource.lower(), [])
+    safe_res = resource.strip().lower() if isinstance(resource, str) else ""
+    prompts = RESOURCE_CRISIS_PROMPTS.get(safe_res, [])
     if not prompts:
-        return f"{resource.upper()} is at a critical level. How will you address this?"
-    return prompts[tick % len(prompts)]
+        return f"{(safe_res or 'RESOURCE').upper()} is at a critical level. How will you address this?"
+    return prompts[_safe_tick_idx(tick) % len(prompts)]

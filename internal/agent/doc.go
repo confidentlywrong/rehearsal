@@ -1,4 +1,6 @@
 // Copyright 2026 Google LLC
+// Modifications copyright 2026 Christian Haeussinger
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +34,8 @@
 // Usage:
 //
 //	catalog := agent.NewCatalog([]string{
-//	    "http://localhost:8210/a2a/runner_autopilot",
-//	    "http://localhost:8202/a2a/simulator",
+//	    "http://127.0.0.1:9120/a2a/leadership_runner_autopilot",
+//	    "http://127.0.0.1:9104/a2a/simulator",
 //	})
 //	agents, err := catalog.DiscoverAgents()
 //	// agents is map[string]AgentCard keyed by agent name

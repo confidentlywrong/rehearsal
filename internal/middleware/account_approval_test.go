@@ -8,10 +8,13 @@
 package middleware
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -162,5 +165,109 @@ func TestAccountApprovalGate_SaaSOffBypassesGate(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("SAAS_MODE=off must bypass approval gate: got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAccount_NegativePaymentGraceClampsToZero(t *testing.T) {
+	r := gin.New()
+	r.Use(Account(AccountOptions{
+		Resolver: stubResolver{uc: account.UserContext{
+			UserID: "uid-1",
+			Status: account.StatusApproved,
+		}},
+		PaymentFailedGracePeriod: -1 * time.Second,
+		PaymentFailedCheck: func(context.Context, string) (time.Time, error) {
+			return time.Now().Add(-10 * time.Millisecond), nil
+		},
+	}))
+	r.POST("/api/v1/sessions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions", nil))
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("negative grace must fire immediately (402), got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestAccount_EmptyStatusBlockedByApprovalGate(t *testing.T) {
+	t.Setenv("SAAS_MODE", "on")
+	r := buildApprovalRouter(account.UserContext{
+		UserID: "uid-1",
+		Email:  "a@example.com",
+		Status: "",
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("empty status must be blocked (403) when ApprovalGate active, got %d", w.Code)
+	}
+}
+
+func TestAccount_SkipAndApprovedPathsRejectTraversalAndWildcardSlash(t *testing.T) {
+	t.Setenv("SAAS_MODE", "on")
+	r := gin.New()
+	r.Use(Account(AccountOptions{
+		Resolver:      stubResolver{uc: account.UserContext{UserID: "u1", Status: account.StatusPending}},
+		SkipPaths:     []string{"", "/", "/health"},
+		ApprovedPaths: []string{"", "/", "/api/v1/me"},
+	}))
+	r.GET("/api/v1/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// "/health/../api/v1/protected" cleans to "/api/v1/protected" and must NOT skip or pass approval gate.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health/../api/v1/protected", nil))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("traversal path must hit approval gate (403), got %d", w.Code)
+	}
+
+	// Empty SkipPaths/ApprovedPaths and "/" must not skip unauthenticated requests to /api/v1/protected.
+	rUnauth := gin.New()
+	rUnauth.Use(Account(AccountOptions{
+		Resolver: failingResolver{err: errors.New("no token")},
+		SkipPaths: []string{"", "/", "/health"},
+	}))
+	rUnauth.GET("/api/v1/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
+	wUnauth := httptest.NewRecorder()
+	rUnauth.ServeHTTP(wUnauth, httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil))
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("empty/root skip must not bypass auth on /api/v1/protected, got %d", wUnauth.Code)
+	}
+}
+
+type failingResolver struct{ err error }
+
+func (f failingResolver) Resolve(*http.Request) (account.UserContext, error) {
+	return account.UserContext{}, f.err
+}
+
+func TestAccountResolverFromEnv_CaseInsensitiveAndCloudRunJob(t *testing.T) {
+	t.Setenv("IDENTITY_PROVIDER", "FIREBASE")
+	t.Setenv("FIREBASE_PROJECT_ID", "demo-proj")
+	res, err := AccountResolverFromEnv()
+	if err != nil || res == nil {
+		t.Fatalf("expected FIREBASE (uppercase) to resolve, got res=%v err=%v", res, err)
+	}
+
+	t.Setenv("IDENTITY_PROVIDER", "local")
+	t.Setenv("CLOUD_RUN_JOB", "worker-job")
+	t.Setenv("ALLOW_LOCAL_AUTH", "")
+	if _, err := AccountResolverFromEnv(); err == nil {
+		t.Fatal("expected local provider to be refused when CLOUD_RUN_JOB is set")
+	}
+}
+
+func TestAccount_NilURLOnResolverErrorDoesNotPanic(t *testing.T) {
+	mw := Account(AccountOptions{
+		Resolver: failingResolver{err: errors.New("missing token")},
+	})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/protected", nil)
+	req.URL = nil
+	c.Request = req
+
+	mw(c)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when Resolver errors with nil URL, got %d body=%s", w.Code, w.Body.String())
 	}
 }

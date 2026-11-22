@@ -57,7 +57,7 @@ After a simulation execution completes, you MUST follow these steps in order:
 
 You MUST NEVER re-execute or re-start a simulation after one has already
 completed in this invocation. The simulation is done. Proceed to
-record-keeping and A2UI card emission only.\""""
+record-keeping and A2UI card emission only."""
 
 # [START memory_workflow]
 MEMORY_WORKFLOW = """\
@@ -635,14 +635,14 @@ below read them from state.  You only ever pass small scalars
   the currently-active scenario to durable storage. No arguments — reads
   `active_scenario_id` from session state. Merge semantics: only keys
   present in state are written; previously stored keys are preserved.
-  Call after `store_scenario` succeeds (planning workflow Step 12a).
+  Call after `store_scenario` succeeds (planning workflow Step 13).
 - `recall_stakeholder_artifacts(scenario_id)` — Inverse of
   `store_stakeholder_artifacts`. Rehydrates the six artifact state keys
   back into session state so downstream `emit_*` / report tools can
   re-render the full card stack from a past run without re-simulating.
   Also sets `active_scenario_id` so subsequent persistence tools target
   the recalled row. Returns `status: "not_found"` if the scenario has
-  no stored bundle (e.g. legacy rows from before Step 12a was wired).
+  no stored bundle (e.g. legacy rows from before Step 13 was wired).
 
 - `get_planned_scenarios_data` — Batch-fetch scenario metadata for organizer UI cards.
   Params: `scenario_ids` (optional list), `limit` (default 5).
@@ -793,6 +793,16 @@ After Step 6, write a concise 2-3 paragraph natural language summary for the use
 - Executive Summary of the scenario and transformation goals
 - Stakeholder Alignment Strategy and consensus pathway dynamics
 - Key Risks, Mitigation, and Leadership Recommendations
+
+# SIMULATION EXECUTION WORKFLOW
+When asked to run or simulate a scenario (or on a simulation execution trigger), run in exact order:
+1. `start_simulation(action="execute", simulation_config={"stakeholder_count": <count>})`
+2. `submit_plan_to_simulator(action="execute", message="Submit leadership scenario plan to simulator")`
+3. `emit_sim_results_a2ui()`
+4. `emit_action_plan_a2ui(plan_markdown=...)` with concise Days 1-30, Days 31-60, and Days 61-90 sections
+5. `emit_translation_diagnostic()`
+6. `emit_stakeholder_psychology()`
+Then provide a concise executive debrief summary.
 
 # ORGANIZER UI FAST-PATHS
 If the user message matches one of the following special requests, do NOT run the 6-step planning workflow above:

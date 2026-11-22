@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 
 // SubscriptionFetcher reads the current subscription state for one
 // Stripe customer. The real implementation hits
-// /v1/subscriptions?customer=...&status=all&limit=1 and decodes
+// /v1/subscriptions?customer=...&status=active&limit=1 and decodes
 // the first item; tests pass an in-memory fake.
 type SubscriptionFetcher interface {
 	// FetchActiveSubscription returns the price id of the
@@ -55,11 +56,11 @@ type Reconciler struct {
 // ReconcileResult is what Reconcile returns to the caller (admin
 // handler) so it can be surfaced in the response and audit log.
 type ReconcileResult struct {
-	UserID    string            `json:"user_id"`
-	FromTier  account.PlanTier  `json:"from_tier"`
-	ToTier    account.PlanTier  `json:"to_tier"`
-	PriceID   string            `json:"price_id,omitempty"` // empty when downgrading to free
-	Changed   bool              `json:"changed"`
+	UserID   string           `json:"user_id"`
+	FromTier account.PlanTier `json:"from_tier"`
+	ToTier   account.PlanTier `json:"to_tier"`
+	PriceID  string           `json:"price_id,omitempty"` // empty when downgrading to free
+	Changed  bool             `json:"changed"`
 }
 
 // Reconcile fetches the user's current Stripe subscription, maps
@@ -149,24 +150,39 @@ func NewStripeSubscriptionFetcher(apiKey string) (*StripeSubscriptionFetcher, er
 	}, nil
 }
 
-// WithSubscriptionAPIBase overrides the Stripe API base URL (tests).
+// WithAPIBase overrides the Stripe API base URL (tests).
 func (f *StripeSubscriptionFetcher) WithAPIBase(base string) *StripeSubscriptionFetcher {
+	if f == nil {
+		return nil
+	}
 	f.apiBase = strings.TrimRight(base, "/")
 	return f
 }
 
-// WithHTTPClient overrides the http client (tests).
+// WithHTTPClient overrides the http client (tests). Ignores nil.
 func (f *StripeSubscriptionFetcher) WithHTTPClient(c *http.Client) *StripeSubscriptionFetcher {
-	f.httpClient = c
+	if f == nil {
+		return nil
+	}
+	if c != nil {
+		f.httpClient = c
+	}
 	return f
 }
 
 // FetchActiveSubscription implements SubscriptionFetcher.
 func (f *StripeSubscriptionFetcher) FetchActiveSubscription(ctx context.Context, customerID string) (string, error) {
+	if f == nil || f.httpClient == nil || f.apiKey == "" || f.apiBase == "" {
+		return "", errors.New("billing: StripeSubscriptionFetcher not initialized")
+	}
 	if customerID == "" {
 		return "", errors.New("billing: customerID required")
 	}
-	u := fmt.Sprintf("%s/v1/subscriptions?customer=%s&status=active&limit=1", f.apiBase, customerID)
+	q := url.Values{}
+	q.Set("customer", customerID)
+	q.Set("status", "active")
+	q.Set("limit", "1")
+	u := fmt.Sprintf("%s/v1/subscriptions?%s", f.apiBase, q.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", fmt.Errorf("build subscription request: %w", err)
@@ -179,7 +195,7 @@ func (f *StripeSubscriptionFetcher) FetchActiveSubscription(ctx context.Context,
 		return "", fmt.Errorf("subscription request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("read subscription response: %w", err)
 	}
@@ -200,8 +216,15 @@ func (f *StripeSubscriptionFetcher) FetchActiveSubscription(ctx context.Context,
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return "", fmt.Errorf("decode subscription response: %w", err)
 	}
-	if len(decoded.Data) == 0 || len(decoded.Data[0].Items.Data) == 0 {
+	if len(decoded.Data) == 0 {
 		return "", nil // no active subscription → free tier
 	}
-	return decoded.Data[0].Items.Data[0].Price.ID, nil
+	if len(decoded.Data[0].Items.Data) == 0 {
+		return "", errors.New("billing: active subscription has no items")
+	}
+	priceID := decoded.Data[0].Items.Data[0].Price.ID
+	if priceID == "" {
+		return "", errors.New("billing: active subscription missing price id")
+	}
+	return priceID, nil
 }

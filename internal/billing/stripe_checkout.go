@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 )
@@ -53,9 +54,13 @@ func WithCheckoutAPIBase(base string) StripeCheckoutOption {
 	return func(s *StripeCheckoutCreator) { s.apiBase = strings.TrimRight(base, "/") }
 }
 
-// WithCheckoutHTTPClient injects a custom http.Client (tests).
+// WithCheckoutHTTPClient injects a custom http.Client (tests). Ignores nil.
 func WithCheckoutHTTPClient(c *http.Client) StripeCheckoutOption {
-	return func(s *StripeCheckoutCreator) { s.httpClient = c }
+	return func(s *StripeCheckoutCreator) {
+		if c != nil {
+			s.httpClient = c
+		}
+	}
 }
 
 // NewStripeCheckoutCreator builds a real Stripe checkout creator.
@@ -96,6 +101,9 @@ func (s *StripeCheckoutCreator) Name() string { return "stripe" }
 //     user's customer id, the line item, and metadata{user_id}.
 //  4. Returns the hosted Checkout URL.
 func (s *StripeCheckoutCreator) Create(ctx context.Context, user account.User, tier account.PlanTier, successURL, cancelURL string) (string, error) {
+	if s == nil || s.httpClient == nil || s.apiKey == "" || s.apiBase == "" {
+		return "", errors.New("billing: StripeCheckoutCreator not initialized")
+	}
 	if user.ID == "" {
 		return "", errors.New("billing: Create requires user.ID")
 	}
@@ -140,11 +148,8 @@ func (s *StripeCheckoutCreator) Create(ctx context.Context, user account.User, t
 		customerID = newCustomer
 		if s.persister != nil {
 			if err := s.persister.SetStripeCustomerID(ctx, user.ID, customerID); err != nil {
-				// Persistence failure is logged loud at the call
-				// site by the handler; we still return the URL so
-				// the user can complete checkout. The webhook
-				// handler will resolve the user via the customer
-				// id on the resulting subscription event.
+				// Fail rather than creating orphaned Stripe customers
+				// across retries without recording the customer id.
 				return "", fmt.Errorf("billing: persist customer id: %w", err)
 			}
 		}
@@ -173,7 +178,7 @@ func (s *StripeCheckoutCreator) Create(ctx context.Context, user account.User, t
 		return "", fmt.Errorf("billing: checkout request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
 		return "", fmt.Errorf("billing: read checkout response: %w", readErr)
 	}
@@ -223,9 +228,12 @@ func (s *StripeCheckoutCreator) createCustomer(ctx context.Context, user account
 		return "", fmt.Errorf("customer request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, readErr := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
 		return "", fmt.Errorf("read customer response: %w", readErr)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", fmt.Errorf("%w: stripe customer rejected credentials (%d): %s", ErrCheckoutUnavailable, resp.StatusCode, truncateForLog(body))
 	}
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("stripe customer %d: %s", resp.StatusCode, truncateForLog(body))
@@ -248,14 +256,18 @@ func (s *StripeCheckoutCreator) createCustomer(ctx context.Context, user account
 	return decoded.ID, nil
 }
 
-// truncateForLog clips a byte slice to <=512 bytes so failure logs
-// don't dump multi-KB Stripe payloads.
+// truncateForLog clips a byte slice to <=512 bytes on a UTF-8 rune boundary so
+// failure logs don't dump multi-KB Stripe payloads or emit partial runes.
 func truncateForLog(b []byte) string {
 	const max = 512
 	if len(b) <= max {
 		return string(b)
 	}
-	return string(b[:max]) + "...(truncated)"
+	cut := max
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return string(b[:cut]) + "...(truncated)"
 }
 
 // safeMetadataID reports whether s is short and uses only

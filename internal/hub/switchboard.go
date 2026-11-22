@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -59,7 +60,7 @@ func SpawnQueueName(agentType, sessionID string, numShards int) string {
 	}
 	h := fnv.New32a()
 	h.Write([]byte(sessionID))
-	shard := int(h.Sum32()) % numShards
+	shard := int(h.Sum32() % uint32(numShards))
 	return fmt.Sprintf("simulation:spawns:%s:%d", agentType, shard)
 }
 
@@ -93,6 +94,16 @@ type QueueItem struct {
 	Data  interface{}
 }
 
+var (
+	// ErrAgentNotFound is returned when a requested agent type is missing from
+	// the catalog or has no configured URL.
+	ErrAgentNotFound = errors.New("agent not found in catalog or has no URL")
+
+	// ErrSwitchboardClosed is returned when a dispatch operation is attempted
+	// after the switchboard has been shut down.
+	ErrSwitchboardClosed = errors.New("switchboard is shut down")
+)
+
 // Switchboard handles distributed message fan-out.
 type Switchboard interface {
 	Broadcast(ctx context.Context, wrapper *gateway.Wrapper) error
@@ -109,17 +120,22 @@ type Switchboard interface {
 
 // RedisSwitchboard handles distributed message fan-out via Redis.
 type RedisSwitchboard struct {
-	client         *redis.Client
-	gatewayID      string
-	localHub       *Hub
-	channel        string
-	catalog        *agent.Catalog
-	registry       session.DistributedRegistry // Session-aware routing
-	httpClient     *http.Client                // Plain HTTP client for subscriber pokes
-	callableClient *http.Client                // Retryable HTTP client for callable dispatch
-	gcpClient      *http.Client                // Authenticated + retryable client for Agent Engine callable agents
-	gcpClientErr   error
-	wg             sync.WaitGroup // Tracks in-flight dispatch goroutines for graceful shutdown
+	client          *redis.Client
+	gatewayID       string
+	localHub        *Hub
+	channel         string
+	catalog         *agent.Catalog
+	registry        session.DistributedRegistry // Session-aware routing
+	httpClient      *http.Client                // Plain HTTP client for subscriber pokes
+	callableClient  *http.Client                // Retryable HTTP client for callable dispatch
+	gcpClient       *http.Client                // Authenticated + retryable client for Agent Engine callable agents
+	gcpClientErr    error
+	oidcClientFn    func(audience string) (*http.Client, error) // Defaults to auth.OIDCClientE
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	closed          bool
+	wg              sync.WaitGroup // Tracks in-flight dispatch goroutines for graceful shutdown
 }
 
 // NewSwitchboardWithRegistry creates a distributed switchboard with session-aware routing.
@@ -139,7 +155,7 @@ func NewSwitchboardWithRegistry(client *redis.Client, gatewayID string, localHub
 		"https://www.googleapis.com/auth/cloud-platform",
 	)
 	if err != nil {
-		log.Printf("Switchboard: WARNING — failed to create GCP auth client: %v (Agent Engine auth disabled, falling back to plain callable client)", err)
+		log.Printf("Switchboard: WARNING — failed to create GCP auth client: %v (Agent Engine requests will fail closed)", err)
 	}
 	if gcpClient != nil {
 		// Agent Engine agents (especially planner_with_eval) execute
@@ -149,6 +165,8 @@ func NewSwitchboardWithRegistry(client *redis.Client, gatewayID string, localHub
 		// must match or the client cancels the request prematurely.
 		gcpClient.Timeout = 5 * time.Minute
 	}
+
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 
 	return &RedisSwitchboard{
 		client:    client,
@@ -160,20 +178,114 @@ func NewSwitchboardWithRegistry(client *redis.Client, gatewayID string, localHub
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
-		callableClient: callableHTTP,
-		gcpClient:      gcpClient,
-		gcpClientErr:   err,
+		callableClient:  callableHTTP,
+		gcpClient:       gcpClient,
+		gcpClientErr:    err,
+		oidcClientFn:    auth.OIDCClientE,
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
 	}
+}
+
+// Shutdown cancels the switchboard lifecycle context, aborting any in-flight
+// asynchronous dispatch or poke requests.
+func (s *RedisSwitchboard) Shutdown() {
+	if s == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	s.closed = true
+	if s.lifecycleCtx == nil {
+		s.lifecycleCtx, s.lifecycleCancel = context.WithCancel(context.Background())
+	}
+	cancel := s.lifecycleCancel
+	s.lifecycleMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *RedisSwitchboard) ensureLifecycleCtx() context.Context {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleCtx == nil {
+		s.lifecycleCtx, s.lifecycleCancel = context.WithCancel(context.Background())
+	}
+	return s.lifecycleCtx
+}
+
+func (s *RedisSwitchboard) lifecycleErr() error {
+	s.lifecycleMu.Lock()
+	closed := s.closed
+	lctx := s.lifecycleCtx
+	s.lifecycleMu.Unlock()
+	if closed {
+		return ErrSwitchboardClosed
+	}
+	if lctx != nil {
+		return lctx.Err()
+	}
+	return nil
+}
+
+// beginAsyncDispatch atomically checks that the switchboard is not shut down,
+// increments s.wg under s.lifecycleMu before returning, and derives an async
+// context detached from caller cancellation/deadlines while still cancelling on
+// switchboard shutdown. Holding s.lifecycleMu across the closed check and
+// s.wg.Add(1) prevents s.wg.Add(1) from racing with Shutdown() + Wait().
+func (s *RedisSwitchboard) beginAsyncDispatch(callerCtx context.Context) (context.Context, context.CancelFunc, bool) {
+	var base context.Context
+	if callerCtx == nil {
+		base = context.Background()
+	} else {
+		// Detach from caller's immediate deadline/defer cancel() while keeping
+		// request values (e.g. account.UserContext, trace context).
+		base = context.WithoutCancel(callerCtx)
+	}
+	derived, cancel := context.WithCancel(base)
+
+	s.lifecycleMu.Lock()
+	if s.closed || (s.lifecycleCtx != nil && s.lifecycleCtx.Err() != nil) {
+		s.lifecycleMu.Unlock()
+		cancel()
+		return nil, nil, false
+	}
+	s.wg.Add(1)
+	lctx := s.lifecycleCtx
+	s.lifecycleMu.Unlock()
+
+	if lctx == nil {
+		return derived, cancel, true
+	}
+	stop := context.AfterFunc(lctx, cancel)
+	return derived, func() {
+		stop()
+		cancel()
+	}, true
+}
+
+func (s *RedisSwitchboard) getOIDCClient(audience string) (*http.Client, error) {
+	fn := s.oidcClientFn
+	if fn == nil {
+		fn = auth.OIDCClientE
+	}
+	return fn(audience)
 }
 
 // Wait blocks until all in-flight dispatch goroutines have completed.
 // Call during graceful shutdown to avoid leaked goroutines.
 func (s *RedisSwitchboard) Wait() {
+	if s == nil {
+		return
+	}
 	s.wg.Wait()
 }
 
 // Ping checks the Redis connection.
 func (s *RedisSwitchboard) Ping(ctx context.Context) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
 	return s.client.Ping(ctx).Err()
 }
 
@@ -182,8 +294,59 @@ func (s *RedisSwitchboard) Channel() string {
 	return s.channel
 }
 
+func escapeRedisGlob(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '*', '?', '[', ']':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 func (s *RedisSwitchboard) FlushQueues(ctx context.Context) (int, error) {
+	if s == nil || s.client == nil {
+		return 0, errors.New("switchboard: nil redis client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	keysCount := 0
+
+	// When SAAS_MODE=on and ctx carries a UserContext, flush ONLY that user's
+	// tenant-scoped spawn queues (e.g. u:{user_id}:simulation:spawns:*).
+	if prefix := account.KeyPrefix(ctx); prefix != "" {
+		queuePrefix := prefix + ":simulation:spawns:"
+		var cursor uint64
+		for {
+			var batch []string
+			var err error
+			batch, cursor, err = s.client.Scan(ctx, cursor, escapeRedisGlob(queuePrefix)+"*", 100).Result()
+			if err != nil {
+				return keysCount, fmt.Errorf("scanning user spawn queues: %w", err)
+			}
+			var owned []string
+			for _, k := range batch {
+				if strings.HasPrefix(k, queuePrefix) {
+					owned = append(owned, k)
+				}
+			}
+			if len(owned) > 0 {
+				deleted, err := s.client.Del(ctx, owned...).Result()
+				if err != nil {
+					return keysCount, fmt.Errorf("deleting user spawn queues: %w", err)
+				}
+				keysCount += int(deleted)
+			}
+			if cursor == 0 {
+				break
+			}
+		}
+		return keysCount, nil
+	}
 
 	// Pass 1: global spawn queues (legacy / no-user-context)
 	var cursor uint64
@@ -192,13 +355,14 @@ func (s *RedisSwitchboard) FlushQueues(ctx context.Context) (int, error) {
 		var err error
 		batch, cursor, err = s.client.Scan(ctx, cursor, "simulation:spawns:*", 100).Result()
 		if err != nil {
-			return 0, fmt.Errorf("scanning spawn queues: %w", err)
+			return keysCount, fmt.Errorf("scanning spawn queues: %w", err)
 		}
 		if len(batch) > 0 {
-			if err := s.client.Del(ctx, batch...).Err(); err != nil {
+			deleted, err := s.client.Del(ctx, batch...).Result()
+			if err != nil {
 				return keysCount, fmt.Errorf("deleting spawn queues: %w", err)
 			}
-			keysCount += len(batch)
+			keysCount += int(deleted)
 		}
 		if cursor == 0 {
 			break
@@ -215,10 +379,11 @@ func (s *RedisSwitchboard) FlushQueues(ctx context.Context) (int, error) {
 			return keysCount, fmt.Errorf("scanning tenant-scoped spawn queues: %w", err)
 		}
 		if len(batch) > 0 {
-			if err := s.client.Del(ctx, batch...).Err(); err != nil {
+			deleted, err := s.client.Del(ctx, batch...).Result()
+			if err != nil {
 				return keysCount, fmt.Errorf("deleting tenant-scoped spawn queues: %w", err)
 			}
-			keysCount += len(batch)
+			keysCount += int(deleted)
 		}
 		if cursor == 0 {
 			break
@@ -232,6 +397,16 @@ func (s *RedisSwitchboard) FlushQueues(ctx context.Context) (int, error) {
 // If the Redis subscription drops, it retries with exponential backoff
 // to ensure cross-instance message delivery is not permanently lost.
 func (s *RedisSwitchboard) Start(ctx context.Context) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ensureLifecycleCtx()
+	stop := context.AfterFunc(ctx, s.Shutdown)
+	defer stop()
+
 	backoff := 500 * time.Millisecond
 	maxBackoff := 30 * time.Second
 
@@ -247,16 +422,38 @@ func (s *RedisSwitchboard) Start(ctx context.Context) error {
 			backoff = 500 * time.Millisecond
 		}
 		log.Printf("Switchboard: Redis subscription lost: %v — reconnecting in %v", err, backoff)
+		timer := time.NewTimer(backoff)
 		select {
-		case <-time.After(backoff):
+		case <-timer.C:
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
 		}
 	}
+}
+
+// parseBroadcastChannelUserID extracts the tenant user ID from a Redis
+// broadcast channel name. It accepts either the unprefixed baseChannel
+// (returning "", true) or a 2-segment tenant prefix "<prefix>:<userID>:<baseChannel>"
+// (returning userID, true). Malformed prefixes are rejected ("", false).
+func parseBroadcastChannelUserID(channel, baseChannel string) (string, bool) {
+	if channel == baseChannel {
+		return "", true
+	}
+	suffix := ":" + baseChannel
+	if !strings.HasSuffix(channel, suffix) {
+		return "", false
+	}
+	prefix := strings.TrimSuffix(channel, suffix)
+	parts := strings.Split(prefix, ":")
+	if len(parts) != 2 || !isValidRedisKeyComponent(parts[0]) || !isValidRedisKeyComponent(parts[1]) {
+		return "", false
+	}
+	return parts[1], true
 }
 
 // listenBroadcasts subscribes to the Redis broadcast channel and forwards
@@ -267,8 +464,8 @@ func (s *RedisSwitchboard) Start(ctx context.Context) error {
 // AND the tenant-scoped `*:gateway:broadcast` form (e.g.
 // `t:acme:gateway:broadcast`) so the gateway keeps receiving Python
 // publishes whether SAAS_MODE is off (legacy literal) or on (per-tenant
-// channel name). The two listeners run concurrently; either delivers
-// the same Wrapper into the local Hub via HandleRemoteMessage.
+// channel name). The parsed tenant user_id is forwarded to the Hub so
+// cross-tenant simulation hijacks are blocked.
 func (s *RedisSwitchboard) listenBroadcasts(ctx context.Context) error {
 	pubsub := s.client.PSubscribe(ctx, s.channel, "*:"+s.channel)
 	defer pubsub.Close()
@@ -286,6 +483,11 @@ func (s *RedisSwitchboard) listenBroadcasts(ctx context.Context) error {
 			if msg == nil {
 				return fmt.Errorf("Redis subscription channel closed")
 			}
+			tenantUserID, ok := parseBroadcastChannelUserID(msg.Channel, s.channel)
+			if !ok {
+				log.Printf("Switchboard: ignoring broadcast on malformed channel %q", msg.Channel)
+				continue
+			}
 			rawBytes := []byte(msg.Payload)
 			var wrapper gateway.Wrapper
 			if err := proto.Unmarshal(rawBytes, &wrapper); err != nil {
@@ -295,27 +497,40 @@ func (s *RedisSwitchboard) listenBroadcasts(ctx context.Context) error {
 			// Per-message log removed (Bug #42): fires on every Redis
 			// broadcast, flooding logs with 1000+ runners.
 			// All messages flow as binary protobuf gateway.Wrapper
-			// through HandleRemoteMessage.
+			// through handleRemoteMessage.
 			// UI clients decode protobuf directly (one format end-to-end).
 			// Pass raw bytes to skip redundant proto.Marshal in Hub.Run().
-			s.localHub.HandleRemoteMessage(&wrapper, rawBytes)
+			if s.localHub != nil {
+				s.localHub.handleRemoteMessage(tenantUserID, true, &wrapper, rawBytes)
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 }
 
-// Broadcast sends a message to all instances.
+// Broadcast sends a message to all instances, scoping the Redis channel by
+// UserContext when SAAS_MODE=on and a user is present on ctx.
 func (s *RedisSwitchboard) Broadcast(ctx context.Context, wrapper *gateway.Wrapper) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	data, err := proto.Marshal(wrapper)
 	if err != nil {
 		return err
 	}
-	return s.client.Publish(ctx, s.channel, data).Err()
+	channel := account.Key(ctx, s.channel)
+	return s.client.Publish(ctx, channel, data).Err()
 }
 
 // EnqueueOrchestration sends a JSON-encoded event to a Redis list for one-to-one delivery.
 func (s *RedisSwitchboard) EnqueueOrchestration(ctx context.Context, queue string, event interface{}) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -326,6 +541,9 @@ func (s *RedisSwitchboard) EnqueueOrchestration(ctx context.Context, queue strin
 // BatchEnqueueOrchestration sends multiple JSON-encoded events to Redis lists
 // in a single pipeline, reducing round-trips from N to 1 during spawn bursts.
 func (s *RedisSwitchboard) BatchEnqueueOrchestration(ctx context.Context, items []QueueItem) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
 	if len(items) == 0 {
 		return nil
 	}
@@ -347,14 +565,30 @@ func (s *RedisSwitchboard) BatchEnqueueOrchestration(ctx context.Context, items 
 //   - All agents receive /orchestration pokes (subscriber and callable alike)
 //   - A2A message/send is reserved for targeted DispatchToAgent only
 func (s *RedisSwitchboard) PublishOrchestration(ctx context.Context, channel string, event interface{}) error {
+	if s == nil || s.client == nil {
+		return errors.New("switchboard: nil redis client")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.lifecycleErr() != nil {
+		return ErrSwitchboardClosed
+	}
+
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
 
+	var errs []error
+
 	// 1. Performance Path: Redis Pub/Sub (subscriber agents listen here)
 	if err := s.client.Publish(ctx, channel, data).Err(); err != nil {
 		log.Printf("Switchboard: Redis PublishOrchestration failed: %v", err)
+		errs = append(errs, fmt.Errorf("redis publish %q: %w", channel, err))
 	}
 
 	// 2. Session-Aware Dispatch: only poke agent types with active sessions
@@ -362,7 +596,8 @@ func (s *RedisSwitchboard) PublishOrchestration(ctx context.Context, channel str
 		agents, err := s.catalog.DiscoverAgents()
 		if err != nil {
 			log.Printf("Switchboard: catalog discovery failed: %v", err)
-			return nil
+			errs = append(errs, fmt.Errorf("catalog discovery: %w", err))
+			return errors.Join(errs...)
 		}
 
 		if s.registry != nil {
@@ -370,28 +605,35 @@ func (s *RedisSwitchboard) PublishOrchestration(ctx context.Context, channel str
 			activeTypes, err := s.registry.ActiveAgentTypes(ctx)
 			if err != nil {
 				log.Printf("Switchboard: ActiveAgentTypes failed: %v", err)
-				return nil
+				errs = append(errs, fmt.Errorf("active agent types: %w", err))
+				return errors.Join(errs...)
 			}
 			for _, agentType := range activeTypes {
 				card, ok := agents[agentType]
 				if !ok || card.URL == "" {
+					log.Printf("Switchboard: Active agentType %q not found in catalog or has no URL", agentType)
 					continue
 				}
 				// Route by URL type:
 				//   - Agent Engine: A2A message/send (no /orchestration endpoint)
 				//   - All local agents: HTTP poke to /orchestration via BaseURL
+				asyncCtx, asyncCancel, ok := s.beginAsyncDispatch(ctx)
+				if !ok {
+					errs = append(errs, ErrSwitchboardClosed)
+					break
+				}
 				if agent.IsAgentEngineURL(card.URL) {
-					s.wg.Add(1)
-					go func() {
+					go func(c agent.AgentCard, d []byte) {
 						defer s.wg.Done()
-						s.dispatchCallable(context.Background(), card.URL, card.Name, data)
-					}()
+						defer asyncCancel()
+						s.dispatchCallable(asyncCtx, c.URL, c.Name, d)
+					}(card, data)
 				} else {
-					s.wg.Add(1)
-					go func() {
+					go func(c agent.AgentCard, d []byte) {
 						defer s.wg.Done()
-						s.pokeOrchestrationEndpoint(card.OrchestrationBaseURL(), card.Name, data)
-					}()
+						defer asyncCancel()
+						s.pokeOrchestrationEndpoint(asyncCtx, c.OrchestrationBaseURL(), c.Name, d)
+					}(card, data)
 				}
 			}
 		} else {
@@ -399,29 +641,55 @@ func (s *RedisSwitchboard) PublishOrchestration(ctx context.Context, channel str
 				if card.URL == "" {
 					continue
 				}
-				s.wg.Add(1)
-				go func() {
-					defer s.wg.Done()
-					s.pokeOrchestrationEndpoint(card.OrchestrationBaseURL(), card.Name, data)
-				}()
+				asyncCtx, asyncCancel, ok := s.beginAsyncDispatch(ctx)
+				if !ok {
+					errs = append(errs, ErrSwitchboardClosed)
+					break
+				}
+				if agent.IsAgentEngineURL(card.URL) {
+					go func(c agent.AgentCard, d []byte) {
+						defer s.wg.Done()
+						defer asyncCancel()
+						s.dispatchCallable(asyncCtx, c.URL, c.Name, d)
+					}(card, data)
+				} else {
+					go func(c agent.AgentCard, d []byte) {
+						defer s.wg.Done()
+						defer asyncCancel()
+						s.pokeOrchestrationEndpoint(asyncCtx, c.OrchestrationBaseURL(), c.Name, d)
+					}(card, data)
+				}
 			}
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // DispatchToAgent dispatches an orchestration event to a single agent by type.
 // Uses dispatch-mode routing: subscriber agents get HTTP pokes, callable agents
 // get A2A JSON-RPC message/send.
 func (s *RedisSwitchboard) DispatchToAgent(ctx context.Context, agentType string, event interface{}) error {
+	return s.dispatchAgentEvent(ctx, "dispatch", agentType, event)
+}
+
+func (s *RedisSwitchboard) dispatchAgentEvent(ctx context.Context, op, agentType string, event interface{}) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if s == nil {
+		return fmt.Errorf("switchboard: nil receiver for agent %s", op)
+	}
+	if s.lifecycleErr() != nil {
+		return ErrSwitchboardClosed
+	}
 	data, err := json.Marshal(event)
 	if err != nil {
 		return err
 	}
 
 	if s.catalog == nil {
-		return fmt.Errorf("no catalog available for agent dispatch")
+		return fmt.Errorf("no catalog available for agent %s", op)
 	}
 
 	agents, err := s.catalog.DiscoverAgents()
@@ -432,20 +700,24 @@ func (s *RedisSwitchboard) DispatchToAgent(ctx context.Context, agentType string
 	card, ok := agents[agentType]
 	if !ok || card.URL == "" {
 		log.Printf("Switchboard: Agent %q not found in catalog or has no URL", agentType)
-		return nil
+		return fmt.Errorf("%w: %q", ErrAgentNotFound, agentType)
 	}
 
+	asyncCtx, asyncCancel, ok := s.beginAsyncDispatch(ctx)
+	if !ok {
+		return ErrSwitchboardClosed
+	}
 	if agent.IsAgentEngineURL(card.URL) {
-		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.dispatchCallable(context.Background(), card.URL, card.Name, data)
+			defer asyncCancel()
+			s.dispatchCallable(asyncCtx, card.URL, card.Name, data)
 		}()
 	} else {
-		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.pokeOrchestrationEndpoint(card.OrchestrationBaseURL(), card.Name, data)
+			defer asyncCancel()
+			s.pokeOrchestrationEndpoint(asyncCtx, card.OrchestrationBaseURL(), card.Name, data)
 		}()
 	}
 
@@ -454,34 +726,51 @@ func (s *RedisSwitchboard) DispatchToAgent(ctx context.Context, agentType string
 
 // pokeOrchestrationEndpoint sends an HTTP POST to any agent's /orchestration
 // endpoint, selecting the HTTP client based on URL:
-//   - Local/Cloud Run: plain HTTP client
+//   - Local/http: plain HTTP client
+//   - Cloud Run (https): OIDC ID-token authenticated client
 //   - Agent Engine (aiplatform.googleapis.com): GCP-authenticated client
-func (s *RedisSwitchboard) pokeOrchestrationEndpoint(agentURL, agentType string, data []byte) {
+func (s *RedisSwitchboard) pokeOrchestrationEndpoint(ctx context.Context, agentURL, agentType string, data []byte) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Agents mount at root (each has its own port/service), so the
 	// orchestration endpoint is directly at {base}/orchestration.
 	pokeURL := strings.TrimRight(agentURL, "/") + "/orchestration"
 
 	// Auth selection per URL kind:
-	//  - Agent Engine: OAuth bearer (cloud-platform scope) via s.gcpClient.
+	//  - Agent Engine: OAuth bearer (cloud-platform scope) via s.gcpClient (fail closed if nil).
 	//  - Cloud Run (any other https://): OIDC ID token with audience =
-	//    service URL. Cloud Run --no-allow-unauthenticated services return
-	//    403 to anything else, including OAuth bearers.
+	//    service URL (fail closed if OIDC client acquisition fails).
 	//  - localhost / http://: plain client (local dev, no auth).
 	client := s.httpClient
-	if agent.IsAgentEngineURL(agentURL) && s.gcpClient != nil {
+	if agent.IsAgentEngineURL(agentURL) {
+		if s.gcpClient == nil {
+			log.Printf("Switchboard: Agent Engine auth client unavailable for poke %s (%s): %v", agentType, pokeURL, s.gcpClientErr)
+			return
+		}
 		client = s.gcpClient
 	} else if auth.IsCloudRunURL(agentURL) {
-		if oidcClient := auth.OIDCClient(auth.AudienceFor(agentURL)); oidcClient != nil {
-			client = oidcClient
+		oidcClient, err := s.getOIDCClient(auth.AudienceFor(agentURL))
+		if err != nil || oidcClient == nil {
+			log.Printf("Switchboard: Cloud Run OIDC client unavailable for poke %s (%s): %v", agentType, pokeURL, err)
+			return
 		}
+		client = oidcClient
+	}
+	if client == nil {
+		log.Printf("Switchboard: nil HTTP client for poke %s (%s)", agentType, pokeURL)
+		return
 	}
 
 	log.Printf("Switchboard: Poking %s at %s", agentType, pokeURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", pokeURL, bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(reqCtx, "POST", pokeURL, bytes.NewBuffer(data))
 	if err != nil {
 		log.Printf("Switchboard: Failed to create request for %s: %v", agentType, err)
 		return
@@ -494,8 +783,17 @@ func (s *RedisSwitchboard) pokeOrchestrationEndpoint(agentURL, agentType string,
 		return
 	}
 	defer resp.Body.Close()
-	// Drain response body to enable TCP connection reuse.
-	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 400 {
+		snippet, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			log.Printf("Switchboard: Poke %s returned HTTP %d (body read error: %v)", agentType, resp.StatusCode, readErr)
+		} else {
+			log.Printf("Switchboard: Poke %s returned HTTP %d: %s", agentType, resp.StatusCode, string(snippet))
+		}
+		return
+	}
+	// Drain response body (bounded) to enable TCP connection reuse.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 }
 
 // PokeAgent dispatches an event to a single agent, routing by URL type:
@@ -507,46 +805,62 @@ func (s *RedisSwitchboard) pokeOrchestrationEndpoint(agentURL, agentType string,
 // LLM. Sending these as A2A message/send would cause the A2A executor to
 // treat the event as a user message, triggering an unwanted LLM invocation.
 func (s *RedisSwitchboard) PokeAgent(ctx context.Context, agentType string, event interface{}) error {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
+	return s.dispatchAgentEvent(ctx, "poke", agentType, event)
+}
 
-	if s.catalog == nil {
-		return fmt.Errorf("no catalog available for agent poke")
+func extractStringField(m map[string]interface{}, keys ...string) string {
+	if m == nil {
+		return ""
 	}
+	for _, k := range keys {
+		if raw, ok := m[k]; ok {
+			if s, ok := raw.(string); ok {
+				if trimmed := strings.TrimSpace(s); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
 
-	agents, err := s.catalog.DiscoverAgents()
-	if err != nil {
-		return fmt.Errorf("catalog discovery failed: %w", err)
+func isValidRedisKeyComponent(v string) bool {
+	if v == "" {
+		return false
 	}
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == ':' || b <= 0x20 || b >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
 
-	card, ok := agents[agentType]
-	if !ok || card.URL == "" {
-		log.Printf("Switchboard: Agent %q not found in catalog or has no URL", agentType)
-		return nil
+func extractDispatchUserID(ctx context.Context, event map[string]interface{}) string {
+	if uc, ok := account.FromContextOK(ctx); ok {
+		if uid := strings.TrimSpace(uc.UserID); uid != "" {
+			return uid
+		}
 	}
-
-	if agent.IsAgentEngineURL(card.URL) {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.dispatchCallable(context.Background(), card.URL, card.Name, data)
-		}()
-	} else {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.pokeOrchestrationEndpoint(card.OrchestrationBaseURL(), card.Name, data)
-		}()
+	if payload, ok := event["payload"].(map[string]interface{}); ok {
+		if uid := extractStringField(payload, "acting_user_id", "user_id", "userId"); uid != "" {
+			return uid
+		}
 	}
-	return nil
+	return extractStringField(event, "acting_user_id", "user_id", "userId")
 }
 
 // dispatchCallable sends an A2A JSON-RPC message/send request to a callable agent.
 // Uses the retryable HTTP client with exponential backoff.
 // For Agent Engine URLs, uses GCP-authenticated client.
 func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agentType string, eventData []byte) {
+	if s == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Determine the A2A endpoint URL.
 	// After catalog discovery, card.URL for non-AE agents includes the A2A
 	// mount path (e.g., /a2a/simulator/). For AE agents, the URL is the
@@ -571,16 +885,32 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 	}
 
 	sessionID, _ := event["sessionId"].(string)
+	userID := extractDispatchUserID(ctx, event)
 
-	// Write session→simulation mapping to the agent-side Redis hash so
+	// Write session→simulation mapping to the agent-side Redis key so
 	// DashLogPlugin on the callable AE agent can resolve simulation_id.
 	// Without this, callable dispatch bypasses the Python dispatcher entirely,
 	// and simulation_registry.register() never runs — so all DashLogPlugin
 	// events are emitted without simulation_id.
-	if payload, ok := event["payload"].(map[string]interface{}); ok {
-		if simID, ok := payload["simulation_id"].(string); ok && simID != "" && sessionID != "" {
-			if err := s.client.Set(ctx, "simreg:session:"+sessionID, simID, 2*time.Hour).Err(); err != nil {
-				log.Printf("Switchboard: Failed to write simreg for callable %s session %s: %v", agentType, sessionID, err)
+	if s.client != nil {
+		if payload, ok := event["payload"].(map[string]interface{}); ok {
+			if simID, ok := payload["simulation_id"].(string); ok && simID != "" && sessionID != "" {
+				simregCtx := ctx
+				if _, hasAcc := account.FromContextOK(simregCtx); !hasAcc && isValidRedisKeyComponent(userID) {
+					simregCtx = account.WithContext(simregCtx, account.UserContext{UserID: userID})
+				}
+				uc, hasAcc := account.FromContextOK(simregCtx)
+				saasOn := account.SaaSModeEnabled()
+				if saasOn && (!hasAcc || !isValidRedisKeyComponent(strings.TrimSpace(uc.UserID))) {
+					log.Printf("Switchboard: Skipping simreg write for callable %s session %s in SAAS_MODE=on without valid user_id", agentType, sessionID)
+				} else if saasOn && !isValidRedisKeyComponent(sessionID) {
+					log.Printf("Switchboard: Skipping simreg write for callable %s invalid session %q in SAAS_MODE=on", agentType, sessionID)
+				} else {
+					simregKey := account.Key(simregCtx, "simreg", "session", sessionID)
+					if err := s.client.Set(ctx, simregKey, simID, 2*time.Hour).Err(); err != nil {
+						log.Printf("Switchboard: Failed to write simreg for callable %s session %s: %v", agentType, sessionID, err)
+					}
+				}
 			}
 		}
 	}
@@ -600,7 +930,7 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 
 	// Construct request body based on agent type.
 	// AE uses protobuf SendMessageRequest (proven via curl → HTTP 200):
-	//   {request: {message_id, role: "ROLE_USER", content: [{text}]},
+	//   {request: {message_id, role: "ROLE_USER", content: [{text}], metadata?: {user_id}},
 	//    configuration: {accepted_output_modes: ["text"]}}
 	// Cloud Run uses standard A2A JSON-RPC envelope.
 	var requestBody interface{}
@@ -614,15 +944,21 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 		if contextID == "" {
 			contextID = fmt.Sprintf("ctx-%d", time.Now().UnixMilli())
 		}
-		requestBody = map[string]interface{}{
-			"request": map[string]interface{}{
-				"role":       "ROLE_USER",
-				"message_id": msgID,
-				"context_id": contextID,
-				"content": []map[string]interface{}{
-					{"text": string(eventData)},
-				},
+		reqMsg := map[string]interface{}{
+			"role":       "ROLE_USER",
+			"message_id": msgID,
+			"context_id": contextID,
+			"content": []map[string]interface{}{
+				{"text": string(eventData)},
 			},
+		}
+		if userID != "" {
+			reqMsg["metadata"] = map[string]interface{}{
+				"user_id": userID,
+			}
+		}
+		requestBody = map[string]interface{}{
+			"request": reqMsg,
 			"configuration": map[string]interface{}{
 				"accepted_output_modes": []string{"text"},
 				"blocking":              true,
@@ -630,21 +966,27 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 		}
 	} else {
 		// Cloud Run: standard A2A JSON-RPC
+		msgMap := map[string]interface{}{
+			"role":      "user",
+			"messageId": msgID,
+			"parts": []map[string]interface{}{
+				{
+					"kind": "text",
+					"text": string(eventData),
+				},
+			},
+		}
+		if userID != "" {
+			msgMap["metadata"] = map[string]interface{}{
+				"user_id": userID,
+			}
+		}
 		requestBody = map[string]interface{}{
 			"jsonrpc": "2.0",
 			"method":  "message/send",
 			"id":      fmt.Sprintf("%s-%s", agentType, sessionID),
 			"params": map[string]interface{}{
-				"message": map[string]interface{}{
-					"role":      "user",
-					"messageId": msgID,
-					"parts": []map[string]interface{}{
-						{
-							"kind": "text",
-							"text": string(eventData),
-						},
-					},
-				},
+				"message": msgMap,
 			},
 		}
 	}
@@ -655,10 +997,25 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 		return
 	}
 
-	// Select HTTP client: GCP-authenticated for Agent Engine, retryable for others
+	// Select HTTP client: GCP-authenticated for Agent Engine, OIDC for Cloud Run, retryable for local/dev
 	httpClient := s.callableClient
-	if agent.IsAgentEngineURL(agentURL) && s.gcpClient != nil {
+	if agent.IsAgentEngineURL(agentURL) {
+		if s.gcpClient == nil {
+			log.Printf("Switchboard: Agent Engine auth client unavailable for callable %s (%s): %v", agentType, a2aURL, s.gcpClientErr)
+			return
+		}
 		httpClient = s.gcpClient
+	} else if auth.IsCloudRunURL(agentURL) {
+		oidcClient, err := s.getOIDCClient(auth.AudienceFor(agentURL))
+		if err != nil || oidcClient == nil {
+			log.Printf("Switchboard: Cloud Run OIDC client unavailable for callable %s (%s): %v", agentType, a2aURL, err)
+			return
+		}
+		httpClient = oidcClient
+	}
+	if httpClient == nil {
+		log.Printf("Switchboard: nil HTTP client for callable %s (%s)", agentType, a2aURL)
+		return
 	}
 
 	log.Printf("Switchboard: Dispatching A2A message/send to callable %s at %s (session: %s)", agentType, a2aURL, sessionID)
@@ -697,14 +1054,24 @@ func (s *RedisSwitchboard) dispatchCallable(ctx context.Context, agentURL, agent
 	// serves as a safety net for the FINAL response text only — it ensures
 	// the A2A Task result reaches WebSocket clients even if the agent's
 	// direct Redis pulse for the final response was lost or not emitted.
-	if len(respBody) > 0 {
-		s.relayCallableResponse(ctx, agentType, sessionID, respBody)
+	if len(respBody) > 0 && ctx.Err() == nil {
+		relayCtx := ctx
+		if _, hasAcc := account.FromContextOK(relayCtx); !hasAcc && isValidRedisKeyComponent(userID) {
+			relayCtx = account.WithContext(relayCtx, account.UserContext{UserID: userID})
+		}
+		s.relayCallableResponse(relayCtx, agentType, sessionID, respBody)
 	}
 }
 
 // relayCallableResponse extracts text from an A2A SendMessageResponse and
 // publishes it as a gateway.Wrapper to the Hub for WebSocket fan-out.
 func (s *RedisSwitchboard) relayCallableResponse(ctx context.Context, agentType, sessionID string, body []byte) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	var resp struct {
 		Task struct {
 			Artifacts []struct {
@@ -736,13 +1103,22 @@ func (s *RedisSwitchboard) relayCallableResponse(ctx context.Context, agentType,
 	// the sessionID is a numeric resource ID, not the simulation UUID.
 	var simulationID string
 	if s.registry != nil {
-		if simID, err := s.registry.FindSimulation(ctx, sessionID); err == nil && simID != "" {
+		simID, err := s.registry.FindSimulation(ctx, sessionID)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("Switchboard: FindSimulation failed for session %s: %v", sessionID, err)
+			}
+		} else if simID != "" {
 			simulationID = simID
 		}
 	}
 
 	for _, text := range texts {
-		payload, _ := json.Marshal(map[string]string{"text": text})
+		payload, err := json.Marshal(map[string]string{"text": text})
+		if err != nil {
+			log.Printf("Switchboard: Failed to marshal relay payload for %s: %v", agentType, err)
+			continue
+		}
 		wrapper := &gateway.Wrapper{
 			Timestamp:    time.Now().Format(time.RFC3339Nano),
 			Type:         "json",

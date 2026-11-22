@@ -1,6 +1,6 @@
 # Copyright 2026 Google LLC
 # Modifications copyright 2026 Christian Haeussinger
-# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@
 """Simulation A2A Executor — custom AgentExecutor for Agent Engine deployment.
 
 Uses the a2a-sdk AgentExecutor base (NOT ADK's A2aAgentExecutor) to handle
-session creation correctly via SessionManager.  Pattern from the working
-next26-simulation-demos/demo-2-autonomous-agents reference implementation.
+session creation correctly via SessionManager.
 
 ADK's A2aAgentExecutor._prepare_session() is broken for VertexAiSessionService:
 - Without context_id: get_session(None) → 400 Invalid Session resource name
@@ -27,10 +26,13 @@ ADK's A2aAgentExecutor._prepare_session() is broken for VertexAiSessionService:
 This executor bypasses _prepare_session entirely by managing sessions itself.
 """
 
+from contextlib import nullcontext
 import json
 import logging
+import math
 import os
 import uuid
+from collections.abc import Mapping
 from typing import Any, Callable, Optional, cast
 
 import vertexai
@@ -55,11 +57,98 @@ from google.genai import types  # noqa: E402
 
 from agents.utils import pulses  # noqa: E402
 from agents.utils import simulation_registry  # noqa: E402
+from agents.utils import tenant_keys  # noqa: E402
+from agents.utils import user_auth_context  # noqa: E402
 from agents.utils.redis_pool import get_shared_redis_client  # noqa: E402
 from agents.utils.runtime import create_services  # noqa: E402
 from agents.utils.session_manager import SessionManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+_ANONYMOUS_USER_IDS = frozenset({"simulation", "simulation_user", "anonymous", "default", "user"})
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def _strict_json_dumps(obj: object, **kwargs: Any) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON, replacing non-finite floats with null."""
+    try:
+        return json.dumps(obj, allow_nan=False, **kwargs)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False, **kwargs)
+
+
+def _extract_str_field(mapping: Any, *keys: str) -> Optional[str]:
+    """Extract the first non-empty stripped string value for *keys* from *mapping*."""
+    if not isinstance(mapping, Mapping):
+        return None
+    for key in keys:
+        val = mapping.get(key)
+        if isinstance(val, str):
+            stripped = val.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _resolve_user_id(
+    context: RequestContext,
+    event: Any = None,
+    inner_event: Any = None,
+) -> Optional[str]:
+    """Resolve authenticated user_id from A2A message metadata or JSON event payload."""
+    msg = getattr(context, "message", None)
+    msg_meta = getattr(msg, "metadata", None) if msg is not None else None
+    if uid := _extract_str_field(msg_meta, "user_id", "acting_user_id", "userId"):
+        return uid
+
+    ctx_meta = getattr(context, "metadata", None)
+    if uid := _extract_str_field(ctx_meta, "user_id", "acting_user_id", "userId"):
+        return uid
+
+    if isinstance(event, Mapping):
+        if uid := _extract_str_field(event.get("payload"), "acting_user_id", "user_id", "userId"):
+            return uid
+        if uid := _extract_str_field(event, "acting_user_id", "user_id", "userId"):
+            return uid
+
+    if isinstance(inner_event, Mapping):
+        if uid := _extract_str_field(inner_event, "acting_user_id", "user_id", "userId"):
+            return uid
+
+    return None
+
+
+def _resolve_user_auth_token(
+    context: RequestContext,
+    event: Any = None,
+    inner_event: Any = None,
+) -> Optional[str]:
+    """Extract and validate per-user bearer token from A2A metadata or JSON event payload."""
+    candidates: list[Optional[str]] = []
+    msg = getattr(context, "message", None)
+    msg_meta = getattr(msg, "metadata", None) if msg is not None else None
+    candidates.append(_extract_str_field(msg_meta, "user_auth_token"))
+    candidates.append(_extract_str_field(getattr(context, "metadata", None), "user_auth_token"))
+    if isinstance(event, Mapping):
+        candidates.append(_extract_str_field(event.get("payload"), "user_auth_token"))
+        candidates.append(_extract_str_field(event, "user_auth_token"))
+    if isinstance(inner_event, Mapping):
+        candidates.append(_extract_str_field(inner_event, "user_auth_token"))
+
+    for raw in candidates:
+        if raw and user_auth_context._is_valid_bearer_token(raw):
+            return raw
+    return None
 
 
 def _final_response_text(event: Any) -> str:
@@ -89,7 +178,7 @@ def _final_response_text(event: Any) -> str:
             if result.strip():
                 chunks.append(result)
         elif result is not None:
-            chunks.append(json.dumps(result, default=str))
+            chunks.append(_strict_json_dumps(result, default=str))
     return "\n".join(chunks)
 
 
@@ -173,7 +262,8 @@ class SimulationExecutor(AgentExecutor):
         from agents.utils.simulation_plugin import SimulationNetworkPlugin
         from google.adk.apps import App
 
-        assert self._agent_getter is not None, "agent_getter required for lazy init"
+        if self._agent_getter is None:
+            raise RuntimeError("agent_getter required for lazy init")
         agent = self._agent_getter()
         services = create_services()
 
@@ -223,12 +313,8 @@ class SimulationExecutor(AgentExecutor):
     ) -> None:
         """Execute a request from the A2A protocol."""
         self._init_runner()
-        assert self._runner is not None
-        assert self._session_manager is not None
-
-        user_id: str = (
-            context.message.metadata.get("user_id") if context.message and context.message.metadata else None
-        ) or self._default_user_id
+        if self._runner is None or self._session_manager is None:
+            raise RuntimeError("SimulationExecutor runner failed to initialize")
 
         task_id = context.task_id or str(uuid.uuid4())
         context_id = context.context_id or str(uuid.uuid4())
@@ -276,110 +362,216 @@ class SimulationExecutor(AgentExecutor):
         # callable mode the dispatcher idles, so we must do it here.
         _event_simulation_id: str | None = None
         event_type: str | None = None
+        parsed_event: dict[str, Any] | None = None
+        inner_event: dict[str, Any] | None = None
 
         try:
-            event = json.loads(query)
-            if isinstance(event, dict) and "type" in event:
-                event_type = event.get("type")
-                logger.info(
-                    "SIMULATION_EXECUTOR: Intercepted orchestration event: %s (mode=%s)", event_type, dispatch_mode
-                )
-
-                # Extract simulation_id from event payload (set by gateway
-                # spawn handler in cmd/gateway/main.go).
-                _evt_payload = event.get("payload")
-                if isinstance(_evt_payload, dict):
-                    _event_simulation_id = _evt_payload.get("simulation_id")
-
-            elif isinstance(event, dict) and "simulation_id" in event:
-                # Direct A2A call from planner: simulation_id is in the
-                # message payload body.  On Agent Engine the A2A transport
-                # assigns its own context_id, so the payload is the only
-                # reliable source of the planner's simulation_id.
-                _event_simulation_id = event.get("simulation_id")
-                logger.warning(
-                    "SIMULATION_EXECUTOR: Extracted simulation_id from payload: %s",
-                    _event_simulation_id,
-                )
-                # No dispatch handling -- fall through to normal query path.
-
-            # Orchestration dispatch (only for events with a "type" field).
-            if isinstance(event, dict) and "type" in event:
-                if dispatch_mode == "callable":
-                    # CALLABLE MODE (Agent Engine): Handle directly without dispatcher.
-                    # The dispatcher uses per-process in-memory session tracking which
-                    # breaks across AE's multi-worker deployment. Instead, we handle
-                    # events directly and use SessionManager + VertexAiSessionService
-                    # for session continuity (shared across all workers).
-                    if event_type == "spawn_agent":
-                        payload = event.get("payload", {})
-                        target_type = payload.get("agentType")
-
-                        # Register session→simulation mapping in Redis so
-                        # that subsequent broadcast events (which may land on
-                        # a different AE instance) can resolve simulation_id
-                        # for DashLogPlugin.
-                        if _event_simulation_id and context_id:
-                            await simulation_registry.register(context_id, _event_simulation_id)
-                            logger.info(
-                                "SIMULATION_EXECUTOR: Registered simreg %s → %s (spawn)",
-                                context_id,
-                                _event_simulation_id,
-                            )
-
-                        if target_type == self._agent_name:
-                            logger.info("SIMULATION_EXECUTOR: Acknowledged spawn for %s", self._agent_name)
-                        else:
-                            logger.info(
-                                "SIMULATION_EXECUTOR: Ignored spawn for %s (we are %s)", target_type, self._agent_name
-                            )
-                        await updater.complete()
-                        return
-
-                    elif event_type == "broadcast":
-                        # Extract user text from broadcast payload and fall through
-                        # to the direct execution path below.
-                        payload = event.get("payload", {})
-                        broadcast_data = payload.get("data", "")
-                        try:
-                            inner = json.loads(broadcast_data)
-                            if isinstance(inner, dict) and "text" in inner:
-                                query = inner["text"]
-                            else:
-                                query = broadcast_data
-                        except (json.JSONDecodeError, TypeError):
-                            query = broadcast_data
-                        if not query:
-                            logger.warning("SIMULATION_EXECUTOR: Broadcast had empty text, skipping execution")
-                            await updater.complete()
-                            return
-                        logger.info("SIMULATION_EXECUTOR: Extracted broadcast text: %s...", query[:80])
-                        # Fall through to direct execution path below
-                    else:
-                        # Unknown event type in callable mode — acknowledge
-                        logger.warning("SIMULATION_EXECUTOR: Unknown event type %s, acknowledging", event_type)
-                        await updater.complete()
-                        return
-                else:
-                    # SUBSCRIBER MODE (Cloud Run): Use dispatcher-based path.
-                    from agents.utils.simulation_plugin import SimulationNetworkPlugin
-
-                    orchestration_plugin = next(
-                        (p for p in getattr(self._runner.app, "plugins", []) if isinstance(p, SimulationNetworkPlugin)),
-                        None,
+            parsed = json.loads(query)
+            if isinstance(parsed, dict):
+                parsed_event = parsed
+                if "type" in parsed_event:
+                    event_type = parsed_event.get("type")
+                    logger.info(
+                        "SIMULATION_EXECUTOR: Intercepted orchestration event: %s (mode=%s)",
+                        event_type,
+                        dispatch_mode,
                     )
-                    if orchestration_plugin and orchestration_plugin.dispatcher:
-                        await orchestration_plugin.dispatcher.handle_event(event)
-                        await updater.complete()
-                        return
-                    else:
-                        logger.warning("SIMULATION_EXECUTOR: No dispatcher found for intercepted event")
+
+                    # Extract simulation_id from event payload (set by gateway
+                    # spawn handler in cmd/gateway/main.go).
+                    _evt_payload = parsed_event.get("payload")
+                    if isinstance(_evt_payload, dict):
+                        _event_simulation_id = _evt_payload.get("simulation_id")
+                        if event_type == "broadcast":
+                            broadcast_data = _evt_payload.get("data", "")
+                            if isinstance(broadcast_data, dict):
+                                inner_event = broadcast_data
+                            elif isinstance(broadcast_data, str):
+                                try:
+                                    parsed_inner = json.loads(broadcast_data)
+                                    if isinstance(parsed_inner, dict):
+                                        inner_event = parsed_inner
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+
+                elif "simulation_id" in parsed_event:
+                    # Direct A2A call from planner: simulation_id is in the
+                    # message payload body.  On Agent Engine the A2A transport
+                    # assigns its own context_id, so the payload is the only
+                    # reliable source of the planner's simulation_id.
+                    _event_simulation_id = parsed_event.get("simulation_id")
+                    logger.warning(
+                        "SIMULATION_EXECUTOR: Extracted simulation_id from payload: %s",
+                        _event_simulation_id,
+                    )
+                    # No dispatch handling -- fall through to normal query path.
         except (json.JSONDecodeError, TypeError) as _parse_err:
             # Not a JSON event or type error in orchestration parsing,
             # proceed as normal user query.
-            logger.warning(
-                "SIMULATION_EXECUTOR: Orchestration parse error (%s): %s", type(_parse_err).__name__, _parse_err
-            )
+            if query.lstrip().startswith("{"):
+                logger.warning(
+                    "SIMULATION_EXECUTOR: Orchestration parse error (%s): %s", type(_parse_err).__name__, _parse_err
+                )
+            else:
+                logger.debug(
+                    "SIMULATION_EXECUTOR: Non-JSON query (%s): %s", type(_parse_err).__name__, _parse_err
+                )
+
+        # Resolve user_id from A2A message metadata first, falling back to JSON
+        # event payload fields (acting_user_id / user_id / userId). In SAAS_MODE=on,
+        # fail closed rather than silently collapsing tenants to "simulation_user".
+        resolved_user_id = _resolve_user_id(context, event=parsed_event, inner_event=inner_event)
+        resolved_auth_token = _resolve_user_auth_token(context, event=parsed_event, inner_event=inner_event)
+        saas_on = tenant_keys._saas_mode_enabled()
+        if saas_on:
+            if not resolved_user_id or resolved_user_id.lower() in _ANONYMOUS_USER_IDS:
+                logger.error(
+                    "SIMULATION_EXECUTOR: Missing or anonymous user_id in SAAS_MODE=on for %s context=%s",
+                    self._agent_name,
+                    context_id,
+                )
+                await updater.update_status(
+                    TaskState.failed,
+                    message=new_agent_text_message("Authenticated user_id is required when SAAS_MODE=on"),
+                    final=True,
+                )
+                return
+            try:
+                user_id = tenant_keys._validate_component(resolved_user_id, "user_id")
+            except ValueError as _uid_err:
+                logger.error(
+                    "SIMULATION_EXECUTOR: Invalid user_id %r in SAAS_MODE=on for %s context=%s: %s",
+                    resolved_user_id,
+                    self._agent_name,
+                    context_id,
+                    _uid_err,
+                )
+                await updater.update_status(
+                    TaskState.failed,
+                    message=new_agent_text_message("Invalid user_id"),
+                    final=True,
+                )
+                return
+        else:
+            user_id = resolved_user_id or self._default_user_id
+
+        # Orchestration dispatch (only for events with a "type" field).
+        if parsed_event is not None and "type" in parsed_event:
+            if dispatch_mode == "callable":
+                # CALLABLE MODE (Agent Engine): Handle directly without dispatcher.
+                # The dispatcher uses per-process in-memory session tracking which
+                # breaks across AE's multi-worker deployment. Instead, we handle
+                # events directly and use SessionManager + VertexAiSessionService
+                # for session continuity (shared across all workers).
+                if event_type == "spawn_agent":
+                    raw_payload = parsed_event.get("payload")
+                    payload = raw_payload if isinstance(raw_payload, dict) else {}
+                    target_type = payload.get("agentType")
+
+                    # Register session→simulation mapping in Redis so
+                    # that subsequent broadcast events (which may land on
+                    # a different AE instance) can resolve simulation_id
+                    # for DashLogPlugin.
+                    if _event_simulation_id and context_id:
+                        if resolved_user_id:
+                            await simulation_registry.register(
+                                context_id, _event_simulation_id, user_id=user_id
+                            )
+                        else:
+                            await simulation_registry.register(context_id, _event_simulation_id)
+                        logger.info(
+                            "SIMULATION_EXECUTOR: Registered simreg %s → %s (spawn)",
+                            context_id,
+                            _event_simulation_id,
+                        )
+
+                    if target_type == self._agent_name:
+                        logger.info("SIMULATION_EXECUTOR: Acknowledged spawn for %s", self._agent_name)
+                    else:
+                        logger.info(
+                            "SIMULATION_EXECUTOR: Ignored spawn for %s (we are %s)", target_type, self._agent_name
+                        )
+                    await updater.complete()
+                    return
+
+                elif event_type == "broadcast":
+                    # Extract user text from broadcast payload and fall through
+                    # to the direct execution path below.
+                    raw_payload = parsed_event.get("payload")
+                    payload = raw_payload if isinstance(raw_payload, dict) else {}
+                    broadcast_data = payload.get("data", "")
+                    if inner_event is not None and "text" in inner_event:
+                        raw_query: Any = inner_event["text"]
+                    elif isinstance(broadcast_data, dict) and "text" in broadcast_data:
+                        raw_query = broadcast_data["text"]
+                    else:
+                        raw_query = broadcast_data
+
+                    if raw_query is None or raw_query == "":
+                        logger.warning("SIMULATION_EXECUTOR: Broadcast had empty text, skipping execution")
+                        await updater.complete()
+                        return
+
+                    if isinstance(raw_query, str):
+                        query = raw_query
+                    elif isinstance(raw_query, (dict, list)):
+                        try:
+                            query = _strict_json_dumps(raw_query)
+                        except (TypeError, ValueError) as exc:
+                            logger.error("SIMULATION_EXECUTOR: Invalid broadcast payload: %s", exc)
+                            await updater.update_status(
+                                TaskState.failed,
+                                message=new_agent_text_message("Invalid broadcast payload"),
+                                final=True,
+                            )
+                            return
+                    elif isinstance(raw_query, (int, float, bool)):
+                        if isinstance(raw_query, float) and not math.isfinite(raw_query):
+                            logger.error("SIMULATION_EXECUTOR: Non-finite float in broadcast text: %r", raw_query)
+                            await updater.update_status(
+                                TaskState.failed,
+                                message=new_agent_text_message("Invalid broadcast payload"),
+                                final=True,
+                            )
+                            return
+                        query = str(raw_query)
+                    else:
+                        logger.error(
+                            "SIMULATION_EXECUTOR: Unsupported broadcast text type: %s",
+                            type(raw_query).__name__,
+                        )
+                        await updater.update_status(
+                            TaskState.failed,
+                            message=new_agent_text_message("Invalid broadcast payload"),
+                            final=True,
+                        )
+                        return
+
+                    if not query:
+                        logger.warning("SIMULATION_EXECUTOR: Broadcast had empty text, skipping execution")
+                        await updater.complete()
+                        return
+                    logger.info("SIMULATION_EXECUTOR: Extracted broadcast text: %s...", query[:80])
+                    # Fall through to direct execution path below
+                else:
+                    # Unknown event type in callable mode — acknowledge
+                    logger.warning("SIMULATION_EXECUTOR: Unknown event type %s, acknowledging", event_type)
+                    await updater.complete()
+                    return
+            else:
+                # SUBSCRIBER MODE (Cloud Run): Use dispatcher-based path.
+                from agents.utils.simulation_plugin import SimulationNetworkPlugin
+
+                orchestration_plugin = next(
+                    (p for p in getattr(self._runner.app, "plugins", []) if isinstance(p, SimulationNetworkPlugin)),
+                    None,
+                )
+                if orchestration_plugin and orchestration_plugin.dispatcher:
+                    await orchestration_plugin.dispatcher.handle_event(parsed_event)
+                    await updater.complete()
+                    return
+                else:
+                    logger.warning("SIMULATION_EXECUTOR: No dispatcher found for intercepted event")
 
         # DEDUP GUARD: Prevent duplicate runner.run_async() invocations.
         #
@@ -405,6 +597,10 @@ class SimulationExecutor(AgentExecutor):
             _dedup_key = f"sim:exec_lock:{self._agent_name}:{context_id}"
         else:
             _dedup_key = f"sim:exec_lock:{self._agent_name}:{context_id}:{task_id}"
+        if saas_on:
+            _tenant_prefix = tenant_keys._key_prefix_for_user(user_id)
+            if _tenant_prefix:
+                _dedup_key = f"{_tenant_prefix}:{_dedup_key}"
         try:
             _redis = get_shared_redis_client()
             if _redis is not None:
@@ -427,7 +623,19 @@ class SimulationExecutor(AgentExecutor):
                     _dedup_key,
                 )
         except Exception as _dedup_err:
-            logger.warning("DEDUP_ERROR: Redis lock failed (%s), proceeding anyway", _dedup_err)
+            logger.error(
+                "DEDUP_ERROR: Redis lock failed (%s); failing closed for %s context=%s",
+                _dedup_err,
+                self._agent_name,
+                context_id,
+                exc_info=True,
+            )
+            await updater.update_status(
+                TaskState.failed,
+                message=new_agent_text_message("Execution lock unavailable; please retry"),
+                final=True,
+            )
+            return
 
         try:
             await updater.update_status(
@@ -435,97 +643,138 @@ class SimulationExecutor(AgentExecutor):
                 message=new_agent_text_message("Processing request..."),
             )
 
-            # Session creation via SessionManager — correctly calls
-            # create_session() WITHOUT user-provided session_id
-            session_id = await self._session_manager.get_or_create_session(
-                context_id=context_id,
-                app_name=self._runner.app_name,
-                user_id=user_id,
+            _user_scope_fn = getattr(simulation_registry, "user_scope", None)
+            _simreg_scope = (
+                _user_scope_fn(user_id)
+                if callable(_user_scope_fn) and (resolved_user_id or saas_on)
+                else nullcontext()
             )
-
-            # SESSION ID BRIDGE (callable mode):
-            # On AE, VertexAiSessionService generates internal session IDs
-            # (e.g. '40765115') that differ from the gateway's spawn session
-            # UUIDs (e.g. 'a8df62fd-...').  The frontend filters events by
-            # the spawn UUID, so events with Vertex IDs are invisible.
-            #
-            # Register the reverse mapping so DashLogPlugin can emit events
-            # with the original spawn session ID in the origin field.
-            if session_id != context_id:
-                await simulation_registry.register_context(session_id, context_id)
-                logger.info(
-                    "SIMULATION_EXECUTOR: Registered context mapping %s (vertex) → %s (spawn)",
-                    session_id,
-                    context_id,
+            with _simreg_scope:
+                # Session creation via SessionManager — correctly calls
+                # create_session() WITHOUT user-provided session_id
+                session_id = await self._session_manager.get_or_create_session(
+                    context_id=context_id,
+                    app_name=self._runner.app_name,
+                    user_id=user_id,
                 )
 
-            # SIMULATION_ID BRIDGE:
-            # Bridge simulation_id from orchestration context to Vertex session.
-            #
-            # Two sources of simulation_id, tried in order:
-            # 1. Extracted from orchestration event payload (_event_simulation_id)
-            # 2. Previously registered in Redis (lookup by context_id)
-            #
-            # Do NOT fall back to context_id -- that would cause every
-            # request (including the initial user message) to register a
-            # fake simulation_id, polluting DashLogPlugin events and
-            # triggering the Hub's subscription filter to drop them.
-            simulation_id = _event_simulation_id
-            if not simulation_id:
-                simulation_id = await simulation_registry.lookup(context_id)
-            if simulation_id:
-                # Register simulation_id for the Vertex session so
-                # DashLogPlugin can resolve it, and also for context_id so
-                # downstream sub-sessions (simulation_pipeline, tick, etc.)
-                # can look it up.
-                await simulation_registry.register(context_id, simulation_id)
-                if session_id != context_id:
-                    await simulation_registry.register(session_id, simulation_id)
-                logger.warning(
-                    "SIMULATION_EXECUTOR: Bridged simreg context=%s vertex=%s sim=%s",
-                    context_id,
-                    session_id,
-                    simulation_id,
-                )
+                effective_auth_token = resolved_auth_token
+                if effective_auth_token is None and context_id:
+                    effective_auth_token = user_auth_context.get_session_token(context_id)
+                bound_token_sids: list[tuple[str, Optional[str]]] = []
+                if effective_auth_token:
+                    for tok_sid in dict.fromkeys(s for s in (session_id, context_id) if s):
+                        prev_tok = user_auth_context.get_session_token(tok_sid)
+                        bound_token_sids.append((tok_sid, prev_tok))
+                        user_auth_context.set_session_token(tok_sid, effective_auth_token)
 
-            content = types.Content(
-                role="user",
-                parts=[types.Part(text=query)],
-            )
+                try:
+                    # SESSION ID BRIDGE (callable mode):
+                    # On AE, VertexAiSessionService generates internal session IDs
+                    # (e.g. '40765115') that differ from the gateway's spawn session
+                    # UUIDs (e.g. 'a8df62fd-...').  The frontend filters events by
+                    # the spawn UUID, so events with Vertex IDs are invisible.
+                    #
+                    # Register the reverse mapping so DashLogPlugin can emit events
+                    # with the original spawn session ID in the origin field.
+                    if session_id != context_id:
+                        if resolved_user_id:
+                            await simulation_registry.register_context(session_id, context_id, user_id=user_id)
+                        else:
+                            await simulation_registry.register_context(session_id, context_id)
+                        logger.info(
+                            "SIMULATION_EXECUTOR: Registered context mapping %s (vertex) → %s (spawn)",
+                            session_id,
+                            context_id,
+                        )
 
-            final_event = None
-            async for event in self._runner.run_async(
-                session_id=session_id,
-                user_id=user_id,
-                new_message=content,
-            ):
-                if event.is_final_response():
-                    final_event = event
+                    # SIMULATION_ID BRIDGE:
+                    # Bridge simulation_id from orchestration context to Vertex session.
+                    #
+                    # Two sources of simulation_id, tried in order:
+                    # 1. Extracted from orchestration event payload (_event_simulation_id)
+                    # 2. Previously registered in Redis (lookup by context_id)
+                    #
+                    # Do NOT fall back to context_id -- that would cause every
+                    # request (including the initial user message) to register a
+                    # fake simulation_id, polluting DashLogPlugin events and
+                    # triggering the Hub's subscription filter to drop them.
+                    simulation_id = _event_simulation_id
+                    if not simulation_id:
+                        if resolved_user_id:
+                            simulation_id = await simulation_registry.lookup(context_id, user_id=user_id)
+                        else:
+                            simulation_id = await simulation_registry.lookup(context_id)
+                    if simulation_id:
+                        # Register simulation_id for the Vertex session so
+                        # DashLogPlugin can resolve it, and also for context_id so
+                        # downstream sub-sessions (simulation_pipeline, tick, etc.)
+                        # can look it up.
+                        if resolved_user_id:
+                            await simulation_registry.register(context_id, simulation_id, user_id=user_id)
+                            if session_id != context_id:
+                                await simulation_registry.register(session_id, simulation_id, user_id=user_id)
+                        else:
+                            await simulation_registry.register(context_id, simulation_id)
+                            if session_id != context_id:
+                                await simulation_registry.register(session_id, simulation_id)
+                        if effective_auth_token and isinstance(simulation_id, str):
+                            already_bound = {sid for sid, _ in bound_token_sids}
+                            if simulation_id not in already_bound:
+                                prev_tok = user_auth_context.get_session_token(simulation_id)
+                                bound_token_sids.append((simulation_id, prev_tok))
+                                user_auth_context.set_session_token(simulation_id, effective_auth_token)
+                        logger.warning(
+                            "SIMULATION_EXECUTOR: Bridged simreg context=%s vertex=%s sim=%s",
+                            context_id,
+                            session_id,
+                            simulation_id,
+                        )
 
-                # TELEMETRY BRIDGE:
-                # Direct A2A calls skip the Redis listener that usually broadcasts
-                # narrative pulses. We bridge them here so the dashboard stays updated.
-                # Use context_id (spawn UUID) instead of vertex session_id so the
-                # frontend's session-based rendering filters match.
-                origin_session = context_id if context_id != session_id else session_id
-                if event.author in ["agent", "model", self._agent_name]:
-                    if event.content and event.content.parts:
-                        for p in event.content.parts:
-                            text = getattr(p, "text", None)
-                            if text:
-                                await pulses.emit_gateway_message(
-                                    origin={
-                                        "type": "agent",
-                                        "id": self._agent_name,
-                                        "session_id": origin_session,
-                                    },
-                                    destination=[origin_session],
-                                    status="success",
-                                    msg_type="json",
-                                    event="narrative",
-                                    data={"text": text, "emotion": "neutral"},
-                                    simulation_id=simulation_id,
-                                )
+                    content = types.Content(
+                        role="user",
+                        parts=[types.Part(text=query)],
+                    )
+
+                    final_event = None
+                    async for event in self._runner.run_async(
+                        session_id=session_id,
+                        user_id=user_id,
+                        new_message=content,
+                    ):
+                        if event.is_final_response():
+                            final_event = event
+
+                        # TELEMETRY BRIDGE:
+                        # Direct A2A calls skip the Redis listener that usually broadcasts
+                        # narrative pulses. We bridge them here so the dashboard stays updated.
+                        # Use context_id (spawn UUID) instead of vertex session_id so the
+                        # frontend's session-based rendering filters match.
+                        origin_session = context_id if context_id != session_id else session_id
+                        if event.author in ["agent", "model", self._agent_name]:
+                            if event.content and event.content.parts:
+                                for p in event.content.parts:
+                                    text = getattr(p, "text", None)
+                                    if text:
+                                        await pulses.emit_gateway_message(
+                                            origin={
+                                                "type": "agent",
+                                                "id": self._agent_name,
+                                                "session_id": origin_session,
+                                            },
+                                            destination=[origin_session],
+                                            status="success",
+                                            msg_type="json",
+                                            event="narrative",
+                                            data={"text": text, "emotion": "neutral"},
+                                            simulation_id=simulation_id,
+                                        )
+                finally:
+                    for tok_sid, prev_tok in bound_token_sids:
+                        if prev_tok is not None:
+                            user_auth_context.set_session_token(tok_sid, prev_tok)
+                        else:
+                            user_auth_context.clear_session_token(tok_sid)
 
             if final_event is not None:
                 response_text = _final_response_text(final_event)

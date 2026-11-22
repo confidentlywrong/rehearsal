@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard Runner tick and setter inputs against non-finite numeric values.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +14,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: round total pace seconds before modulo to avoid "X:60" rollover formatting.
  */
 
 import * as THREE from 'three';
@@ -136,7 +140,14 @@ export class Runner {
   }
 
   tick(deltaSeconds: number): void {
-    if (this.status !== 'running' || this.working) return;
+    if (
+      this.status !== 'running' ||
+      this.working ||
+      !Number.isFinite(deltaSeconds) ||
+      deltaSeconds <= 0
+    ) {
+      return;
+    }
 
     // Same physics as backend process_tick: Δmi = (effective_mph / 60) × Δsim_min,
     // with Δsim_min implied by viewport time compression (simDistanceIntegrator × Δt_real).
@@ -175,6 +186,7 @@ export class Runner {
   }
 
   setWater(value: number): void {
+    if (!Number.isFinite(value)) return;
     const prev = this.water;
     this.water = Math.max(0, Math.min(100, value));
     if (this._isTracked && Math.abs(this.water - prev) > 0.1) {
@@ -252,12 +264,14 @@ export class Runner {
    * Used by JSON commands and gateway updates.
    */
   setVelocity(normalized: number): void {
+    if (!Number.isFinite(normalized)) return;
     this.effectiveMph = Math.max(0, normalized * RUNNER_SPEED_SCALE);
     this.rawMph = this.effectiveMph;
   }
 
   setRawMph(mph: number): void {
-    this.rawMph = mph;
+    if (!Number.isFinite(mph)) return;
+    this.rawMph = Math.max(0, mph);
   }
 
   /** Immediately halt the runner in place (e.g. when the simulation ends). */
@@ -302,10 +316,10 @@ export class Runner {
   }
 
   getPace(): string {
-    if (this.rawMph <= 0) return '--:--';
-    const totalMinutes = 60 / this.rawMph;
-    const mins = Math.floor(totalMinutes);
-    const secs = Math.round((totalMinutes % 1) * 60);
+    if (!Number.isFinite(this.rawMph) || this.rawMph <= 0) return '--:--';
+    const totalSecs = Math.round((60 / this.rawMph) * 60);
+    const mins = Math.floor(totalSecs / 60);
+    const secs = totalSecs % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   }
 

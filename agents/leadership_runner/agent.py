@@ -19,8 +19,8 @@ stakeholder persona and leadership-specific physics.  The LLM interprets
 simulation events and decides how to respond as an organizational
 stakeholder navigating a transformation initiative.
 
-The model backend is configurable via the ``RUNNER_MODEL`` environment variable
-(same as the Marathon runner).
+The model backend is configurable via the ``LEADERSHIP_RUNNER_MODEL`` (or
+``RUNNER_MODEL``) environment variable, defaulting to ``gemini-3.5-flash-lite``.
 """
 
 from agents.utils.env import configure_project_env
@@ -40,6 +40,7 @@ from google.genai import types  # noqa: E402
 
 from agents.utils import config, load_agent_skills  # noqa: E402
 from agents.utils.communication_plugin import SimulationCommunicationPlugin  # noqa: E402
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model  # noqa: E402
 from agents.utils.retry import resilient_model  # noqa: E402
 from agents.utils.deployment import create_a2a_deployment  # noqa: E402
 from agents.utils.factory import create_simulation_runner  # noqa: E402
@@ -67,11 +68,11 @@ RUNNER_SUPPRESSED_EVENTS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.5-flash-lite"
-RUNNER_MODEL = (
-    (os.environ.get("LEADERSHIP_RUNNER_MODEL") or "").strip()
-    or (os.environ.get("RUNNER_MODEL") or "").strip()
-    or DEFAULT_MODEL
+DEFAULT_MODEL = DEFAULT_FLASH_LITE_MODEL
+RUNNER_MODEL = get_model(
+    "LEADERSHIP_RUNNER_MODEL",
+    DEFAULT_MODEL,
+    fallback_env_vars=("RUNNER_MODEL",),
 )
 
 _is_gemini = RUNNER_MODEL.startswith("gemini")
@@ -87,7 +88,7 @@ if not _is_gemini:
 # ---------------------------------------------------------------------------
 # Agent name configuration
 # ---------------------------------------------------------------------------
-AGENT_NAME = os.environ.get("AGENT_NAME", "leadership_runner")
+AGENT_NAME = (os.environ.get("AGENT_NAME") or "").strip() or "leadership_runner"
 
 # Load tool functions from the agent's skills/ directory
 _skills, skill_tools = load_agent_skills(str(pathlib.Path(__file__).parent))
@@ -172,13 +173,33 @@ async def _stakeholder_before_agent_callback(callback_context):
     state = callback_context.state
     content = getattr(callback_context, "user_content", None)
 
+    incoming_tick_msg: dict | None = None
+    if content and hasattr(content, "parts") and content.parts:
+        for part in content.parts:
+            text = getattr(part, "text", None)
+            if not text:
+                continue
+            try:
+                msg = json.loads(text)
+                if isinstance(msg, dict) and msg.get("event") == "tick":
+                    incoming_tick_msg = msg
+                    break
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     # --- Initialize stakeholder on first tick (Marathon ordering: init FIRST) ---
     if state.get("velocity") is None:
         session = getattr(callback_context, "session", None)
-        sid = getattr(session, "id", "unknown") if session else "unknown"
+        sid = getattr(session, "id", None) or "unknown" if session else "unknown"
         runner_count = state.get("runner_count")
-        if runner_count is None:
-            logger.warning("CRITICAL: runner_count is missing from state. Defaulting to 1 to avoid stall.")
+        if runner_count is None and incoming_tick_msg is not None:
+            runner_count = incoming_tick_msg.get("runner_count")
+        if (
+            not isinstance(runner_count, int)
+            or isinstance(runner_count, bool)
+            or runner_count <= 0
+        ):
+            logger.warning("CRITICAL: runner_count is missing/invalid from state. Defaulting to 1 to avoid stall.")
             runner_count = 1
         initialize_leadership_stakeholder(state, sid, runner_count)
         persona_name = state.get("persona", "pragmatist")
@@ -212,27 +233,24 @@ async def _stakeholder_before_agent_callback(callback_context):
         )
 
     # --- Extract tick params from user message into state (Marathon ordering: SECOND) ---
-    if content and hasattr(content, "parts") and content.parts:
-        for part in content.parts:
-            text = getattr(part, "text", None)
-            if not text:
-                continue
-            try:
-                msg = json.loads(text)
-                if isinstance(msg, dict) and msg.get("event") == "tick":
-                    state["_tick_params"] = {
-                        "tick": msg.get("tick", 0),
-                        "minutes_per_tick": msg.get("minutes_per_tick", 0.0),
-                        "elapsed_minutes": msg.get("elapsed_minutes", 0.0),
-                        "race_distance_mi": msg.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
-                        "collector_buffer_key": msg.get("collector_buffer_key", ""),
-                        "station_index": msg.get("station_index", {}),
-                        "route_friction_map": msg.get("route_friction_map", {}),
-                        "gatekeeper_route_map": msg.get("gatekeeper_route_map", {}),
-                    }
-                    break
-            except (json.JSONDecodeError, TypeError):
-                pass
+    if incoming_tick_msg is not None:
+        raw_stations = incoming_tick_msg.get("station_index")
+        raw_rfm = incoming_tick_msg.get("route_friction_map")
+        raw_grm = incoming_tick_msg.get("gatekeeper_route_map")
+        raw_cbk = incoming_tick_msg.get("collector_buffer_key")
+        raw_sim_id = incoming_tick_msg.get("simulation_id")
+        state["_tick_params"] = {
+            "tick": incoming_tick_msg.get("tick", 0),
+            "minutes_per_tick": incoming_tick_msg.get("minutes_per_tick", 0.0),
+            "elapsed_minutes": incoming_tick_msg.get("elapsed_minutes", 0.0),
+            "race_distance_mi": incoming_tick_msg.get("race_distance_mi", DEFAULT_RACE_DISTANCE_MI),
+            "collector_buffer_key": raw_cbk if isinstance(raw_cbk, str) else "",
+            "station_index": raw_stations if isinstance(raw_stations, dict) else {},
+            "weather_modifier": incoming_tick_msg.get("weather_modifier", 1.0),
+            "route_friction_map": raw_rfm if isinstance(raw_rfm, dict) else {},
+            "gatekeeper_route_map": raw_grm if isinstance(raw_grm, dict) else {},
+            "simulation_id": raw_sim_id if isinstance(raw_sim_id, str) else "",
+        }
 
     return None  # Continue to LLM
 
@@ -292,11 +310,19 @@ runner_a2a_agent, agent_card = create_a2a_deployment(
     agent_getter=get_agent,
 )
 
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("LEADERSHIP_RUNNER_PORT", "").strip()
+        or "9117"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("LEADERSHIP_RUNNER_PORT", "9117")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info("Starting leadership runner agent server on port %d", port)
 

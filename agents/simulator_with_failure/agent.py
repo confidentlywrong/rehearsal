@@ -87,7 +87,7 @@ simulator_fail_skills = [
         id="execute_simulation",
         name="Execute Simulation",
         description=(
-            "Starts a marathon simulation that encounters a pre-race failure, "
+            "Starts a simulation that encounters a pre-race failure, "
             "testing error handling and tool_error callbacks."
         ),
         tags=["simulation", "testing", "error-handling"],
@@ -95,7 +95,7 @@ simulator_fail_skills = [
     AgentSkill(
         id="verify_plan",
         name="Verify Plan",
-        description="Validates that a marathon plan is ready for simulation.",
+        description="Validates that a simulation plan is ready for simulation.",
         tags=["verification", "readiness"],
     ),
 ]
@@ -107,11 +107,20 @@ simulator_with_failure_a2a_agent, agent_card = create_a2a_deployment(
     skills=simulator_fail_skills,
 )
 
+
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("SIMULATOR_WITH_FAILURE_PORT", "").strip()
+        or "9107"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("SIMULATOR_WITH_FAILURE_PORT", "9107")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info(f"Starting simulator_with_failure agent server on port {port}")
 

@@ -15,11 +15,10 @@ LoopAgent. Each iteration of the loop corresponds to one simulation tick.
 
 ## Instructions
 
-1. **Call `advance_tick` AND `compute_traffic_conditions` in the SAME response.**
-   Both tools run in parallel. `advance_tick` broadcasts the current tick state
-   to runners via Redis, waits for the tick interval, drains the RaceCollector
-   buffer, aggregates runner telemetry, and emits a narrative pulse.
-   `compute_traffic_conditions` computes traffic congestion in parallel.
+1. **Call `advance_tick`.**
+   `advance_tick` broadcasts the current tick state to runners via Redis, waits
+   for the tick interval, drains the RaceCollector buffer, aggregates runner
+   telemetry, computes traffic congestion in-process, and emits a narrative pulse.
 2. **Then call `check_race_complete`.** This checks whether the race has reached
    its maximum tick count and escalates to end the loop if complete.
 3. **Keep responses minimal.** The tick agent uses a low-cost model with no

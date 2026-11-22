@@ -1,4 +1,3 @@
-
 # Copyright 2026 Christian Haeussinger
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +25,7 @@ This module is pure logic — independently testable with mock state dicts.
 from enum import Enum
 import json
 import logging
+import math
 from typing import Any
 
 from google.adk.agents.callback_context import CallbackContext
@@ -33,8 +33,11 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
-from agents.ai_echo.initialization import initialize_echo
-from agents.utils.redis_pool import get_shared_redis_client
+from agents.ai_echo.initialization import (
+    compute_wall_severity,
+    fetch_echo_config,
+    initialize_echo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,13 +84,15 @@ class Phase(str, Enum):
 
 
 def detect_phase(llm_request: LlmRequest) -> Phase:
-    """Detect if we're in the dispatch or summarize phase."""
+    """Detect if we're in the dispatch or summarize phase by checking the last content entry."""
     contents = getattr(llm_request, "contents", None) or []
-    for content in contents:
-        parts = getattr(content, "parts", None) or []
-        for part in parts:
-            if hasattr(part, "function_response") and part.function_response is not None:
-                return Phase.SUMMARIZE
+    if not contents:
+        return Phase.DISPATCH
+    last = contents[-1]
+    parts = getattr(last, "parts", None) or []
+    for part in parts:
+        if hasattr(part, "function_response") and part.function_response is not None:
+            return Phase.SUMMARIZE
     return Phase.DISPATCH
 
 
@@ -136,6 +141,55 @@ def _tool_call_response(
     )
 
 
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def _strict_json_dumps(obj: object) -> str:
+    """Serialize *obj* to strict RFC-8259 JSON, replacing non-finite floats with null."""
+    try:
+        return json.dumps(obj, allow_nan=False)
+    except ValueError:
+        return json.dumps(_strip_nonfinite(obj), allow_nan=False)
+
+
 def _pick_inner_thought(state: StateLike, tick: int) -> str:
     """Pick a deterministic inner thought based on stance and tick."""
     if state.get("defected"):
@@ -143,13 +197,14 @@ def _pick_inner_thought(state: StateLike, tick: int) -> str:
     if state.get("aligned"):
         return _ALIGNED_THOUGHT
 
-    stance = state.get("stance", "neutral")
+    raw_stance = state.get("stance", "neutral")
+    stance = raw_stance if isinstance(raw_stance, str) else "neutral"
     thoughts = _INNER_THOUGHTS.get(stance, _INNER_THOUGHTS["neutral"])
     # Deterministic selection based on tick
-    return thoughts[tick % len(thoughts)]
+    return thoughts[_finite_int(tick, 0) % len(thoughts)]
 
 
-def autopilot_echo_callback(
+async def autopilot_echo_callback(
     callback_context: CallbackContext,
     llm_request: LlmRequest,
 ) -> LlmResponse:
@@ -170,9 +225,10 @@ def autopilot_echo_callback(
 
     # Parse the event
     try:
-        event = json.loads(text) if text else {}
-    except json.JSONDecodeError:
-        event = {}
+        parsed = json.loads(text) if text else {}
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    event = parsed if isinstance(parsed, dict) else {}
 
     event_type = event.get("event", "")
 
@@ -185,58 +241,49 @@ def autopilot_echo_callback(
     # --- Initialize Echo on first tick ---
     if state.get("sentiment") is None:
         session = getattr(callback_context, "session", None)
-        sid = getattr(session, "id", "default") if session else "default"
-        echo_config = state.get("_echo_config", {})
+        sid = (getattr(session, "id", None) or "unknown") if session else "unknown"
+        raw_cfg = state.get("_echo_config")
+        echo_config = raw_cfg if isinstance(raw_cfg, dict) else {}
         if not echo_config:
-            try:
-                import inspect
+            from agents.utils.communication import resolve_tool_context_user_id
 
-                r = get_shared_redis_client()
-                val = r.get(f"echo_config:{sid}") if r else None
-                if inspect.iscoroutine(val):
-                    val.close()
-                    val = None
-                if val:
-                    echo_config = json.loads(val)
-                    state["_echo_config"] = echo_config
-            except Exception as e:
-                logger.warning("Failed to fetch echo config from redis: %s", e)
+            cb_uid = resolve_tool_context_user_id(callback_context, require_when_saas=False)
+            echo_config = (
+                await fetch_echo_config(sid, user_id=cb_uid)
+                if cb_uid is not None
+                else await fetch_echo_config(sid)
+            )
+            if echo_config:
+                state["_echo_config"] = echo_config
         initialize_echo(state, sid, echo_config)
 
-    tick = event.get("tick", 0)
+    tick = _finite_int(event.get("tick"), 0)
     inner_thought = _pick_inner_thought(state, tick)
 
     # --- Compute wall_severity deterministically from stance/sentiment ---
-    # Mirrors what the Tier 1 LLM would decide:
-    #   hostile/opposed → high friction (7–9), supportive/allied → low (1–3),
-    #   neutral → 5.0.  Sentiment further modulates within the band.
-    stance = state.get("stance", "neutral")
-    sentiment = state.get("sentiment", 0.0)
-    _WALL_BASE: dict[str, float] = {
-        "opposed": 8.0,
-        "hostile": 9.0,
-        "skeptical": 6.5,
-        "neutral": 5.0,
-        "supportive": 3.0,
-        "allied": 1.5,
-        "champion": 0.5,
-    }
-    wall_severity = _WALL_BASE.get(stance, 5.0)
-    # Sentiment in [-1, 1]: negative pushes severity up, positive pulls down.
-    wall_severity = max(0.0, min(10.0, wall_severity - sentiment * 1.5))
+    wall_severity = compute_wall_severity(
+        state.get("stance", "neutral"),
+        state.get("sentiment", 0.0),
+    )
+
+    raw_tags = event.get("decision_tags")
+    raw_res = event.get("resource_state")
+    raw_deltas = event.get("influence_deltas")
+    raw_cbk = event.get("collector_buffer_key")
+    raw_dtext = event.get("decision_text")
 
     # Return a tool call to process_decision_round
     return _tool_call_response(
         name="process_decision_round_tool",
         args={
             "tick": tick,
-            "decision_text": event.get("decision_text", ""),
-            "decision_tags": json.dumps(event.get("decision_tags", {})),
-            "resource_state": json.dumps(event.get("resource_state", {})),
-            "contradiction_alert": json.dumps(event.get("contradiction_alert")),
+            "decision_text": raw_dtext if isinstance(raw_dtext, str) else "",
+            "decision_tags": _strict_json_dumps(raw_tags if isinstance(raw_tags, dict) else {}),
+            "resource_state": _strict_json_dumps(raw_res if isinstance(raw_res, dict) else {}),
+            "contradiction_alert": _strict_json_dumps(event.get("contradiction_alert")),
             "inner_thought": inner_thought,
             "wall_severity": wall_severity,
-            "collector_buffer_key": event.get("collector_buffer_key", ""),
-            "influence_deltas": json.dumps(event.get("influence_deltas", {})),
+            "collector_buffer_key": raw_cbk if isinstance(raw_cbk, str) else "",
+            "influence_deltas": _strict_json_dumps(raw_deltas if isinstance(raw_deltas, dict) else {}),
         },
     )

@@ -118,19 +118,6 @@ def get_tools() -> list:
             from agents.utils.local_ai import is_local_gemma_active
 
             if is_local_gemma_active():
-                if (
-                    hasattr(tool_context, "state")
-                    and tool_context.state.get("simulation_result")
-                    and not tool_context.state.get("echo_voice_log")
-                ):
-                    try:
-                        import importlib
-                        mod = importlib.import_module(
-                            "agents.leadership_planner_with_eval.skills.translation-diagnostic.tools"
-                        )
-                        mod._ensure_telemetry_in_state(tool_context)
-                    except Exception:
-                        pass
                 return
             await super().process_llm_request(
                 tool_context=tool_context,

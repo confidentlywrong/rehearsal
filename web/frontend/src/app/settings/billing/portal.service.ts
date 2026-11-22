@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate external portal redirect URLs and send return_url matching Go portal contract.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +27,10 @@
  */
 
 import { Injectable } from '@angular/core';
+import {
+  isSafeBillingRedirectUrl,
+  resolveBillingOrigin,
+} from '../../usage/billing.service';
 
 declare global {
   interface Window {
@@ -44,7 +50,9 @@ export type PortalOutcome =
 
 @Injectable({ providedIn: 'root' })
 export class PortalService {
-  async openPortal(): Promise<PortalOutcome> {
+  async openPortal(returnUrl?: string): Promise<PortalOutcome> {
+    const origin = resolveBillingOrigin();
+    const resolvedReturnUrl = returnUrl?.trim() || `${origin}/#/settings/billing`;
     try {
       const resp = await fetch('/api/v1/billing/portal', {
         method: 'POST',
@@ -53,7 +61,7 @@ export class PortalService {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ return_url: resolvedReturnUrl }),
       });
       if (resp.status === 503) {
         const body = (await resp.json().catch(() => ({}))) as {
@@ -89,7 +97,14 @@ export class PortalService {
           status: 200,
         };
       }
-      return { outcome: 'redirect', url: body.url, provider: body.provider ?? '' };
+      if (!isSafeBillingRedirectUrl(body.url)) {
+        return {
+          outcome: 'error',
+          message: 'Invalid billing portal redirect URL.',
+          status: 200,
+        };
+      }
+      return { outcome: 'redirect', url: body.url.trim(), provider: body.provider ?? '' };
     } catch {
       return { outcome: 'error', message: 'Network error.', status: 0 };
     }

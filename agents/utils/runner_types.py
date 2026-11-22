@@ -16,13 +16,15 @@
 
 """Runner type constants for simulation agent selection.
 
-The simulator defaults to leadership_runner (LLM-powered, leadership physics).
-The planner can request a different type via simulation_config.
-leadership_runner_autopilot is available as a deterministic opt-in for
-testing, benchmarking, and scaling.
+The simulator defaults to ``leadership_runner_autopilot`` (deterministic opt-in
+for testing, benchmarking, and scaling). The planner can request a different
+type (such as ``leadership_runner``) via ``simulation_config``.
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 RUNNER_AUTOPILOT = "runner_autopilot"
 RUNNER_CLOUDRUN = "runner_cloudrun"
@@ -59,5 +61,20 @@ def cap_for_runner_type(runner_type: str) -> int:
     cap as a defensive default — better undersized than uncapped.
     """
     if runner_type in (RUNNER_AUTOPILOT, LEADERSHIP_RUNNER_AUTOPILOT):
-        return int(os.environ.get("MAX_RUNNERS_AUTOPILOT", "1000"))
-    return int(os.environ.get("MAX_RUNNERS_LLM", "10"))
+        return _safe_positive_int_env("MAX_RUNNERS_AUTOPILOT", 1000)
+    return _safe_positive_int_env("MAX_RUNNERS_LLM", 10)
+
+
+def _safe_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("runner_types: invalid integer for %s=%r; using default %d", name, raw, default)
+        return default
+    if parsed < 1:
+        logger.warning("runner_types: non-positive %s=%d; clamping to 1", name, parsed)
+        return 1
+    return parsed

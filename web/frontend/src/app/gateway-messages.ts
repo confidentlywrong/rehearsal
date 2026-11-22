@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard null, array, and non-string fields in parseGatewayPayload and hasGeoData.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,8 +115,11 @@ export function parseGatewayPayload(data: {
   result?: { status?: string; a2ui?: string; [key: string]: any };
   [key: string]: any;
 }): GatewayMessage | null {
-  const text = data.text ?? '';
-  const emotion = data.emotion ?? '';
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return null;
+  }
+  const text = typeof data.text === 'string' ? data.text : '';
+  const emotion = typeof data.emotion === 'string' ? data.emotion : '';
 
   if (data.a2ui) {
     return {
@@ -200,7 +205,7 @@ export function parseGatewayPayload(data: {
   if (trimmed.startsWith('{')) {
     try {
       const json = JSON.parse(trimmed);
-      if (typeof json === 'object' && json !== null) {
+      if (typeof json === 'object' && json !== null && !Array.isArray(json)) {
         return {
           kind: 'tool_result',
           emotion,
@@ -332,9 +337,9 @@ export function toolIcon(tool: string): string {
 }
 
 /** Check if a tool result carries GeoJSON data. */
-export function hasGeoData(toolName: string | undefined, result: ToolResult): boolean {
+export function hasGeoData(toolName: string | undefined, result: ToolResult | null | undefined): boolean {
   return !!(
-    result.geojson ||
+    result?.geojson ||
     toolName === 'add_medical_tents' ||
     toolName === 'add_water_stations' ||
     toolName === 'plan_marathon_route' ||

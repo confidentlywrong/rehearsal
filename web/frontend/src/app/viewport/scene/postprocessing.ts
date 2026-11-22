@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: clamp zero-dimension viewport sizes when constructing WebGL render targets and depth textures.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +14,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: clamp zero viewport dimensions before allocating render targets and dispose async LUT 3D texture if viewport destroyed before load resolves and handle LUT load errors.
  */
 
 import * as THREE from 'three';
@@ -28,8 +32,8 @@ import { DepthOutlineShader } from '../shaders/depth-outline-shader';
 import { VignetteColorShader } from '../shaders/vignette-shader';
 
 export function initPostProcessing(ctx: Context): void {
-  const w = window.innerWidth,
-    h = window.innerHeight;
+  const w = Math.max(1, window.innerWidth),
+    h = Math.max(1, window.innerHeight);
 
   ctx.depthRT = new THREE.WebGLRenderTarget(w, h, {
     depthTexture: new THREE.DepthTexture(w, h),
@@ -107,11 +111,17 @@ export function initPostProcessing(ctx: Context): void {
   ctx.lutPass.intensity = 1.0;
   ctx.lutPass.enabled = false;
   ctx.composer.addPass(ctx.lutPass);
-  new LUTCubeLoader().loadAsync('/assets/luts/Lut_v05.lut.CUBE').then((result: any) => {
-    if (!ctx.lutPass) return;
-    ctx.lutPass.lut = result.texture3D;
-    ctx.lutPass.enabled = true;
-  });
+  new LUTCubeLoader()
+    .loadAsync('/assets/luts/Lut_v05.lut.CUBE')
+    .then((result: any) => {
+      if (!ctx.lutPass) {
+        result?.texture3D?.dispose?.();
+        return;
+      }
+      ctx.lutPass.lut = result.texture3D;
+      ctx.lutPass.enabled = true;
+    })
+    .catch(() => undefined);
 
   // Vignette
   ctx.vignettePass = new ShaderPass(VignetteColorShader);

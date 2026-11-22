@@ -168,7 +168,6 @@ class TestGracefulStop:
         mock_redis = AsyncMock()
         mock_pubsub = AsyncMock()
         mock_redis.pubsub = MagicMock(return_value=mock_pubsub)
-        mock_redis.delete = AsyncMock(side_effect=RedisConnectionError("Connection closed by server."))
         with patch(
             "agents.simulator.collector.get_shared_redis_client",
             return_value=mock_redis,
@@ -177,10 +176,30 @@ class TestGracefulStop:
                 session_id="graceful-3",
                 runner_session_ids={"r1"},
             )
+            mock_redis.delete = AsyncMock(side_effect=RedisConnectionError("Connection closed by server."))
             # Must not raise
             await collector.stop()
 
         assert not RaceCollector.is_running("graceful-3")
+
+    @pytest.mark.asyncio
+    async def test_start_raises_on_redis_delete_error(self):
+        """RaceCollector.start() must surface Redis failures when clearing stale buffers."""
+        mock_redis = AsyncMock()
+        mock_pubsub = AsyncMock()
+        mock_redis.pubsub = MagicMock(return_value=mock_pubsub)
+        mock_redis.delete = AsyncMock(side_effect=RedisConnectionError("Connection refused"))
+        with patch(
+            "agents.simulator.collector.get_shared_redis_client",
+            return_value=mock_redis,
+        ):
+            with pytest.raises(RedisConnectionError, match="Connection refused"):
+                await RaceCollector.start(
+                    session_id="graceful-start-err",
+                    runner_session_ids={"r1"},
+                )
+
+        assert not RaceCollector.is_running("graceful-start-err")
 
     @pytest.mark.asyncio
     async def test_drain_proxy_stop_survives_connection_error(self):

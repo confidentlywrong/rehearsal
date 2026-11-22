@@ -28,7 +28,7 @@ A2UI protocol. It provides five capabilities:
 ```mermaid
 flowchart LR
     tester(["Tester UI"])
-    gw["Gateway<br/>:8101"]
+    gw["Gateway<br/>:9101"]
 
     tester -->|"WSS (binary protobuf)"| gw
     tester -->|"GET /api/v1/agent-types"| gw
@@ -96,7 +96,7 @@ high-volume streaming.
 
 ```bash
 npm install
-npm run dev     # Vite dev server, proxies /api to gateway :8101
+npm run dev     # Vite dev server, proxies /api and /ws to gateway :9101
 npm test        # Vitest + jsdom
 npm run build   # Production bundle (output: dist/)
 ```

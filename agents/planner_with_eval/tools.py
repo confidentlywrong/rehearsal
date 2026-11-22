@@ -17,13 +17,43 @@
 """Planner-with-eval specific tools — simulator collaboration."""
 
 import asyncio
-import json
 import logging
+from typing import Any
 from uuid import uuid4
 
 from google.adk.tools.tool_context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+_SIMULATOR_FAILURE_PREFIXES = ("Request failed:", "No request provided")
+_SIMULATOR_FAILURE_SUFFIX = "failed to generate response"
+_SIMULATOR_PROGRESS_PREFIX = "Processing request..."
+
+
+def _simulator_failure_reason(response: object) -> str | None:
+    """Return a failure description if the simulator call failed, else None.
+
+    Handles call_agent error dicts (``{"status": "error", "message": ...}``),
+    relayed A2A task failure dicts (``{"status": "success", "response": "Request failed: ..."}``),
+    and raw failure strings (``"Request failed: ..."`` / ``"... failed to generate response"``).
+    """
+    text: str | None = None
+    if isinstance(response, dict):
+        if response.get("status") == "error":
+            return str(response.get("message") or response.get("error") or "unknown simulator error")
+        body = response.get("response")
+        if isinstance(body, str):
+            text = body
+    elif isinstance(response, str):
+        text = response
+
+    if isinstance(text, str):
+        cleaned = text.strip()
+        while cleaned.startswith(_SIMULATOR_PROGRESS_PREFIX):
+            cleaned = cleaned[len(_SIMULATOR_PROGRESS_PREFIX) :].lstrip()
+        if cleaned.startswith(_SIMULATOR_FAILURE_PREFIXES) or cleaned.endswith(_SIMULATOR_FAILURE_SUFFIX):
+            return cleaned[:500]
+    return None
 
 
 async def start_simulation(
@@ -49,10 +79,11 @@ async def start_simulation(
         runner_type: Optional runner type (e.g. 'runner', 'runner_gke',
             'runner_cloudrun'). Injected into simulation_config.
     """
-    if not tool_context:
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if not tool_context or state is None or not hasattr(state, "get"):
         return {"status": "error", "message": "No tool context available."}
 
-    route_geojson = tool_context.state.get("marathon_route")
+    route_geojson = state.get("marathon_route")
     if not route_geojson:
         return {
             "status": "error",
@@ -62,7 +93,7 @@ async def start_simulation(
     # Re-entrancy guard: if a simulation was already executed in the SAME
     # invocation (LLM response), reject. The invocation_id changes when a
     # new user message arrives, so legitimate re-runs are allowed.
-    executed_in = tool_context.state.get("simulation_executed_invocation")
+    executed_in = state.get("simulation_executed_invocation")
     if executed_in and executed_in == tool_context.invocation_id:
         logger.warning("start_simulation: simulation already executed in this invocation, rejecting")
         return {
@@ -73,7 +104,7 @@ async def start_simulation(
         }
 
     if runner_type:
-        simulation_config = simulation_config or {}
+        simulation_config = dict(simulation_config) if simulation_config else {}
         simulation_config["runner_type"] = runner_type
 
     simulator_session_id = str(uuid4())
@@ -81,16 +112,20 @@ async def start_simulation(
     # Write a unique token BEFORE setting the session ID so that
     # submit_plan_to_simulator (running concurrently) can detect
     # a fresh start_simulation vs a stale value from a prior run.
-    tool_context.state["_sim_token"] = simulator_session_id
-    tool_context.state["simulator_session_id"] = simulator_session_id
+    state["_sim_token"] = simulator_session_id
+    state["simulator_session_id"] = simulator_session_id
 
     # Set simulation_id in planner state so all subsequent messages carry it.
-    tool_context.state["simulation_id"] = simulator_session_id
+    state["simulation_id"] = simulator_session_id
 
     # Persist simulation_config so submit_plan_to_simulator can read it
     # from state when the LLM omits it (the "carry forward" contract).
     if simulation_config:
-        tool_context.state["simulation_config"] = simulation_config
+        state["simulation_config"] = simulation_config
+
+    from agents.utils.gateway import register_simulation_with_gateway
+
+    await register_simulation_with_gateway(simulator_session_id, tool_context=tool_context)
 
     logger.info(f"PLANNER: Simulation initialized (simulation_id={simulator_session_id}, action={action})")
 
@@ -124,14 +159,15 @@ async def submit_plan_to_simulator(
         runner_type: Optional runner type (e.g. 'runner', 'runner_gke',
             'runner_cloudrun'). Injected into simulation_config.
     """
-    if not tool_context:
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if not tool_context or state is None or not hasattr(state, "get"):
         return {"status": "error", "message": "No tool context available."}
 
-    from agents.utils.communication import call_agent
+    from agents.utils.communication import call_agent, resolve_tool_context_user_id, strict_json_dumps
 
     logger.info(f"PLANNER: Submitting plan to simulator with action: {action}")
 
-    route_geojson = tool_context.state.get("marathon_route")
+    route_geojson = state.get("marathon_route")
     if not route_geojson:
         return {
             "status": "error",
@@ -145,7 +181,7 @@ async def submit_plan_to_simulator(
     # The invocation_id changes when a new user message arrives, so
     # legitimate user-initiated re-runs (e.g. "Re-run Simulation" button)
     # are allowed because they start a new invocation.
-    executed_in = tool_context.state.get("simulation_executed_invocation")
+    executed_in = state.get("simulation_executed_invocation")
     if action == "execute" and executed_in and executed_in == tool_context.invocation_id:
         logger.warning("submit_plan_to_simulator: simulation already executed in this invocation, rejecting duplicate")
         return {
@@ -155,8 +191,14 @@ async def submit_plan_to_simulator(
             "record_simulation, then validate_and_emit_a2ui.",
         }
 
+    try:
+        resolved_user_id = resolve_tool_context_user_id(tool_context)
+    except ValueError as exc:
+        logger.error("PLANNER: Cannot submit simulation without valid user_id: %s", exc)
+        return {"status": "error", "message": str(exc)}
+
     if runner_type:
-        simulation_config = simulation_config or {}
+        simulation_config = dict(simulation_config) if simulation_config else {}
         simulation_config["runner_type"] = runner_type
 
     # Wait for start_simulation to write a FRESH simulator_session_id.
@@ -218,13 +260,27 @@ async def submit_plan_to_simulator(
     # Store large data in Redis side-channel (route GeoJSON, traffic
     # assessment) so the simulator can read it directly without the LLM
     # having to pass multi-KB JSON through function call arguments.
-    from agents.utils.simdata import store_simulation_data
+    from agents.utils.simdata import SimDataError, store_simulation_data
 
-    stored = await store_simulation_data(
-        simulation_id=simulator_session_id,
-        route_geojson=route_geojson,
-        traffic_assessment=tool_context.state.get("traffic_assessment"),
-    )
+    try:
+        store_kwargs: dict[str, Any] = {
+            "simulation_id": simulator_session_id,
+            "route_geojson": route_geojson,
+            "traffic_assessment": tool_context.state.get("traffic_assessment"),
+        }
+        if resolved_user_id is not None:
+            store_kwargs["user_id"] = resolved_user_id
+        stored = await store_simulation_data(**store_kwargs)
+    except SimDataError as exc:
+        logger.error(
+            "submit_plan_to_simulator: failed to store simulation data in Redis for %s: %s",
+            simulator_session_id,
+            exc,
+        )
+        return {
+            "status": "error",
+            "message": f"Failed to store simulation data in Redis: {exc}",
+        }
 
     # Build the payload from this tool's own arguments.
     # Fall back to simulation_config stored by start_simulation if not
@@ -239,6 +295,8 @@ async def submit_plan_to_simulator(
         # authoritative simulation_id from the payload.
         "simulation_id": simulator_session_id,
     }
+    if resolved_user_id is not None:
+        payload["user_id"] = resolved_user_id
     if effective_config:
         payload["simulation_config"] = effective_config
     # When Redis is unavailable, fall back to including route and traffic
@@ -252,17 +310,37 @@ async def submit_plan_to_simulator(
             payload["traffic_assessment"] = ta
 
     try:
-        response = await call_agent(
-            tool_context=tool_context,
-            agent_name="simulator",
-            message=json.dumps(payload),
-            session_id=simulator_session_id,
-        )
+        call_kwargs: dict[str, Any] = {
+            "tool_context": tool_context,
+            "agent_name": "simulator",
+            "message": strict_json_dumps(payload),
+            "session_id": simulator_session_id,
+        }
+        if resolved_user_id is not None:
+            call_kwargs["user_id"] = resolved_user_id
+        response = await call_agent(**call_kwargs)
+        failure = _simulator_failure_reason(response)
+        if failure:
+            logger.error(
+                "PLANNER: Simulator %s failed for simulation %s: %s",
+                action,
+                simulator_session_id,
+                failure,
+            )
+            tool_context.state["simulation_error"] = failure
+            tool_context.state["simulation_result"] = None
+            return {
+                "status": "error",
+                "simulation_id": simulator_session_id,
+                "message": f"Simulator {action} failed: {failure}",
+            }
+
         # Persist the simulator response to session state so downstream
         # memory tools (record_simulation) can
         # read it without the LLM having to transcribe the JSON back
         # through a function-call argument.
         tool_context.state["simulation_result"] = response
+        tool_context.state["simulation_error"] = None
 
         # Mark execution complete so subsequent LLM loops are blocked.
         # Store the invocation_id so the guard is scoped to this invocation.

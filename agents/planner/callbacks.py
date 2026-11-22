@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: guard missing callback_context/state in financial guardrail callback.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -71,7 +73,8 @@ def financial_guardrail_callback(
     Returns a refusal LlmResponse if the guardrail triggers, or None to let
     the LLM handle the request normally.
     """
-    mode = callback_context.state.get("financial_modeling_mode", "insecure")
+    state = getattr(callback_context, "state", None) if callback_context is not None else None
+    mode = state.get("financial_modeling_mode", "insecure") if state is not None and hasattr(state, "get") else "insecure"
     if mode != "secure":
         return None
 

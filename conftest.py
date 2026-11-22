@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Root conftest for the Race Condition OSS repo.
+"""Root conftest for The Rehearsal simulation workspace.
 
 Provides mock GCP credentials so agent modules can be imported without
 real Google Cloud credentials. This runs before test collection, which

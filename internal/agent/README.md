@@ -54,8 +54,8 @@ resolves this by rewriting the host to match the discovery base URL while
 preserving the card's A2A path.
 
 For example, if an agent's card reports `http://public.example.com/a2a/simulator/`
-but the discovery URL is `http://localhost:8202`, the resolved URL becomes
-`http://localhost:8202/a2a/simulator/`.
+but the discovery URL is `http://127.0.0.1:9104`, the resolved URL becomes
+`http://127.0.0.1:9104/a2a/simulator/`.
 
 Each card stores two URLs for different purposes:
 
@@ -128,7 +128,7 @@ internal/agent/
 
 | Variable | Example | Description |
 |:---------|:--------|:------------|
-| `AGENT_URLS` | `http://localhost:8210,http://localhost:8202` | Comma-separated agent base URLs |
+| `AGENT_URLS` | `http://127.0.0.1:9120,http://127.0.0.1:9104` | Comma-separated agent base URLs |
 
 URL formats by deployment type:
 

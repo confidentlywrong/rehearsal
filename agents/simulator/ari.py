@@ -36,8 +36,32 @@ Zero LLM cost — pure Python.
 """
 
 import logging
+import math
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: Any, default: int = 0) -> int:
+    """Coerce non-bool int/float value to finite int, falling back to default."""
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(value) if math.isfinite(num) else default
 
 
 def compute_ari_dimensions(state: dict) -> dict:
@@ -50,10 +74,11 @@ def compute_ari_dimensions(state: dict) -> dict:
     Returns:
         Dict with keys: o, j, d, s, ari, zone, dimension_details.
     """
-    o = _compute_ontology(state)
-    j = _compute_judgment(state)
-    d = _compute_decision(state)
-    s = _compute_scale(state)
+    safe_state = state if hasattr(state, "get") else {}
+    o = min(1.0, max(0.0, _finite_float(_compute_ontology(safe_state), 0.2)))
+    j = min(1.0, max(0.0, _finite_float(_compute_judgment(safe_state), 0.2)))
+    d = min(1.0, max(0.0, _finite_float(_compute_decision(safe_state), 0.4)))
+    s = min(1.0, max(0.0, _finite_float(_compute_scale(safe_state), 0.2)))
 
     ari = round(o * j * d * s, 4)
 
@@ -72,10 +97,10 @@ def compute_ari_dimensions(state: dict) -> dict:
         "ari": ari,
         "zone": zone,
         "dimension_details": {
-            "ontology": _ontology_detail(state, o),
-            "judgment": _judgment_detail(state, j),
-            "decision": _decision_detail(state, d),
-            "scale": _scale_detail(state, s),
+            "ontology": _ontology_detail(safe_state, o),
+            "judgment": _judgment_detail(safe_state, j),
+            "decision": _decision_detail(safe_state, d),
+            "scale": _scale_detail(safe_state, s),
         },
     }
 
@@ -95,8 +120,8 @@ def _compute_ontology(state: dict) -> float:
     one resource at a time has siloed thinking (low O); one who
     considers cross-resource trade-offs has integrated thinking (high O).
     """
-    decision_log = state.get("decision_log", [])
-    if not decision_log:
+    decision_log = state.get("decision_log") or []
+    if not isinstance(decision_log, list) or not decision_log:
         return 0.2  # ad hoc baseline
 
     resource_keys = {"lau", "bt", "tbu", "owb"}
@@ -104,12 +129,20 @@ def _compute_ontology(state: dict) -> float:
     total_decision_ticks = 0
 
     for entry in decision_log:
-        tags = entry.get("decision_tags", {})
-        impacts = tags.get("resource_impact_suggestion", {})
-        if not impacts:
+        if not isinstance(entry, dict):
+            continue
+        tags = entry.get("decision_tags") or {}
+        if not isinstance(tags, dict):
+            continue
+        impacts = tags.get("resource_impact_suggestion") or {}
+        if not isinstance(impacts, dict) or not impacts:
             continue
         total_decision_ticks += 1
-        touched = set(k for k in impacts.keys() if k in resource_keys and impacts[k] != 0)
+        touched = {
+            k
+            for k, val in impacts.items()
+            if k in resource_keys and _finite_float(val, 0.0) != 0.0
+        }
         if len(touched) >= 2:
             cross_impact_ticks += 1
 
@@ -128,15 +161,63 @@ def _compute_judgment(state: dict) -> float:
     Consistent principle application = high J.  Erratic usage or
     many contradictions = low J.
     """
-    principle_scores = state.get("principle_scores", [0.0] * 7)
-    contradiction_log = state.get("contradiction_log", [])
+    raw_scores = state.get("principle_scores")
+    principle_scores = (
+        [_finite_float(sc, 0.0) for sc in raw_scores]
+        if isinstance(raw_scores, (list, tuple)) and raw_scores
+        else [0.0] * 7
+    )
+    contradiction_log = state.get("contradiction_log") or []
+    if not isinstance(contradiction_log, list):
+        contradiction_log = []
 
     # Principle consistency: low variance = high consistency
-    if principle_scores and any(s > 0 for s in principle_scores):
-        mean_score = sum(principle_scores) / len(principle_scores)
-        variance = sum((s - mean_score) ** 2 for s in principle_scores) / len(principle_scores)
-        # Normalize variance: max possible variance for 0-100 scale is ~2500
-        norm_variance = min(variance / 2500.0, 1.0)
+    if principle_scores and any(sc > 0 for sc in principle_scores):
+        if min(principle_scores) == max(principle_scores):
+            norm_variance = 0.0
+        else:
+            n = len(principle_scores)
+            raw_sum = sum(principle_scores)
+            if math.isfinite(raw_sum):
+                mean_score = raw_sum / n
+                scale = 1.0
+            else:
+                scaled_sum = sum(sc / n for sc in principle_scores)
+                if math.isfinite(scaled_sum):
+                    mean_score = scaled_sum
+                    scale = 1.0
+                else:
+                    mean_score = sum((sc * 0.5) / n for sc in principle_scores)
+                    scale = 0.5
+
+            overflowed = False
+            sq_diffs: list[float] = []
+            for sc in principle_scores:
+                diff = (sc * scale) - mean_score
+                if not math.isfinite(diff):
+                    overflowed = True
+                    break
+                try:
+                    sq = diff ** 2
+                    if scale != 1.0:
+                        sq = sq * 4.0
+                except OverflowError:
+                    overflowed = True
+                    break
+                if not math.isfinite(sq):
+                    overflowed = True
+                    break
+                sq_diffs.append(sq)
+
+            if overflowed:
+                norm_variance = 1.0
+            else:
+                var_sum = sum(sq_diffs)
+                if not math.isfinite(var_sum):
+                    norm_variance = 1.0
+                else:
+                    variance = var_sum / n
+                    norm_variance = min(variance / 2500.0, 1.0) if math.isfinite(variance) else 1.0
         consistency = 1.0 - norm_variance
     else:
         consistency = 0.2  # No data → ad hoc
@@ -154,40 +235,53 @@ def _compute_decision(state: dict) -> float:
     pass before the leader's decisions provide positive impact to the
     critical resource.
     """
-    snapshots = state.get("tick_snapshots", [])
-    if len(snapshots) < 3:
+    snapshots = state.get("tick_snapshots") or []
+    if not isinstance(snapshots, list) or len(snapshots) < 3:
         return 0.4  # structured baseline (insufficient data)
 
     # Track resource criticality events and response
-    decision_log = state.get("decision_log", [])
+    decision_log = state.get("decision_log") or []
+    if not isinstance(decision_log, list):
+        decision_log = []
     critical_events = 0
     fast_responses = 0
 
     # Build a map of which ticks had positive resource impacts
     tick_impacts: dict[int, dict] = {}
     for entry in decision_log:
-        tick = entry.get("tick", -1)
-        impacts = entry.get("decision_tags", {}).get("resource_impact_suggestion", {})
-        tick_impacts[tick] = impacts
+        if not isinstance(entry, dict):
+            continue
+        tick = _finite_int(entry.get("tick", -1), -1)
+        tags = entry.get("decision_tags") or {}
+        if not isinstance(tags, dict):
+            continue
+        impacts = tags.get("resource_impact_suggestion") or {}
+        if isinstance(impacts, dict):
+            tick_impacts[tick] = impacts
 
     # Detect when resources went critical and if the next decision addressed it
     for i, snap in enumerate(snapshots):
-        resources = snap.get("resources", snap.get("resource_state", {}))
+        if not isinstance(snap, dict):
+            continue
+        org_state = snap.get("organizational_state")
+        org_resources = org_state.get("resources", {}) if isinstance(org_state, dict) else {}
+        resources = snap.get("resources") or snap.get("resource_state") or org_resources
         if not isinstance(resources, dict):
             continue
+        snap_tick = _finite_int(snap.get("tick"), i)
         for key in ["lau", "bt", "tbu", "owb"]:
             pool = resources.get(key, {})
             if not isinstance(pool, dict):
                 continue
-            current = pool.get("current", 100)
-            threshold = pool.get("critical_threshold", 20)
+            current = _finite_float(pool.get("current"), 100.0)
+            threshold = _finite_float(pool.get("critical_threshold"), 20.0)
             if current <= threshold:
                 critical_events += 1
                 # Check if next 1-2 ticks have positive impact for this resource
                 for offset in range(1, 3):
-                    future_tick = snap.get("tick", i) + offset
+                    future_tick = snap_tick + offset
                     future_impacts = tick_impacts.get(future_tick, {})
-                    if future_impacts.get(key, 0) > 0:
+                    if _finite_float(future_impacts.get(key), 0.0) > 0.0:
                         fast_responses += 1
                         break
 
@@ -207,19 +301,29 @@ def _compute_scale(state: dict) -> float:
     (low S).  If echoes diverge based on the leader's targeted engagement,
     the leader is scaling individualized response (high S).
     """
-    echo_states = state.get("_echo_states", {})
-    echo_voice_log = state.get("echo_voice_log", [])
+    echo_states = state.get("_echo_states") or {}
+    echo_voice_log = state.get("echo_voice_log") or []
 
     if not echo_states and not echo_voice_log:
         return 0.2  # ad hoc baseline
 
     # Use final echo states if available
-    if echo_states:
-        stances = [es.get("stance", "neutral") for es in echo_states.values()]
-    else:
+    if isinstance(echo_states, dict) and echo_states:
+        stances = [str(es.get("stance") or "neutral") for es in echo_states.values() if isinstance(es, dict)]
+    elif isinstance(echo_voice_log, list) and echo_voice_log:
         # Fall back to last tick of voice log
-        max_tick = max((e.get("tick", 0) for e in echo_voice_log), default=0)
-        stances = [e.get("stance", "neutral") for e in echo_voice_log if e.get("tick") == max_tick]
+        def _safe_entry_tick(entry: dict) -> int:
+            return _finite_int(entry.get("tick"), 0)
+
+        valid_entries = [e for e in echo_voice_log if isinstance(e, dict)]
+        max_tick = max((_safe_entry_tick(e) for e in valid_entries), default=0)
+        stances = [
+            str(e.get("stance") or "neutral")
+            for e in valid_entries
+            if _safe_entry_tick(e) == max_tick
+        ]
+    else:
+        return 0.2
 
     if len(stances) < 2:
         return 0.2
@@ -253,7 +357,8 @@ def _ontology_detail(state: dict, score: float) -> str:
 
 
 def _judgment_detail(state: dict, score: float) -> str:
-    n = len(state.get("contradiction_log", []))
+    log = state.get("contradiction_log") or []
+    n = len(log) if isinstance(log, list) else 0
     if score >= 0.8:
         return "Principles applied consistently across decisions."
     elif score >= 0.6:
@@ -276,7 +381,11 @@ def _decision_detail(state: dict, score: float) -> str:
 
 
 def _scale_detail(state: dict, score: float) -> str:
-    n = len(state.get("_echo_states", {}))
+    echo_states = state.get("_echo_states") or {}
+    n = len(echo_states) if isinstance(echo_states, dict) else 0
+    if n == 0:
+        voice_log = state.get("echo_voice_log") or []
+        n = len({e.get("role") for e in voice_log if isinstance(e, dict) and e.get("role")}) if isinstance(voice_log, list) else 0
     if score >= 0.8:
         return f"Stakeholder responses are differentiated across {n} personas."
     elif score >= 0.6:
@@ -292,13 +401,16 @@ def build_ari_a2ui_card(ari_result: dict) -> dict:
 
     Returns a dict with ``surfaceUpdate`` and ``beginRendering`` keys.
     """
-    o = ari_result["o"]
-    j = ari_result["j"]
-    d = ari_result["d"]
-    s = ari_result["s"]
-    ari = ari_result["ari"]
-    zone = ari_result["zone"]
-    details = ari_result.get("dimension_details", {})
+    safe_result = ari_result if isinstance(ari_result, dict) else {}
+    o = min(1.0, max(0.0, _finite_float(safe_result.get("o"), 0.0)))
+    j = min(1.0, max(0.0, _finite_float(safe_result.get("j"), 0.0)))
+    d = min(1.0, max(0.0, _finite_float(safe_result.get("d"), 0.0)))
+    s = min(1.0, max(0.0, _finite_float(safe_result.get("s"), 0.0)))
+    ari = min(1.0, max(0.0, _finite_float(safe_result.get("ari"), 0.0)))
+    zone = str(safe_result.get("zone") or "Dead Zone")
+    details = safe_result.get("dimension_details") or {}
+    if not isinstance(details, dict):
+        details = {}
 
     zone_emoji = "🔴" if zone == "Dead Zone" else "🟡" if zone == "Transition" else "🟢"
 
@@ -370,11 +482,12 @@ def build_ari_a2ui_card(ari_result: dict) -> dict:
     children.append("ari-div2")
 
     # Weakest dimension callout
+    dim_scores = {"o": o, "j": j, "d": d, "s": s}
     weakest_letter, weakest_name = min(
         [("O", "Ontology"), ("J", "Judgment"), ("D", "Decision"), ("S", "Scale")],
-        key=lambda x: ari_result[x[0].lower()],
+        key=lambda x: dim_scores[x[0].lower()],
     )
-    weakest_val = ari_result[weakest_letter.lower()]
+    weakest_val = dim_scores[weakest_letter.lower()]
 
     callout = (
         f"⚠️  {weakest_name} ({weakest_letter}={weakest_val:.2f}) is the ceiling on the total. "

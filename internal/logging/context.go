@@ -39,12 +39,18 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 	if id == "" {
 		return ctx
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return context.WithValue(ctx, requestIDKey, id)
 }
 
 // RequestID returns the request_id stored on ctx, or the empty
 // string if none was attached.
 func RequestID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
 	if v, ok := ctx.Value(requestIDKey).(string); ok {
 		return v
 	}

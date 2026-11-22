@@ -129,8 +129,11 @@ locals {
   # Emitted only when identity_provider=firebase; otherwise the login
   # page falls back to LOCAL mode (no Firebase init), which is what
   # the local-dev fixture user expects.
+  # FIREBASE_PROJECT_ID is already supplied via local.frontend_saas_env
+  # (local.saas_env) when identity_provider == "firebase"; do not emit it
+  # again here or Cloud Run v2 rejects the container spec with a duplicate
+  # environment variable error.
   frontend_firebase_env = (var.identity_provider == "firebase") ? [
-    { name = "FIREBASE_PROJECT_ID", value = coalesce(var.firebase_project_id, var.project_id) },
     { name = "FIREBASE_API_KEY", value = var.firebase_web_api_key },
     { name = "FIREBASE_AUTH_DOMAIN", value = coalesce(var.firebase_auth_domain, "${coalesce(var.firebase_project_id, var.project_id)}.firebaseapp.com") },
   ] : []

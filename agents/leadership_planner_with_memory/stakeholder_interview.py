@@ -32,7 +32,9 @@ Design choices (locked 2026-06-28 by the operator):
   focused — the agent should call this tool once per stakeholder it
   wants to surface, not bundle them all. Order of calls = render
   order in the UI.
-* **No persistence yet.** Interview lives in `tool_context.state`.
+* **Persisted via artifact bundle.** Interview lives in `tool_context.state`
+  during the run and is persisted via `store_stakeholder_artifacts()` /
+  `store_scenario()`.
 * **Invented data is allowed here** — simulation layer. Default
   `inferred: true` and the UI tags the card as a synthetic interview.
 * **Stakeholder id must match personas when known.** When personas
@@ -45,11 +47,17 @@ Downstream: nothing yet — this is the demo's final artifact.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_citations,
+    validate_optional_rationale,
+)
 
 
 
@@ -179,15 +187,9 @@ async def emit_stakeholder_interview(
             "message": "..."}``.
     """
     # 1. Parse the JSON envelope (lenient: accept a dict directly).
-    if isinstance(interview_json, dict):
-        data = interview_json
-    else:
-        try:
-            data = json.loads(interview_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(interview_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Resolve known persona ids (permissive when absent).
     known_ids: set[str] = set()
@@ -248,9 +250,8 @@ async def emit_stakeholder_interview(
     exchanges: list[dict[str, Any]] = []
     for i, raw in enumerate(exchanges_raw):
         normalized, err = _validate_exchange(i, raw)
-        if err:
-            return _err(err, field="exchanges")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid exchange", field="exchanges")
         exchanges.append(normalized)
 
     # 5. Optional key quotes.
@@ -291,11 +292,16 @@ async def emit_stakeholder_interview(
                 )
             summary_clean = summary_raw.strip()
 
-    rationale_raw = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale_raw, str) and rationale_raw.strip():
-        rationale_clean = rationale_raw.strip()[:MAX_RATIONALE_CHARS]
+    rationale_clean, rationale_err = validate_optional_rationale(
+        data.get("rationale"),
+        max_chars=MAX_RATIONALE_CHARS,
+    )
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
+    citations_clean, citations_err = validate_citations(data.get("citations"))
+    if citations_err:
+        return _err(citations_err, field="citations")
 
     inferred = data.get("inferred", True)
     if not isinstance(inferred, bool):
@@ -315,13 +321,19 @@ async def emit_stakeholder_interview(
         payload["summary"] = summary_clean
     if rationale_clean:
         payload["rationale"] = rationale_clean
-    if "citations" in data:
-        payload["citations"] = data["citations"]
+    if citations_clean is not None:
+        payload["citations"] = citations_clean
 
-    # 7. Stash for the UI to render.
+    clean_payload, json_err = sanitize_json_value(payload, path=STATE_KEY)
+    if json_err or not isinstance(clean_payload, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    payload = clean_payload
+
+    # 7. Stash for the UI to render (copy list so ADK state delta tracking sees the update).
     try:
         tool_context.state[STATE_KEY] = payload
-        interviews = tool_context.state.get("stakeholder_interviews", []) or []
+        existing = tool_context.state.get("stakeholder_interviews")
+        interviews = list(existing) if isinstance(existing, list) else []
         interviews.append(payload)
         tool_context.state["stakeholder_interviews"] = interviews
     except (AttributeError, TypeError):

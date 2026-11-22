@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +19,7 @@ import json
 from agents.utils.runner_protocol import (
     RunnerEventType,
     RunnerEvent,
+    build_decision_round_event,
     build_tick_event,
     parse_runner_event,
     serialize_runner_event,
@@ -146,3 +149,22 @@ class TestSerializeRunnerEvent:
         text = serialize_runner_event(event)
         obj = json.loads(text)
         assert obj["event"] == "start_gun"
+
+
+def test_build_decision_round_event():
+    ev = build_decision_round_event(
+        tick=3,
+        max_ticks=12,
+        decision_text="Shift budget to engineering",
+        decision_tags={"tone": "decisive"},
+        resource_state={"budget": 80},
+        contradiction_alert={"flag": "low_trust"},
+        collector_buffer_key="buf:1",
+    )
+    assert ev.event is RunnerEventType.DECISION_ROUND
+    assert ev.data["tick"] == 3
+    assert ev.data["decision_text"] == "Shift budget to engineering"
+    assert ev.data["collector_buffer_key"] == "buf:1"
+    parsed = parse_runner_event(serialize_runner_event(ev))
+    assert parsed.event is RunnerEventType.DECISION_ROUND
+    assert parsed.data["decision_tags"] == {"tone": "decisive"}

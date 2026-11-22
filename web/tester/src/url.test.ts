@@ -51,4 +51,11 @@ describe("wsToHttp", () => {
   it("handles URL without /ws path", () => {
     expect(wsToHttp("wss://example.com")).toBe("https://example.com");
   });
+
+  it("handles uppercase WSS://, trailing /ws/, trailing slashes, and query parameters", () => {
+    expect(wsToHttp("WSS://example.com/ws/")).toBe("https://example.com");
+    expect(wsToHttp("WS://localhost:9101/ws?token=1")).toBe("http://localhost:9101");
+    expect(wsToHttp("http://localhost:9101/")).toBe("http://localhost:9101");
+    expect(wsToHttp("https://example.com///")).toBe("https://example.com");
+  });
 });

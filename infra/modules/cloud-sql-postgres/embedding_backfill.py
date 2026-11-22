@@ -35,6 +35,7 @@ Required env vars:
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -43,7 +44,6 @@ from typing import TYPE_CHECKING
 # imports stay deferred (so this module is import-safe in test envs
 # without asyncpg + google-genai installed).
 if TYPE_CHECKING:
-    import asyncpg as _asyncpg
     from google import genai as _genai
 
 
@@ -58,7 +58,28 @@ def _to_pgvector_text(vec: list[float]) -> str:
     SQL via `$1::vector`. Using repr(float(x)) preserves full precision
     and handles scientific notation correctly.
     """
-    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+    if not vec:
+        raise ValueError("Embedding vector must not be empty")
+    formatted: list[str] = []
+    for x in vec:
+        if isinstance(x, bool):
+            raise ValueError("Embedding vector values must be finite numbers, got bool")
+        try:
+            val = float(x)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid embedding value for pgvector: {x!r}") from exc
+        if not math.isfinite(val):
+            raise ValueError(f"Non-finite embedding value is not valid for pgvector: {val!r}")
+        formatted.append(repr(val))
+    return "[" + ",".join(formatted) + "]"
+
+
+def _require_env(name: str) -> str:
+    """Return a non-empty environment variable or raise ValueError."""
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise ValueError(f"Required environment variable {name!r} is missing or empty")
+    return val
 
 
 def _client() -> _genai.Client:
@@ -68,7 +89,7 @@ def _client() -> _genai.Client:
 
     return genai.Client(
         vertexai=True,
-        project=os.environ["PROJECT_ID"],
+        project=_require_env("PROJECT_ID"),
         location=os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
     )
 
@@ -82,7 +103,12 @@ async def _embed(client: _genai.Client, text: str) -> list[float]:
     )
     if not response.embeddings or response.embeddings[0].values is None:
         raise RuntimeError(f"Vertex AI returned no embedding for text: {text[:60]!r}")
-    return list(response.embeddings[0].values)
+    vec = list(response.embeddings[0].values)
+    if len(vec) != EMBED_DIMENSION:
+        raise ValueError(
+            f"Expected {EMBED_DIMENSION}-dim embedding from {model}, got {len(vec)} for text: {text[:60]!r}"
+        )
+    return vec
 
 
 async def main() -> int:
@@ -90,11 +116,14 @@ async def main() -> int:
     # import-safe in environments without asyncpg installed.
     import asyncpg
 
+    db_host = _require_env("DATABASE_HOST")
+    db_password = _require_env("DATABASE_PASSWORD")
+
     conn = await asyncpg.connect(
-        host=os.environ["DATABASE_HOST"],
+        host=db_host,
         port=int(os.environ.get("DATABASE_PORT", "5432")),
         user=os.environ.get("DATABASE_USER", "postgres"),
-        password=os.environ["DATABASE_PASSWORD"],
+        password=db_password,
         database=os.environ.get("DATABASE_NAME", "postgres"),
     )
 
@@ -113,6 +142,10 @@ async def main() -> int:
 
         for row in rows:
             vec = await _embed(client, row["text"])
+            if len(vec) != EMBED_DIMENSION:
+                raise ValueError(
+                    f"Expected {EMBED_DIMENSION}-dim embedding for {row['source_file']}#{row['chunk_id']}, got {len(vec)}"
+                )
             await conn.execute(
                 "UPDATE rules SET embedding = $1::vector WHERE source_file = $2 AND chunk_id = $3",
                 _to_pgvector_text(vec),

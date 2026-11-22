@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: clamp Web-Mercator latitudes, validate GeoJSON coordinates, guard missing 2D canvas contexts, and dispose all Three.js geometries, materials, textures, and barriers.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,9 +31,60 @@ const CX = (MAP_CENTER_LON * Math.PI / 180) * R_EARTH;
 const CY = Math.log(Math.tan(Math.PI / 4 + (MAP_CENTER_LAT * Math.PI / 180) / 2)) * R_EARTH;
 const SCALE = GLB_TRANSFORM.scale;
 
+const MAX_MERCATOR_LAT = 85.05112878;
+
+function disposeMaterialAndTextures(
+  mat: THREE.Material,
+  disposedMats: Set<THREE.Material>,
+  disposedTexs: Set<THREE.Texture>,
+): void {
+  if (disposedMats.has(mat)) return;
+  disposedMats.add(mat);
+  for (const value of Object.values(mat as unknown as Record<string, unknown>)) {
+    if (value && typeof value === 'object' && (value as { isTexture?: boolean }).isTexture) {
+      const tex = value as THREE.Texture;
+      if (!disposedTexs.has(tex)) {
+        disposedTexs.add(tex);
+        tex.dispose();
+      }
+    }
+  }
+  mat.dispose();
+}
+
+function disposeObjectTree(root: THREE.Object3D): void {
+  const disposedGeos = new Set<THREE.BufferGeometry>();
+  const disposedMats = new Set<THREE.Material>();
+  const disposedTexs = new Set<THREE.Texture>();
+  root.traverse(obj => {
+    // Sprites share Three.js's global quad geometry, so only dispose geometry on Mesh/Line/Points.
+    if (obj instanceof THREE.Mesh || obj instanceof THREE.Line || obj instanceof THREE.Points) {
+      const geo = obj.geometry;
+      if (geo && typeof geo.dispose === 'function' && !disposedGeos.has(geo)) {
+        disposedGeos.add(geo);
+        geo.dispose();
+      }
+    }
+    const mat = (obj as { material?: THREE.Material | THREE.Material[] }).material;
+    if (Array.isArray(mat)) {
+      for (const m of mat) {
+        if (m && typeof m.dispose === 'function') {
+          disposeMaterialAndTextures(m, disposedMats, disposedTexs);
+        }
+      }
+    } else if (mat && typeof mat.dispose === 'function') {
+      disposeMaterialAndTextures(mat, disposedMats, disposedTexs);
+    }
+  });
+}
+
 function lonLatToWorld(lon: number, lat: number): THREE.Vector3 {
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+    return new THREE.Vector3(0, 0, 0);
+  }
+  const clampedLat = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, lat));
   const mx = (lon * Math.PI / 180) * R_EARTH;
-  const my = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2)) * R_EARTH;
+  const my = Math.log(Math.tan(Math.PI / 4 + (clampedLat * Math.PI / 180) / 2)) * R_EARTH;
   return new THREE.Vector3(
     (mx - CX) * SCALE + GLB_TRANSFORM.offsetX,
     0,
@@ -158,21 +211,38 @@ export class RoadNetwork {
   /** Parse a GeoJSON FeatureCollection of LineStrings into a road network. */
   static fromGeoJSON(geojson: any): RoadNetwork {
     const net = new RoadNetwork();
-    if (geojson?.type !== 'FeatureCollection') return net;
+    if (geojson?.type !== 'FeatureCollection' || !Array.isArray(geojson.features)) return net;
 
     // Step 1: Convert all features to world-space polylines
     const polylines: THREE.Vector3[][] = [];
     const featureNames: (string | null)[] = [];
-    for (const feature of geojson.features ?? []) {
-      if (feature.geometry?.type !== 'LineString') continue;
-      const coords: [number, number][] = feature.geometry.coordinates;
-      if (coords.length < 2) continue;
-      polylines.push(coords.map(([lon, lat]) => {
-        const p = lonLatToWorld(lon, lat);
+    for (const feature of geojson.features) {
+      if (feature?.geometry?.type !== 'LineString') continue;
+      const coords = feature.geometry.coordinates;
+      if (!Array.isArray(coords) || coords.length < 2) continue;
+      const poly: THREE.Vector3[] = [];
+      for (const tuple of coords) {
+        if (
+          !Array.isArray(tuple) ||
+          tuple.length < 2 ||
+          typeof tuple[0] !== 'number' ||
+          typeof tuple[1] !== 'number' ||
+          !Number.isFinite(tuple[0]) ||
+          !Number.isFinite(tuple[1])
+        ) {
+          continue;
+        }
+        const p = lonLatToWorld(tuple[0], tuple[1]);
         p.y = ROAD_Y;
-        return p;
-      }));
-      featureNames.push(feature.properties?.name ?? null);
+        poly.push(p);
+      }
+      if (poly.length < 2) continue;
+      polylines.push(poly);
+      featureNames.push(
+        typeof feature.properties?.name === 'string' && feature.properties.name.length > 0
+          ? feature.properties.name
+          : null,
+      );
     }
 
     // Step 2: Find all intersection points (endpoints + cross-intersections)
@@ -365,16 +435,15 @@ export class RoadNetwork {
     this.carSim = null;
     this.trafficSim?.removeFromScene(scene);
     this.trafficSim = null;
+    this.removeBarriers(scene);
+    this.edgeMeshes.clear();
     if (!this.sceneGroup) return;
     scene.remove(this.sceneGroup);
-    this.sceneGroup.traverse(obj => {
-      if (obj instanceof THREE.Mesh) {
-        obj.geometry.dispose();
-        const mat = obj.material;
-        if (Array.isArray(mat)) mat.forEach(m => m.dispose());
-        else mat.dispose();
-      }
-    });
+    disposeObjectTree(this.sceneGroup);
+    this.edgeGroup = null;
+    this.nodeGroup = null;
+    this.spawnGroup = null;
+    this.streetNameGroup = null;
     this.sceneGroup = null;
   }
 
@@ -409,6 +478,9 @@ export class RoadNetwork {
 
   /** Find edges that CROSS or JOIN the marathon path (not edges the path runs along). */
   findEdgesCrossingPath(pathPoints: readonly THREE.Vector3[], radius: number): number[] {
+    if (!Array.isArray(pathPoints) || pathPoints.length < 2 || !Number.isFinite(radius) || radius < 0) {
+      return [];
+    }
     const PARALLEL_THRESHOLD = Math.cos(35 * Math.PI / 180); // ~0.82 – edges more parallel than this are "along" the path
 
     const result: number[] = [];
@@ -450,8 +522,9 @@ export class RoadNetwork {
 
   /** Close the given edges to traffic, rebuild adjacency, and show barriers. */
   closeEdges(edgeIds: number[], scene: THREE.Scene, pathPoints?: readonly THREE.Vector3[]): void {
-    this.closedEdgeIds = new Set(edgeIds);
+    this.closedEdgeIds = new Set(Array.isArray(edgeIds) ? edgeIds : []);
     this.carSim?.setClosedEdges(this.closedEdgeIds);
+    this.restoreEdgeColors();
     this.colorClosedEdges();
     this.buildBarriers(scene, pathPoints);
   }
@@ -589,17 +662,14 @@ export class RoadNetwork {
       }
     }
 
+    barrierMat.dispose();
+    stripeMat.dispose();
     scene.add(this.barrierGroup);
   }
 
   private removeBarriers(scene: THREE.Scene): void {
     if (!this.barrierGroup) return;
-    this.barrierGroup.traverse(obj => {
-      if (obj instanceof THREE.Mesh) {
-        obj.geometry.dispose();
-        (obj.material as THREE.Material).dispose();
-      }
-    });
+    disposeObjectTree(this.barrierGroup);
     scene.remove(this.barrierGroup);
     this.barrierGroup = null;
   }
@@ -614,6 +684,7 @@ export class RoadNetwork {
     for (const edge of this.edges) {
       const fromNode = this.nodes[edge.from];
       const toNode = this.nodes[edge.to];
+      if (!fromNode || !toNode) continue;
 
       const trimmed = this.trimEdgePoints(edge.points, fromNode.position, toNode.position);
       if (trimmed.length < 2) continue;
@@ -640,6 +711,7 @@ export class RoadNetwork {
         this.edgeGroup!.add(mesh);
         meshes.push(mesh);
       }
+      mat.dispose();
       this.edgeMeshes.set(edge.id, meshes);
     }
 
@@ -669,6 +741,8 @@ export class RoadNetwork {
       mesh.renderOrder = 5;
       this.nodeGroup!.add(mesh);
     }
+    circleGeo.dispose();
+    mat.dispose();
 
     this.sceneGroup.add(this.nodeGroup);
   }
@@ -692,11 +766,14 @@ export class RoadNetwork {
 
     for (const nodeId of this.spawnNodeIds) {
       const node = this.nodes[nodeId];
+      if (!node) continue;
       const mesh = new THREE.Mesh(circleGeo.clone(), mat.clone());
       mesh.position.set(node.position.x, SPAWN_Y, node.position.z);
       mesh.renderOrder = 6;
       this.spawnGroup!.add(mesh);
     }
+    circleGeo.dispose();
+    mat.dispose();
 
     this.sceneGroup.add(this.spawnGroup);
   }
@@ -773,7 +850,9 @@ export class RoadNetwork {
       this.streetNameGroup!.add(dot);
 
       // ── Billboard sprite label at the top ──
-      const measure = document.createElement('canvas').getContext('2d')!;
+      if (typeof document === 'undefined') continue;
+      const measure = document.createElement('canvas').getContext('2d');
+      if (!measure) continue;
       measure.font = LABEL_FONT;
       const textW = measure.measureText(entry.name).width;
       const padX = 20;
@@ -785,7 +864,8 @@ export class RoadNetwork {
       const canvas = document.createElement('canvas');
       canvas.width = canvasW;
       canvas.height = canvasH;
-      const ctx = canvas.getContext('2d')!;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) continue;
 
       // Background pill
       const r = canvasH / 2;

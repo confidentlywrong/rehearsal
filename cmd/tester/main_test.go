@@ -319,3 +319,31 @@ func TestRequireAuth_BearerAcceptedDoesNotValidateToken(t *testing.T) {
 	require.NotEqual(t, http.StatusUnauthorized, w.Code, "bearer presence must satisfy app-layer gate")
 	assert.Equal(t, http.StatusOK, w.Code)
 }
+
+func TestTesterAPIProxy_StripsHopByHopAndCapsErrorFramingHeaders(t *testing.T) {
+	largeErrBody := make([]byte, (1<<16)+2048)
+	for i := range largeErrBody {
+		largeErrBody[i] = 'x'
+	}
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Upstream-Trace", "trace-123")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write(largeErrBody)
+	}))
+	defer apiServer.Close()
+
+	t.Setenv("GATEWAY_INTERNAL_URL", apiServer.URL)
+	r := setupRouter("")
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/sessions", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	assert.Equal(t, 1<<16, w.Body.Len(), "error body should be capped at 64 KiB")
+	assert.Equal(t, []string{"application/json"}, w.Header().Values("Content-Type"), "Content-Type must not be duplicated")
+	assert.Empty(t, w.Header().Get("Connection"), "hop-by-hop Connection header must be stripped")
+	assert.Equal(t, "trace-123", w.Header().Get("X-Upstream-Trace"))
+}

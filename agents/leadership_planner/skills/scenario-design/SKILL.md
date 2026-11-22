@@ -28,7 +28,7 @@ and resource allocation models.
 - `design_leadership_scenario(scenario_type, stakeholder_count, budget_allocation, complexity)`:
   Generate a complete scenario configuration.
   - `scenario_type`: Type of scenario (transformation, crisis, merger, innovation, compliance).
-  - `stakeholder_count`: Number of stakeholder personas (default: 10).
+  - `stakeholder_count`: Number of stakeholder personas (default: 1000).
   - `budget_allocation`: Budget strategy (balanced, aggressive, conservative).
   - `complexity`: Scenario complexity (simple, moderate, complex).
 - `report_leadership_scenario()`: Emit the scenario to the gateway for visualization.

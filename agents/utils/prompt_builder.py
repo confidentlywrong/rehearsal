@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,7 +56,7 @@ class PromptBuilder:
 
     def static(self, *keys: str) -> str:
         """Join named sections for ``LlmAgent.static_instruction``."""
-        return "\n\n".join(self._sections[k] for k in keys if k in self._sections)
+        return "\n\n".join(self._sections[k] for k in keys if k in self._sections and self._sections[k])
 
     def dynamic(self, *, exclude: tuple[str, ...] = ()) -> Callable[[ReadonlyContext], Awaitable[str]]:
         """Return an async ``InstructionProvider`` for ``LlmAgent.instruction``.

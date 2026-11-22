@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard missing graph nodes/edges, empty node sets, missing 2D canvas contexts in createGlowTexture, and recreate glowTexture if re-added after removeFromScene.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,8 +53,11 @@ function buildAdjacency(
       const dz = e.points[i].z - e.points[i - 1].z;
       len += Math.sqrt(dx * dx + dz * dz);
     }
-    adj.get(e.from)!.push({ edgeId: e.id, neighborNodeId: e.to, cost: len });
-    adj.get(e.to)!.push({ edgeId: e.id, neighborNodeId: e.from, cost: len });
+    const fromAdj = adj.get(e.from);
+    const toAdj = adj.get(e.to);
+    if (!fromAdj || !toAdj) continue;
+    fromAdj.push({ edgeId: e.id, neighborNodeId: e.to, cost: len });
+    toAdj.push({ edgeId: e.id, neighborNodeId: e.from, cost: len });
   }
   return adj;
 }
@@ -200,8 +205,8 @@ export class CarSimulator {
   private scene: THREE.Scene | null = null;
 
   private closedEdges = new Set<number>();
-  private carGeo: THREE.SphereGeometry;
-  private glowTexture: THREE.Texture;
+  private carGeo: THREE.SphereGeometry | null;
+  private glowTexture: THREE.Texture | null;
   private carColors = [
     0xe74c3c, 0x3498db, 0x2ecc71, 0xf39c12, 0x9b59b6,
     0x1abc9c, 0xe67e22, 0xecf0f1, 0x34495e, 0xf1c40f,
@@ -220,11 +225,21 @@ export class CarSimulator {
   }
 
   private static createGlowTexture(): THREE.Texture {
+    if (typeof document === 'undefined') {
+      const tex = new THREE.DataTexture(new Uint8Array([255, 255, 255, 180]), 1, 1);
+      tex.needsUpdate = true;
+      return tex;
+    }
     const size = 64;
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
-    const ctx = canvas.getContext('2d')!;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      const tex = new THREE.DataTexture(new Uint8Array([255, 255, 255, 180]), 1, 1);
+      tex.needsUpdate = true;
+      return tex;
+    }
     const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
     grad.addColorStop(0, 'rgba(255,255,255,0.7)');
     grad.addColorStop(0.3, 'rgba(255,255,255,0.3)');
@@ -236,7 +251,14 @@ export class CarSimulator {
   }
 
   addToScene(scene: THREE.Scene): void {
+    if (this.sceneGroup) this.removeFromScene(scene);
     this.scene = scene;
+    if (!this.carGeo) {
+      this.carGeo = new THREE.SphereGeometry(CAR_RADIUS, 16, 12);
+    }
+    if (!this.glowTexture) {
+      this.glowTexture = CarSimulator.createGlowTexture();
+    }
     this.sceneGroup = new THREE.Group();
     this.sceneGroup.name = 'cars';
     scene.add(this.sceneGroup);
@@ -250,7 +272,10 @@ export class CarSimulator {
       (car.glow.material as THREE.Material).dispose();
     }
     this.cars = [];
-    this.glowTexture.dispose();
+    this.carGeo?.dispose();
+    this.carGeo = null;
+    this.glowTexture?.dispose();
+    this.glowTexture = null;
     scene.remove(this.sceneGroup);
     this.sceneGroup = null;
     this.scene = null;
@@ -300,7 +325,9 @@ export class CarSimulator {
   }
 
   spawnCar(): void {
-    if (!this.sceneGroup || this.edges.length < 1) return;
+    if (!this.sceneGroup || this.edges.length < 1 || this.nodes.length === 0) return;
+    if (!this.carGeo) this.carGeo = new THREE.SphereGeometry(CAR_RADIUS, 16, 12);
+    if (!this.glowTexture) this.glowTexture = CarSimulator.createGlowTexture();
 
     // Pick a random open edge to spawn on
     const openEdges = this.edges.filter(e => !this.closedEdges.has(e.id));
@@ -407,6 +434,7 @@ export class CarSimulator {
   }
 
   tick(delta: number): void {
+    if (!Number.isFinite(delta) || delta <= 0) return;
     for (const car of this.cars) {
       this.updateCar(car, delta);
     }
@@ -562,6 +590,11 @@ export class CarSimulator {
   }
 
   private assignNewDestination(car: Car): void {
+    if (this.nodes.length === 0) {
+      car.route = [];
+      car.routeIdx = 0;
+      return;
+    }
     // Current position is at the end of the last route step
     const lastStep = car.route[car.route.length - 1];
     const currentNode = lastStep
@@ -588,7 +621,11 @@ export class CarSimulator {
     car.currentNodeId = currentNode;
 
     const step = route[0];
-    const edge = this.edgeMap.get(step.edgeId)!;
+    const edge = this.edgeMap.get(step.edgeId);
+    if (!edge) {
+      car.route = [];
+      return;
+    }
     car.lanePoints = getLanePoints(edge, step.forward);
     const d = computeDistances(car.lanePoints);
     car.cumDist = d.cumDist;

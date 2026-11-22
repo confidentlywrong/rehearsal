@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	pubsub "cloud.google.com/go/pubsub/v2/apiv1"
@@ -52,10 +54,31 @@ type GCPPubSubDrainer struct {
 
 // NewGCPPubSubDrainer creates a drainer for the given project and subscriptions.
 func NewGCPPubSubDrainer(projectID string, subscriptions []string) *GCPPubSubDrainer {
-	return &GCPPubSubDrainer{
-		projectID:     projectID,
-		subscriptions: subscriptions,
+	cleaned := make([]string, 0, len(subscriptions))
+	for _, s := range subscriptions {
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
 	}
+	return &GCPPubSubDrainer{
+		projectID:     strings.TrimSpace(projectID),
+		subscriptions: cleaned,
+	}
+}
+
+// Close releases the underlying PubSub admin client if initialized.
+func (d *GCPPubSubDrainer) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	client := d.client
+	d.client = nil
+	d.mu.Unlock()
+	if client != nil {
+		return client.Close()
+	}
+	return nil
 }
 
 // newSubscriptionAdminClient is the function used to create PubSub admin clients.
@@ -67,7 +90,7 @@ var newSubscriptionAdminClient = func(ctx context.Context) (*pubsub.Subscription
 // Drain seeks all configured subscriptions to "now", discarding backlogged
 // messages. Returns the number of subscriptions successfully drained.
 func (d *GCPPubSubDrainer) Drain(ctx context.Context) (int, error) {
-	if len(d.subscriptions) == 0 {
+	if d == nil || len(d.subscriptions) == 0 {
 		return 0, nil
 	}
 
@@ -84,24 +107,41 @@ func (d *GCPPubSubDrainer) Drain(ctx context.Context) (int, error) {
 	d.mu.Unlock()
 
 	drained := 0
-	var lastErr error
+	var errs []error
 	for _, subName := range d.subscriptions {
-		subPath := fmt.Sprintf("projects/%s/subscriptions/%s", d.projectID, subName)
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+		var subPath string
+		if strings.HasPrefix(subName, "projects/") {
+			subPath = subName
+		} else {
+			if d.projectID == "" {
+				err := fmt.Errorf("pubsub subscription %q requires non-empty projectID", subName)
+				log.Printf("PubSubDrainer: %v", err)
+				errs = append(errs, err)
+				continue
+			}
+			subPath = fmt.Sprintf("projects/%s/subscriptions/%s", d.projectID, subName)
+		}
 		_, err := client.Seek(ctx, &pubsubpb.SeekRequest{
 			Subscription: subPath,
 			Target:       &pubsubpb.SeekRequest_Time{Time: timestamppb.Now()},
 		})
 		if err != nil {
 			log.Printf("PubSubDrainer: failed to seek %s: %v", subName, err)
-			lastErr = err
+			errs = append(errs, fmt.Errorf("%s: %w", subPath, err))
 			continue
 		}
 		log.Printf("PubSubDrainer: drained subscription %s", subName)
 		drained++
 	}
 
-	if lastErr != nil && drained == 0 {
-		return 0, fmt.Errorf("all subscription seeks failed, last: %w", lastErr)
+	if len(errs) > 0 {
+		return drained, errors.Join(errs...)
 	}
 	return drained, nil
 }

@@ -210,3 +210,30 @@ func TestRequestTracing_AddsRawQuery(t *testing.T) {
 		t.Errorf("url.query: %v", spans[0].Attributes())
 	}
 }
+
+func TestRequestTracing_HonorsLatePropagatorRegistration(t *testing.T) {
+	rec := installTestTracer(t)
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() { otel.SetTextMapPropagator(prevProp) })
+
+	// Start with an empty propagator when building the router.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator())
+	r := newTracingRouter("svc")
+	r.GET("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Register W3C TraceContext propagator AFTER router construction.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}))
+
+	const traceParent = "00-fedcba9876543210fedcba9876543210-0123456789abcdef-01"
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Traceparent", traceParent)
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("want 1 span, got %d", len(spans))
+	}
+	if got := spans[0].SpanContext().TraceID().String(); got != "fedcba9876543210fedcba9876543210" {
+		t.Errorf("late propagator trace_id: got %s", got)
+	}
+}

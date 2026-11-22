@@ -24,62 +24,58 @@ independently testable with mock state dicts.
 """
 
 import logging
+import math
 from typing import Any
 
-from agents.ai_echo.initialization import sentiment_to_stance
+from agents.ai_echo.initialization import ACRONYMS, format_role_display, sentiment_to_stance
 
 logger = logging.getLogger(__name__)
 
 StateLike = Any
 
-ACRONYMS = {
-    "cfo": "CFO",
-    "cto": "CTO",
-    "ceo": "CEO",
-    "coo": "COO",
-    "cpo": "CPO",
-    "cio": "CIO",
-    "ciso": "CISO",
-    "cmo": "CMO",
-    "chro": "CHRO",
-    "cro": "CRO",
-    "cbo": "CBO",
-    "vp": "VP",
-    "svp": "SVP",
-    "evp": "EVP",
-    "hr": "HR",
-    "ai": "AI",
-    "it": "IT",
-    "sla": "SLA",
-    "roi": "ROI",
-    "wtt": "WTT",
-    "pr": "PR",
-    "qa": "QA",
-    "r&d": "R&D",
-    "ops": "Ops",
-    "eng": "Eng",
-}
+__all__ = [
+    "ACRONYMS",
+    "format_role_display",
+    "process_decision_round",
+    "sentiment_to_stance",
+]
 
 
-def format_role_display(role: str) -> str:
-    """Format a role or slug into a human-readable title preserving acronyms."""
-    if not role or not isinstance(role, str):
-        return ""
-    clean = role.replace("-", " ").replace("_", " ").strip()
-    if not clean:
-        return ""
-    words = clean.split()
-    formatted = []
-    lower_words = {"of", "and", "the", "for", "in", "on", "at", "to"}
-    for idx, w in enumerate(words):
-        low = w.lower()
-        if low in ACRONYMS:
-            formatted.append(ACRONYMS[low])
-        elif idx > 0 and low in lower_words:
-            formatted.append(low)
-        else:
-            formatted.append(w.capitalize())
-    return " ".join(formatted)
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
+def _str_list(value: object) -> list[str]:
+    """Normalize an iterable of principle names to list[str]."""
+    if isinstance(value, (list, tuple, set)):
+        return [x for x in value if isinstance(x, str)]
+    return []
 
 
 def process_decision_round(
@@ -112,14 +108,23 @@ def process_decision_round(
     Returns:
         Result dict with updated Echo state for aggregation.
     """
-    if decision_tags is None:
+    if not isinstance(decision_tags, dict):
         decision_tags = {}
-    if resource_state is None:
+    if not isinstance(resource_state, dict):
         resource_state = {}
+    tick = _finite_int(tick, 0)
+    wall_severity = max(0.0, min(10.0, _finite_float(wall_severity, 5.0)))
+    if not isinstance(inner_thought, str):
+        inner_thought = str(inner_thought) if inner_thought is not None else ""
 
-    role = state.get("role", "unknown")
-    role_display = state.get("label") or state.get("name") or format_role_display(role)
-    tier = state.get("tier", 3)
+    raw_role = state.get("role", "unknown")
+    role = raw_role if isinstance(raw_role, str) and raw_role else "unknown"
+    role_display = (
+        (state.get("label") if isinstance(state.get("label"), str) else None)
+        or (state.get("name") if isinstance(state.get("name"), str) else None)
+        or format_role_display(role)
+    )
+    tier = _finite_int(state.get("tier", 3), 3)
 
     # --- Check for defection/alignment terminal states ---
     if state.get("defected", False):
@@ -128,13 +133,20 @@ def process_decision_round(
         return _terminal_result(state, tick, "aligned", inner_thought, 0.0)
 
     # --- Update principle affinity based on decision ---
-    affinity = list(state.get("principle_affinity", [0.5] * 7))
-    receptivity = state.get("communication_receptivity", 0.7)
-    principles_applied = decision_tags.get("principles_applied", [])
-    principles_neglected = decision_tags.get("principles_neglected", [])
-    principles = state.get(
-        "_principles",
-        [
+    raw_aff = state.get("principle_affinity")
+    affinity = (
+        [max(0.0, min(1.0, _finite_float(a, 0.5))) for a in raw_aff]
+        if isinstance(raw_aff, (list, tuple))
+        else [0.5] * 7
+    )
+    receptivity = max(0.0, min(1.0, _finite_float(state.get("communication_receptivity", 0.7), 0.7)))
+    principles_applied = _str_list(decision_tags.get("principles_applied"))
+    principles_neglected = _str_list(decision_tags.get("principles_neglected"))
+    raw_principles = state.get("_principles")
+    principles = (
+        _str_list(raw_principles)
+        if isinstance(raw_principles, (list, tuple)) and len(raw_principles) > 0
+        else [
             "Strategic Foresight & Vision Cascading",
             "Adaptive Decision-Making & Agility",
             "Stakeholder Engagement & Inclusive Communication",
@@ -142,10 +154,10 @@ def process_decision_round(
             "Empowerment & Cultivating Distributed Leadership",
             "Organizational Resilience & Change Agility",
             "Resource Optimization & Strategic Allocation",
-        ],
+        ]
     )
 
-    domain_principles = set(state.get("domain_principles", []))
+    domain_principles = set(_str_list(state.get("domain_principles")))
 
     for i, principle in enumerate(principles):
         if i >= len(affinity):
@@ -158,7 +170,7 @@ def process_decision_round(
     state["principle_affinity"] = [round(a, 4) for a in affinity]
 
     # --- Update sentiment ---
-    sentiment = state.get("sentiment", 0.0)
+    sentiment = max(-1.0, min(1.0, _finite_float(state.get("sentiment", 0.0), 0.0)))
 
     # Positive shift if domain principles are applied
     domain_applied = domain_principles & set(principles_applied)
@@ -175,18 +187,24 @@ def process_decision_round(
         sentiment -= TRUST_ERODE_RATE * len(domain_neglected) * (1.0 - receptivity * 0.5)
 
     # Hysteresis: once hostile, harder to recover (trust debt)
-    old_stance = state.get("stance", "neutral")
+    raw_old_stance = state.get("stance", "neutral")
+    old_stance = raw_old_stance if isinstance(raw_old_stance, str) and raw_old_stance else "neutral"
+    raw_chist = state.get("_contradiction_history")
+    chist = list(raw_chist) if isinstance(raw_chist, list) else []
     if old_stance == "hostile" and sentiment > -0.4:
-        breach_count = len(state.get("_contradiction_history", []))
+        breach_count = len(chist)
         recovery_penalty = 0.03 * min(breach_count, 5)
         sentiment -= recovery_penalty
 
-    # Contradiction alert causes extra sentiment drop
+    # Contradiction alert causes extra sentiment drop and accumulates trust debt
     if contradiction_alert:
         sentiment -= 0.1
+        chist.append(contradiction_alert)
+        state["_contradiction_history"] = chist
 
     # Resource health affects sentiment
-    owb = resource_state.get("owb", {}).get("current", 70) if resource_state else 70
+    owb_pool = resource_state.get("owb")
+    owb = _finite_float(owb_pool.get("current"), 70.0) if isinstance(owb_pool, dict) else 70.0
     if owb < 30:
         sentiment -= 0.02  # Low organizational will erodes all sentiment
 
@@ -194,9 +212,8 @@ def process_decision_round(
     # The influence network propagation (computed in advance_tick) produces
     # per-role sentiment nudges representing peer pressure from connected
     # stakeholders. Scale by receptivity so closed-minded echoes resist.
-    if influence_deltas:
-        role = state.get("role", "unknown")
-        delta = influence_deltas.get(role, 0.0)
+    if isinstance(influence_deltas, dict):
+        delta = _finite_float(influence_deltas.get(role, 0.0), 0.0)
         if delta:
             sentiment += delta * receptivity
 
@@ -204,7 +221,7 @@ def process_decision_round(
     state["sentiment"] = round(sentiment, 4)
 
     # --- Update resistance ---
-    resistance = state.get("resistance", 0.3)
+    resistance = max(0.0, min(1.0, _finite_float(state.get("resistance", 0.3), 0.3)))
     if domain_neglected:
         resistance = min(1.0, resistance + 0.05 * len(domain_neglected))
     elif domain_applied:
@@ -212,7 +229,7 @@ def process_decision_round(
     state["resistance"] = round(resistance, 4)
 
     # --- Update urgency ---
-    urgency = state.get("urgency", 0.2)
+    urgency = max(0.0, min(1.0, _finite_float(state.get("urgency", 0.2), 0.2)))
     if owb < 40:
         urgency = min(1.0, urgency + 0.05)
     elif owb >= 60:
@@ -221,7 +238,12 @@ def process_decision_round(
 
     # --- Check for hidden agenda activation (BEFORE stance update) ---
     agenda_event = None
-    agenda_trigger = state.get("agenda_trigger_tick")
+    raw_trigger = state.get("agenda_trigger_tick")
+    agenda_trigger = (
+        _finite_int(raw_trigger)
+        if raw_trigger is not None and not isinstance(raw_trigger, bool)
+        else None
+    )
     if (
         state.get("has_hidden_agenda")
         and agenda_trigger is not None
@@ -229,8 +251,8 @@ def process_decision_round(
         and not state.get("agenda_revealed")
     ):
         state["agenda_revealed"] = True
-        sentiment -= 0.15
-        state["sentiment"] = round(max(-1.0, sentiment), 4)
+        sentiment = max(-1.0, min(1.0, sentiment - 0.15))
+        state["sentiment"] = round(sentiment, 4)
         agenda_event = True
 
     # --- Update stance ---
@@ -282,6 +304,9 @@ def process_decision_round(
         autonomous_action = f"{role_display} champions the initiative internally"
 
     # --- Build result ---
+    influence = _finite_float(state.get("influence", 0.5), 0.5)
+    raw_status = state.get("echo_status", "active")
+    echo_status = raw_status if isinstance(raw_status, str) and raw_status else "active"
     result = {
         "tick": tick,
         "role": role,
@@ -289,12 +314,12 @@ def process_decision_round(
         "tier": tier,
         "sentiment": state["sentiment"],
         "resistance": state["resistance"],
-        "influence": state.get("influence", 0.5),
+        "influence": influence,
         "urgency": state["urgency"],
         "stance": state["stance"],
-        "defected": state.get("defected", False),
-        "aligned": state.get("aligned", False),
-        "echo_status": state.get("echo_status", "active"),
+        "defected": bool(state.get("defected", False)),
+        "aligned": bool(state.get("aligned", False)),
+        "echo_status": echo_status,
         "principle_affinity": state["principle_affinity"],
         "inner_thought": inner_thought,
         "wall_severity": wall_severity,
@@ -317,24 +342,40 @@ def process_decision_round(
 
 def _terminal_result(state: StateLike, tick: int, status: str, inner_thought: str, wall_severity: float) -> dict:
     """Build result for a terminal-state Echo (defected or aligned)."""
-    role = state.get("role", "unknown")
-    role_display = state.get("label") or state.get("name") or format_role_display(role)
+    safe_tick = _finite_int(tick, 0)
+    raw_role = state.get("role", "unknown")
+    role = raw_role if isinstance(raw_role, str) and raw_role else "unknown"
+    role_display = (
+        (state.get("label") if isinstance(state.get("label"), str) else None)
+        or (state.get("name") if isinstance(state.get("name"), str) else None)
+        or format_role_display(role)
+    )
+    raw_stance = state.get("stance", "neutral")
+    stance = raw_stance if isinstance(raw_stance, str) and raw_stance else "neutral"
+    raw_aff = state.get("principle_affinity")
+    principle_affinity = (
+        [_finite_float(a, 0.5) for a in raw_aff]
+        if isinstance(raw_aff, (list, tuple))
+        else [0.5] * 7
+    )
+    safe_thought = inner_thought if isinstance(inner_thought, str) else (str(inner_thought) if inner_thought is not None else "")
+    safe_status = status if isinstance(status, str) and status else "active"
     return {
-        "tick": tick,
+        "tick": safe_tick,
         "role": role,
         "role_display": role_display,
-        "tier": state.get("tier", 3),
-        "sentiment": state.get("sentiment", 0.0),
-        "resistance": state.get("resistance", 0.0),
-        "influence": state.get("influence", 0.5),
-        "urgency": state.get("urgency", 0.0),
-        "stance": state.get("stance", "neutral"),
-        "defected": state.get("defected", False),
-        "aligned": state.get("aligned", False),
-        "echo_status": status,
-        "principle_affinity": state.get("principle_affinity", [0.5] * 7),
-        "inner_thought": inner_thought,
-        "wall_severity": wall_severity,
+        "tier": _finite_int(state.get("tier", 3), 3),
+        "sentiment": _finite_float(state.get("sentiment", 0.0), 0.0),
+        "resistance": _finite_float(state.get("resistance", 0.0), 0.0),
+        "influence": _finite_float(state.get("influence", 0.5), 0.5),
+        "urgency": _finite_float(state.get("urgency", 0.0), 0.0),
+        "stance": stance,
+        "defected": bool(state.get("defected", False)),
+        "aligned": bool(state.get("aligned", False)),
+        "echo_status": safe_status,
+        "principle_affinity": principle_affinity,
+        "inner_thought": safe_thought,
+        "wall_severity": _finite_float(wall_severity, 5.0),
         "notable_event": None,
         "autonomous_action": None,
         "resource_claims": [],

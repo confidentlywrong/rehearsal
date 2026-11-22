@@ -177,10 +177,11 @@ def get_maps_tools() -> list:
         return []
 
     mcp_server_name = None
-    for server in servers.get("mcpServers", []):
-        if server.get("displayName") == _MAPS_MCP_DISPLAY_NAME:
-            mcp_server_name = server["name"]
-            break
+    if isinstance(servers, dict):
+        for server in servers.get("mcpServers") or []:
+            if isinstance(server, dict) and server.get("displayName") == _MAPS_MCP_DISPLAY_NAME:
+                mcp_server_name = server.get("name")
+                break
 
     if not mcp_server_name:
         logger.warning(
@@ -224,7 +225,9 @@ async def set_financial_modeling_mode(mode: str, tool_context: ToolContext) -> d
             "status": "error",
             "message": (f"Invalid mode '{mode}'. Must be 'secure' or 'insecure'."),
         }
-    tool_context.state["financial_modeling_mode"] = mode
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is not None and hasattr(state, "__setitem__"):
+        state["financial_modeling_mode"] = mode
     return {"status": "success", "financial_modeling_mode": mode}
 
 

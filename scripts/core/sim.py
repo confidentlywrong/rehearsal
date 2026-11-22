@@ -80,6 +80,30 @@ def _docker_compose_cmd():
     return ["docker", "compose", "-f", "docker-compose.yml"]
 
 
+def _parse_dotenv_line(raw_line: str) -> tuple[str, str] | None:
+    """Parse a single KEY=VALUE line from .env, stripping export, quotes, and inline comments."""
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export ") or line.startswith("export\t"):
+        line = line[len("export") :].strip()
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+        value = value[1:-1]
+    else:
+        for idx, ch in enumerate(value):
+            if ch == "#" and (idx == 0 or value[idx - 1].isspace()):
+                value = value[:idx].rstrip()
+                break
+    return key, value
+
+
 def _read_ports_from_env():
     """Read simulation *_PORT values from .env.
 
@@ -91,12 +115,10 @@ def _read_ports_from_env():
     try:
         with open(env_path) as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
+                parsed = _parse_dotenv_line(line)
+                if not parsed:
                     continue
-                if "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
+                key, value = parsed
                 if key.endswith("_PORT") and key not in _EXCLUDED_KEYS:
                     try:
                         ports.append(int(value))
@@ -116,16 +138,14 @@ def _read_redis_port_from_env():
     try:
         with open(env_path) as f:
             for line in f:
-                line = line.strip()
-                if line.startswith("REDIS_ADDR="):
-                    _, addr = line.split("=", 1)
+                parsed = _parse_dotenv_line(line)
+                if parsed and parsed[0] == "REDIS_ADDR":
+                    addr = parsed[1]
                     if ":" in addr:
                         return int(addr.rsplit(":", 1)[1])
     except (FileNotFoundError, ValueError):
         pass
     return 9102
-
-
 
 
 def _read_env_file_value(key, default):
@@ -134,9 +154,9 @@ def _read_env_file_value(key, default):
     try:
         with open(env_path) as f:
             for line in f:
-                line = line.strip()
-                if line.startswith(f"{key}="):
-                    return line.split("=", 1)[1]
+                parsed = _parse_dotenv_line(line)
+                if parsed and parsed[0] == key:
+                    return parsed[1]
     except FileNotFoundError:
         pass
     return default
@@ -154,8 +174,8 @@ def wait_for_infra():
     # Parse addresses
     def parse_addr(env_val, default_port):
         if ":" in env_val:
-            host, port = env_val.split(":")
-            return (host, int(port))
+            host, port = env_val.rsplit(":", 1)
+            return (host.strip("[]"), int(port))
         return (env_val, default_port)
 
     redis_addr = parse_addr(redis_env, 9102)
@@ -172,7 +192,7 @@ def wait_for_infra():
                 with socket.create_connection(addr, timeout=1):
                     connected = True
                     break
-            except (socket.timeout, ConnectionRefusedError):
+            except OSError:
                 time.sleep(1)
 
         if not connected:
@@ -180,18 +200,24 @@ def wait_for_infra():
             sys.exit(1)
 
         if addr == pg_addr:
-            import subprocess
+            compose_cmd = _docker_compose_cmd()
+            pg_ready = False
             for _ in range(30):
                 try:
                     result = subprocess.run(
-                        ["docker", "exec", "leadership-sim-postgres", "pg_isready", "-U", "postgres"],
-                        capture_output=True, timeout=5
+                        compose_cmd + ["exec", "-T", "postgres", "pg_isready", "-U", "postgres"],
+                        capture_output=True,
+                        timeout=5,
                     )
                     if result.returncode == 0:
+                        pg_ready = True
                         break
                 except (subprocess.TimeoutExpired, FileNotFoundError):
                     pass
                 time.sleep(1)
+            if not pg_ready:
+                print(f"❌ Timeout waiting for PostgreSQL readiness at {addr[0]}:{addr[1]} (pg_isready)")
+                sys.exit(1)
 
         print(f"  ✅ {addr[0]}:{addr[1]} is online.")
 
@@ -224,7 +250,10 @@ def preflight_infra():
         res = subprocess.run(["docker", "image", "inspect", img], capture_output=True)
         if res.returncode != 0:
             print(f"  ☁️ Pulling {img} from host context...")
-            subprocess.run(["docker", "pull", img])
+            pull_res = subprocess.run(["docker", "pull", img])
+            if pull_res.returncode != 0:
+                print(f"❌ Error: Failed to pull required image {img}")
+                sys.exit(pull_res.returncode)
 
     # 2. Prune stopped containers and dangling networks from previous sessions.
     # This prevents name conflicts (containers) and network limit exhaustion.
@@ -249,9 +278,6 @@ def preflight_infra():
     # 3. Start infrastructure independently to avoid honcho cascade
     print("🏗️ Starting infrastructure (Redis/PubSub)...")
 
-    # Clear any rogue host processes that might shadow container ports (e.g. Ollama on 11434)
-    kill_process_on_port(11434)
-
     # Pre-remove stale containers to prevent name conflicts.
     # docker-compose --force-recreate fails if a container with the same name
     # exists from a different compose project (e.g., a previous worktree run
@@ -263,16 +289,18 @@ def preflight_infra():
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
 
     # Pre-build the local Postgres image to avoid timeout during compose up
+    compose_cmd = _docker_compose_cmd()
     print("🔨 Pre-building local Postgres image...")
     try:
         subprocess.run(
-            ["docker", "compose", "build", "postgres"],
-            capture_output=True, check=True, timeout=120
+            compose_cmd + ["build", "postgres"],
+            capture_output=True,
+            check=True,
+            timeout=120,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print(f"   ⚠️ Postgres image pre-build failed: {e}")
 
-    compose_cmd = _docker_compose_cmd()
     result = subprocess.run(
         compose_cmd + ["up", "-d", "--force-recreate", "--remove-orphans"],
         capture_output=True,
@@ -430,12 +458,13 @@ def _run_honcho_with_logging(cmd, log_path=LOG_FILE):
             stderr=subprocess.STDOUT,
         )
         try:
-            for line in proc.stdout:
-                decoded = line.decode("utf-8", errors="replace")
-                sys.stdout.write(decoded)
-                sys.stdout.flush()
-                logfile.write(decoded)
-                logfile.flush()
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    decoded = line.decode("utf-8", errors="replace")
+                    sys.stdout.write(decoded)
+                    sys.stdout.flush()
+                    logfile.write(decoded)
+                    logfile.flush()
         except KeyboardInterrupt:
             print("\n🛑 Simulation stopped by user.")
             proc.terminate()
@@ -475,12 +504,18 @@ def kill_process_on_port(port: int):
     """Find and terminate processes listening on the given port.
 
     Skips Colima/Docker infrastructure processes. Handles PermissionError gracefully.
-    Escalates termination signal from SIGTERM to SIGKILL if process persists.
+    Terminates matching processes with SIGKILL.
     """
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError):
+        return
+    if not (0 <= port_int <= 65535):
+        return
     _INFRA_KEYWORDS = {"colima", "lima", "docker", "containerd", "vpnkit"}
     try:
-        cmd = f"lsof -ti :{port} -sTCP:LISTEN"
-        pids = subprocess.check_output(cmd, shell=True).decode().split()
+        cmd = ["lsof", "-ti", f":{port_int}", "-sTCP:LISTEN"]
+        pids = subprocess.check_output(cmd).decode().split()
         for pid in pids:
             try:
                 # Use lsof instead of ps to avoid macOS SIP blocks on /bin/ps
@@ -521,9 +556,8 @@ def stop():
     """Stops the simulation processes and infrastructure.
 
     Port list is read dynamically from .env so this works correctly for any
-    worktree slot. Infrastructure teardown is skipped for non-zero slots to
-    avoid killing shared containers -- each slot manages its own containers
-    via docker-compose override.
+    worktree slot. Tears down the slot's Docker Compose stack via
+    _docker_compose_cmd() and removes slot-scoped redis/pubsub containers.
     """
     print("🛑 Stopping simulation...")
 
@@ -598,14 +632,19 @@ def flush_redis():
     redis_password = _read_env_file_value("REDIS_PASSWORD", "")
     print(f"🗑️  Flushing Redis on port {redis_port}...")
 
-    auth_arg = f"-a '{redis_password}' " if redis_password else ""
-    # Try redis-cli first (fastest)
-    result = subprocess.run(
-        f"redis-cli -p {redis_port} {auth_arg}flushall",
-        shell=True,
-        capture_output=True,
-        text=True,
-    )
+    cmd_env = os.environ.copy()
+    if redis_password:
+        cmd_env["REDISCLI_AUTH"] = redis_password
+    # Try redis-cli first (fastest; avoid shell=True and CLI -a password exposure)
+    try:
+        result = subprocess.run(
+            ["redis-cli", "-p", str(redis_port), "flushall"],
+            env=cmd_env,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        result = subprocess.CompletedProcess(args=[], returncode=127, stdout="", stderr="redis-cli not found")
     if result.returncode == 0 and "OK" in result.stdout:
         print(f"  ✅ Redis flushed via redis-cli (port {redis_port})")
         return
@@ -641,35 +680,58 @@ def generate_protos():
         subprocess.run(["bash", proto_script], check=True)
     except subprocess.CalledProcessError as e:
         print(f"❌ Error: Protobuf generation failed: {e}")
-        # We don't exit here because older bindings might still work,
-        # but Go tests will likely fail later if they are missing.
+        sys.exit(e.returncode or 1)
 
 
 def test(include_slow=False):
-    """Runs all unit tests (Python and Go)."""
-    # 0. Check credentials
-    check_gcp_credentials()
-
+    """Runs all offline unit tests (Python and Go)."""
     # Ensure protos are generated before testing
     generate_protos()
 
     print("🧪 Running all unit tests...")
 
-    print("\n🐍 [Python] Testing agents and utils...")
+    print("\n🐍 [Python] Testing agents, scripts, and backfill...")
     # Always exclude integration tests -- they require the hermetic
     # docker-compose.test.yml stack (see Makefile:test-py-integration).
-    pytest_cmd = [".venv/bin/pytest", "agents"]
+    pytest_cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "agents",
+        "scripts/tests",
+        "scripts/deploy/deploy_test.py",
+        "infra/modules/cloud-sql-postgres/embedding_backfill_test.py",
+    ]
     marker = "not integration" if include_slow else "not slow and not integration"
     pytest_cmd.extend(["-m", marker])
     py_res = subprocess.run(pytest_cmd, check=False)
 
     print("\n🐹 [Go] Testing internal packages and gateway...")
-    go_res = subprocess.run(["go", "test", "./..."], check=False)
+    go_res = subprocess.run(["go", "test", "./...", "-short"], check=False)
 
     if py_res.returncode != 0 or go_res.returncode != 0:
         print("\n❌ Unit testing failed.")
         sys.exit(1)
     print("\n✅ All unit tests passed.")
+
+
+def test_integration():
+    """Runs integration tests (Python and Go) against docker-compose.test.yml."""
+    generate_protos()
+
+    print("🧪 Running integration tests...")
+    py_res = subprocess.run(
+        [sys.executable, "-m", "pytest", "agents", "-q", "-m", "integration", "-o", "addopts="],
+        check=False,
+    )
+    go_res = subprocess.run(
+        ["go", "test", "./...", "-count=1", "-run", "Integration|Relay"],
+        check=False,
+    )
+    if py_res.returncode != 0 or go_res.returncode != 0:
+        print("\n❌ Integration testing failed.")
+        sys.exit(1)
+    print("\n✅ All integration tests passed.")
 
 
 def _start_cli_parser():
@@ -741,11 +803,17 @@ def status():
 
     # Friendly service name mapping
     default_service_names = {
+        9100: "firebase-auth-emulator-ui",
         9101: "gateway",
         9102: "redis",
         9103: "pubsub",
         9104: "simulator",
+        9105: "planner",
+        9106: "planner_with_eval",
         9107: "simulator-with-failure",
+        9108: "runner",
+        9109: "planner_with_memory",
+        9110: "runner_autopilot",
         9111: "dash",
         9112: "tester",
         9113: "postgres",
@@ -769,16 +837,17 @@ def status():
         try:
             with open(env_path) as f:
                 for line in f:
-                    line = line.strip()
-                    if "=" in line and not line.startswith("#"):
-                        k, v = line.split("=", 1)
-                        if k.endswith("_PORT"):
-                            try:
-                                port_to_service[int(v)] = k.replace("_PORT", "").lower()
-                            except ValueError:
-                                pass
-        except Exception:
-            pass
+                    parsed = _parse_dotenv_line(line)
+                    if not parsed:
+                        continue
+                    k, v = parsed
+                    if k.endswith("_PORT"):
+                        try:
+                            port_to_service[int(v)] = k.replace("_PORT", "").lower()
+                        except ValueError:
+                            print(f"  ⚠️ Warning: Invalid port value for {k} in {env_path}: {v!r}")
+        except OSError as e:
+            print(f"  ⚠️ Warning: Could not read {env_path}: {e}")
 
     status_records = {}
     for port in sorted(set(ports)):
@@ -787,10 +856,10 @@ def status():
         pids = []
         if in_use:
             try:
-                cmd = f"lsof -ti :{port} -sTCP:LISTEN"
-                out = subprocess.check_output(cmd, shell=True, timeout=2).decode().split()
+                cmd = ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"]
+                out = subprocess.check_output(cmd, timeout=2).decode().split()
                 pids = out
-            except Exception:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
                 pids = []
             status_str = f"ACTIVE (PID: {', '.join(pids)})" if pids else "ACTIVE"
             print(f"  ✅ Port {port:5d} [{svc_name:30s}]: {status_str}")

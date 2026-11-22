@@ -90,7 +90,7 @@ The agent supports three model backends, selected via environment variables:
 
 | Backend | Model | Use case |
 |:--------|:------|:---------|
-| Gemini (default) | `gemini-3.1-flash-lite-preview` | Production, Vertex AI |
+| Gemini (default) | `gemini-3.5-flash-lite` | Production, Vertex AI |
 | Ollama | `gemma4:e2b` via litellm | Local development |
 | vLLM | `gemma-4-E4B-it` via litellm | GKE self-hosted |
 
@@ -112,9 +112,9 @@ The agent is optimized for hundreds of concurrent instances:
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `RUNNER_PORT` | `8207` | HTTP listen port |
+| `PORT` / `RUNNER_PORT` | `9108` | HTTP listen port |
 | `AGENT_NAME` | `runner` | Agent name (use `runner_gke` for GKE) |
-| `RUNNER_MODEL` | `gemini-3.1-flash-lite-preview` | Model identifier (e.g., `ollama_chat/gemma4:e2b` for Ollama) |
+| `RUNNER_MODEL` | `gemini-3.5-flash-lite` | Model identifier (e.g., `ollama_chat/gemma4:e2b` for Ollama) |
 | `VLLM_API_URL` | -- | vLLM endpoint (sets `OPENAI_API_BASE` for litellm) |
 
 ## File layout

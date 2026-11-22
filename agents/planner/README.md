@@ -101,7 +101,7 @@ extended variants build on top of it:
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `PLANNER_PORT` | `8204` | HTTP listen port |
+| `PORT` / `PLANNER_PORT` | `9105` | HTTP listen port |
 | `GOOGLE_CLOUD_LOCATION` | `global` | Gemini API endpoint |
 | `GOOGLE_CLOUD_PROJECT` | -- | GCP project (enables Maps MCP tools) |
 | `GOOGLE_MAPS_API_KEY` | -- | Maps API key (env var or Secret Manager) |

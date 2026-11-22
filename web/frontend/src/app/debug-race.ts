@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: track and cancel startup timeouts on stop/restart, guard race generation, and validate count/speed inputs.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +38,8 @@ interface RunnerState {
 
 let _states: RunnerState[] = [];
 let _tickTimer: ReturnType<typeof setInterval> | null = null;
+let _startTimers: ReturnType<typeof setTimeout>[] = [];
+let _raceGeneration = 0;
 let _running = false;
 let _speedMultiplier = 1;
 
@@ -44,16 +48,21 @@ function uid(): string {
 }
 
 function dispatch(type: string, detail?: any): void {
+  if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent(type, detail !== undefined ? { detail } : undefined));
 }
 
 export function startDebugRace(count: number, speed = 1): void {
   stopDebugRace();
+  if (!Number.isFinite(count) || count <= 0) return;
+  const safeCount = Math.min(200, Math.floor(count));
+  if (safeCount <= 0) return;
   _states = [];
   _running = true;
-  _speedMultiplier = speed;
+  _speedMultiplier = Number.isFinite(speed) && speed > 0 ? Math.min(100, speed) : 1;
+  const gen = _raceGeneration;
 
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < safeCount; i++) {
     const id = uid();
     _states.push({
       id,
@@ -65,10 +74,10 @@ export function startDebugRace(count: number, speed = 1): void {
     });
   }
 
-  emulateSpawnAndStart();
+  emulateSpawnAndStart(gen);
 }
 
-function emulateSpawnAndStart(): void {
+function emulateSpawnAndStart(gen: number): void {
   for (const s of _states) {
     dispatch('hud:addSimRunner', {
       guid: s.guid,
@@ -78,27 +87,32 @@ function emulateSpawnAndStart(): void {
     });
   }
 
-  setTimeout(() => {
-    if (!_running) return;
-    for (const s of _states) {
-      dispatch('hud:updateSimRunner', {
-        guid: s.guid,
-        velocity: s.velocity,
-        water: s.water,
-        _fromGateway: true,
-      });
-    }
-    _tickTimer = setInterval(tick, TICK_INTERVAL_MS);
-  }, 500);
+  _startTimers.push(
+    setTimeout(() => {
+      if (!_running || gen !== _raceGeneration) return;
+      for (const s of _states) {
+        dispatch('hud:updateSimRunner', {
+          guid: s.guid,
+          velocity: s.velocity,
+          water: s.water,
+          _fromGateway: true,
+        });
+      }
+      if (_tickTimer) clearInterval(_tickTimer);
+      _tickTimer = setInterval(tick, TICK_INTERVAL_MS);
+    }, 500),
+  );
 
-  setTimeout(() => {
-    if (!_running) return;
-    dispatch('sim:raceStarted', {
-      speedMultiplier: _speedMultiplier,
-      simDistanceIntegrator: SIM_DISTANCE_INTEGRATOR,
-      _debugRace: true,
-    });
-  }, 1500);
+  _startTimers.push(
+    setTimeout(() => {
+      if (!_running || gen !== _raceGeneration) return;
+      dispatch('sim:raceStarted', {
+        speedMultiplier: _speedMultiplier,
+        simDistanceIntegrator: SIM_DISTANCE_INTEGRATOR,
+        _debugRace: true,
+      });
+    }, 1500),
+  );
 }
 
 function tick(): void {
@@ -150,7 +164,12 @@ function tick(): void {
 }
 
 export function stopDebugRace(): void {
+  _raceGeneration++;
   _running = false;
+  for (const timer of _startTimers) {
+    clearTimeout(timer);
+  }
+  _startTimers = [];
   if (_tickTimer) {
     clearInterval(_tickTimer);
     _tickTimer = null;

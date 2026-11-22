@@ -64,44 +64,53 @@ func RequestLogger() gin.HandlerFunc {
 		c.Set("request_id", id)
 		c.Header(requestIDHeader, id)
 
+		defer func() {
+			latencyMs := time.Since(start).Milliseconds()
+			status := c.Writer.Status()
+
+			// Pull the logger AFTER c.Next() so we capture tenant attrs
+			// that the tenant middleware injected during the handler.
+			logger := logging.FromContext(c.Request.Context())
+
+			level := slog.LevelInfo
+			switch {
+			case status >= http.StatusInternalServerError:
+				level = slog.LevelError
+			case status >= http.StatusBadRequest:
+				level = slog.LevelWarn
+			}
+
+			// gin collects per-request errors via c.Error(); surface them
+			// as a single comma-joined string when present.
+			var errStr string
+			if len(c.Errors) > 0 {
+				errStr = c.Errors.String()
+			}
+
+			reqPath := ""
+			rawQuery := ""
+			if c.Request.URL != nil {
+				reqPath = c.Request.URL.Path
+				rawQuery = c.Request.URL.RawQuery
+			}
+
+			attrs := []any{
+				slog.String("method", c.Request.Method),
+				slog.String("path", reqPath),
+				slog.Int("status", status),
+				slog.Int64("latency_ms", latencyMs),
+				slog.String("client_ip", c.ClientIP()),
+			}
+			if rawQuery != "" {
+				attrs = append(attrs, slog.String("query", sanitizeQuery(rawQuery)))
+			}
+			if errStr != "" {
+				attrs = append(attrs, slog.String("error", errStr))
+			}
+			logger.Log(c.Request.Context(), level, "http.request", attrs...)
+		}()
+
 		c.Next()
-
-		latencyMs := time.Since(start).Milliseconds()
-		status := c.Writer.Status()
-
-		// Pull the logger AFTER c.Next() so we capture tenant attrs
-		// that the tenant middleware injected during the handler.
-		logger := logging.FromContext(c.Request.Context())
-
-		level := slog.LevelInfo
-		switch {
-		case status >= http.StatusInternalServerError:
-			level = slog.LevelError
-		case status >= http.StatusBadRequest:
-			level = slog.LevelWarn
-		}
-
-		// gin collects per-request errors via c.Error(); surface them
-		// as a single comma-joined string when present.
-		var errStr string
-		if len(c.Errors) > 0 {
-			errStr = c.Errors.String()
-		}
-
-		attrs := []any{
-			slog.String("method", c.Request.Method),
-			slog.String("path", c.Request.URL.Path),
-			slog.Int("status", status),
-			slog.Int64("latency_ms", latencyMs),
-			slog.String("client_ip", c.ClientIP()),
-		}
-		if c.Request.URL.RawQuery != "" {
-			attrs = append(attrs, slog.String("query", c.Request.URL.RawQuery))
-		}
-		if errStr != "" {
-			attrs = append(attrs, slog.String("error", errStr))
-		}
-		logger.Log(c.Request.Context(), level, "http.request", attrs...)
 	}
 }
 
@@ -127,7 +136,7 @@ func isSafeRequestID(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if r <= 0x20 || r >= 0x7f {
 			return false
 		}
 	}

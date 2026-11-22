@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -171,10 +170,14 @@ func initMeHandler(store meStore) gin.HandlerFunc {
 			return
 		}
 		var body req
-		if c.Request.ContentLength > 0 {
-			if err := json.NewDecoder(c.Request.Body).Decode(&body); err != nil {
-				log.Printf("/me/init: ignoring malformed JSON body: %v", err)
+		if err := decodeStrictJSON(c, &body, 1<<20, true); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
 			}
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid_json", "hint": err.Error()})
+			return
 		}
 
 		ctx := c.Request.Context()
@@ -209,10 +212,7 @@ func initMeHandler(store meStore) gin.HandlerFunc {
 			emailWasSynthetic = true
 		}
 
-		displayName := strings.TrimSpace(body.DisplayName)
-		if len(displayName) > maxDisplayNameLen {
-			displayName = displayName[:maxDisplayNameLen]
-		}
+		displayName := sanitizeAndTruncateRunes(strings.TrimSpace(body.DisplayName), maxDisplayNameLen)
 		timezone := strings.TrimSpace(body.Timezone)
 		if timezone != "" {
 			// Reject obviously bad zones; the store will accept
@@ -241,6 +241,12 @@ func initMeHandler(store meStore) gin.HandlerFunc {
 			// than the marginal enumeration risk (the same
 			// signal leaks via the Firebase sign-up endpoint
 			// anyway).
+			if errors.Is(err, account.ErrAccountDeleted) {
+				c.AbortWithStatusJSON(http.StatusGone, gin.H{
+					"error": "account_deleted",
+				})
+				return
+			}
 			if errors.Is(err, account.ErrEmailTaken) {
 				c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 					"error": "email_taken",
@@ -481,13 +487,15 @@ func deleteAccountHandler(store meStore) gin.HandlerFunc {
 		if err := store.SoftDeleteUser(c.Request.Context(), uc.UserID); err != nil {
 			if errors.Is(err, account.ErrNotFound) {
 				// Firebase-authenticated but never inited — no
-				// server-side row to delete. Treat as success.
+				// server-side row to delete. Clear the session cookie and treat as success.
+				clearSessionCookie(c)
 				c.Status(http.StatusNoContent)
 				return
 			}
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "delete_failed"})
 			return
 		}
+		clearSessionCookie(c)
 		recordAuditBestEffort(c, account.AuditEntry{
 			UserID: uc.UserID,
 			Action: account.ActionUserErased,

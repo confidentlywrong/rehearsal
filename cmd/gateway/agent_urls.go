@@ -79,7 +79,7 @@ func validateAgentURL(rawURL string, inCloud bool, lookupIP func(string) ([]net.
 
 	// Hard-block GCP metadata aliases by name before DNS, so a
 	// /etc/hosts entry can't shadow the check.
-	lowerHost := strings.ToLower(host)
+	lowerHost := strings.TrimSuffix(strings.ToLower(host), ".")
 	if lowerHost == "metadata.google.internal" || lowerHost == "metadata" {
 		return fmt.Errorf("host %q is the GCP metadata alias", host)
 	}

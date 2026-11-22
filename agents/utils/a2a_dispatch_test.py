@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +20,7 @@ import pytest
 from google.adk.agents import LlmAgent
 from google.adk.apps import App
 from agents.utils.a2a import prepare_simulation_agent
+from agents.utils.models import DEFAULT_PLANNER_MODEL
 
 
 @pytest.fixture
@@ -25,7 +28,7 @@ def test_app():
     """Create a minimal real App for prepare_simulation_agent."""
     agent = LlmAgent(
         name="dispatch_test",
-        model="gemini-3-flash-preview",
+        model=DEFAULT_PLANNER_MODEL,
         description="Test agent for dispatch extension tests.",
         instruction="You are a test agent.",
     )

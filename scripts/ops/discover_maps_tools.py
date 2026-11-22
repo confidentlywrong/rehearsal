@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: guard missing Available Tools heading and use explicit UTF-8 encoding.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,11 +32,11 @@ import os
 import re
 import sys
 
-from agents.planner.adk_tools import _MAPS_MCP_DISPLAY_NAME, _strip_adc_headers, header_provider
-from google.adk.integrations.agent_registry import AgentRegistry
-
 
 async def main() -> int:
+    from agents.planner.adk_tools import _MAPS_MCP_DISPLAY_NAME, _normalize_maps_toolset, header_provider
+    from google.adk.integrations.agent_registry import AgentRegistry
+
     project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
     maps_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
 
@@ -60,7 +62,7 @@ async def main() -> int:
         print(f"ERROR: Maps MCP server ({_MAPS_MCP_DISPLAY_NAME}) not found in Agent Registry", file=sys.stderr)
         return 2
 
-    toolset = _strip_adc_headers(registry.get_mcp_toolset(mcp_server_name=mcp_server_name))
+    toolset = _normalize_maps_toolset(registry.get_mcp_toolset(mcp_server_name=mcp_server_name))
 
     # Resolve tools from MCP server
     tools = await toolset.get_tools()
@@ -70,19 +72,18 @@ async def main() -> int:
     actual_names = set()
     for tool in tools:
         name = tool.name if hasattr(tool, "name") else type(tool).__name__
-        desc = getattr(tool, "description", "")[:60]
+        desc = (getattr(tool, "description", None) or "")[:60]
         print(f"{name:<40} {desc}")
         actual_names.add(name)
 
-    # Compare against SKILL.md
+    # Extract backtick-quoted tool names from the "## Available Tools" section of SKILL.md.
     skill_path = os.path.join(
         os.path.dirname(__file__), "..", "..", "agents", "planner", "skills", "mapping", "SKILL.md"
     )
-    with open(skill_path) as f:
+    with open(skill_path, encoding="utf-8") as f:
         content = f.read()
 
-    # Extract backtick-quoted tool names from SKILL.md
-    documented = set(re.findall(r"`(\w+)`", content.split("## Available Tools")[-1]))
+    documented = extract_documented_tools(content)
 
     print(f"\nDocumented in SKILL.md: {sorted(documented)}")
     print(f"Actual from MCP server: {sorted(actual_names)}")
@@ -102,6 +103,18 @@ async def main() -> int:
 
     print("\nPASS: All documented tools exist on the MCP server.")
     return 0
+
+
+def extract_documented_tools(content: str) -> set[str]:
+    """Return backtick-quoted tool names under the '## Available Tools' section."""
+    marker = "## Available Tools"
+    if marker not in content:
+        return set()
+    section = content.split(marker, 1)[1]
+    next_heading = re.search(r"^##\s+", section, re.MULTILINE)
+    if next_heading:
+        section = section[: next_heading.start()]
+    return set(re.findall(r"`(\w+)`", section))
 
 
 if __name__ == "__main__":

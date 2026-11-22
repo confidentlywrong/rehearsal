@@ -30,7 +30,10 @@ Environment variables
     Seconds between ticks (default **10**).
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 
 def _nearest_divisor(duration: int, tick_interval: int) -> int:
@@ -41,18 +44,40 @@ def _nearest_divisor(duration: int, tick_interval: int) -> int:
     """
     for candidate in range(tick_interval, 0, -1):
         if duration % candidate == 0:
+            if candidate != tick_interval:
+                logger.warning(
+                    "sim_defaults: adjusted tick_interval from %ds to %ds to evenly divide duration=%ds",
+                    tick_interval,
+                    candidate,
+                    duration,
+                )
             return candidate
     return 1  # pragma: no cover – 1 always divides anything
 
 
-_raw_duration = int(os.environ.get("SIM_DEFAULT_DURATION_SECONDS", "120"))
-_raw_tick = int(os.environ.get("SIM_DEFAULT_TICK_INTERVAL_SECONDS", "10"))
+def _safe_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("sim_defaults: invalid integer for %s=%r; using default %d", name, raw, default)
+        return default
+    if parsed < 1:
+        logger.warning("sim_defaults: non-positive %s=%d; using default %d", name, parsed, default)
+        return default
+    return parsed
+
+
+_raw_duration = _safe_positive_int_env("SIM_DEFAULT_DURATION_SECONDS", 120)
+_raw_tick = _safe_positive_int_env("SIM_DEFAULT_TICK_INTERVAL_SECONDS", 10)
 
 DEFAULT_DURATION_SECONDS: int = _raw_duration
 DEFAULT_TICK_INTERVAL_SECONDS: int = _nearest_divisor(_raw_duration, _raw_tick)
 DEFAULT_MAX_TICKS: int = DEFAULT_DURATION_SECONDS // DEFAULT_TICK_INTERVAL_SECONDS
 
-DEFAULT_RUNNER_COUNT: int = int(os.environ.get("SIM_DEFAULT_RUNNER_COUNT", "1000"))
+DEFAULT_RUNNER_COUNT: int = _safe_positive_int_env("SIM_DEFAULT_RUNNER_COUNT", 1000)
 
 # L5: Standard marathon distance used as the default race_distance_mi across
 # the simulator, runners, and planners.  Centralised here so future callers

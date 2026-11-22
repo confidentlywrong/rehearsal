@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +32,8 @@ Three-phase state machine per LoopAgent iteration:
 """
 
 import logging
+import math
+from typing import Any
 
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
@@ -37,6 +41,23 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Coerce tick/count state values to int safely for logging & formatting."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(num) if math.isfinite(num) else default
 
 
 def _function_call(name: str) -> LlmResponse:
@@ -76,6 +97,16 @@ def _detect_phase(llm_request: LlmRequest) -> str:
     for part in reversed(last.parts or []):
         if part.function_response is not None:
             name = part.function_response.name
+            response_dict = part.function_response.response
+            if isinstance(response_dict, dict) and (
+                response_dict.get("status") == "error"
+                or ("error" in response_dict and "status" not in response_dict)
+            ):
+                msg = response_dict.get("message") or response_dict.get("error")
+                tool_name = str(name or "unknown")
+                logger.error("tick_callback: tool %s failed with %s", tool_name, msg)
+                return f"error::{tool_name}::{msg or 'unknown error'}"
+
             if name == "advance_tick":
                 return "check"
             if name == "check_race_complete":
@@ -99,10 +130,17 @@ def tick_callback(
     gateway.  Only the *decision* is deterministic.
     """
     phase = _detect_phase(llm_request)
+    tick = _safe_int(callback_context.state.get("current_tick"), 0)
+    max_ticks = _safe_int(callback_context.state.get("max_ticks"), 0)
+
+    if phase.startswith("error::"):
+        _, failed_tool, failure_msg = phase.split("::", 2)
+        actions = getattr(callback_context, "actions", None)
+        if actions is not None:
+            actions.escalate = True
+        return _text(f"Tick {tick}/{max_ticks} aborted: {failed_tool} failed ({failure_msg}).")
 
     if phase == "advance":
-        tick = callback_context.state.get("current_tick", 0)
-        max_ticks = callback_context.state.get("max_ticks", 0)
         logger.debug("tick_callback: ADVANCE phase, tick %d/%d", tick, max_ticks)
         return _function_call("advance_tick")
 
@@ -111,7 +149,5 @@ def tick_callback(
         return _function_call("check_race_complete")
 
     # SUMMARIZE: both tools done, end this LoopAgent iteration
-    tick = callback_context.state.get("current_tick", 0)
-    max_ticks = callback_context.state.get("max_ticks", 0)
     logger.debug("tick_callback: SUMMARIZE phase, tick %d/%d", tick, max_ticks)
     return _text(f"Tick {tick}/{max_ticks} complete.")

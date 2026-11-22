@@ -14,6 +14,8 @@
 
 /**
  * Copyright 2026 Google LLC. Apache-2.0.
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: URL-encode memory path parameters, unwrap upload document wrapper, and guard malformed 2xx XHR JSON responses.
  *
  * MemoryService — typed HTTP client for /api/v1/memory/*.
  *
@@ -114,7 +116,7 @@ export class MemoryService {
   }
 
   async getAnalysis(analysisId: string): Promise<Analysis> {
-    const resp = await fetch(`${BASE}/analyses/${analysisId}`, {
+    const resp = await fetch(`${BASE}/analyses/${encodeURIComponent(analysisId)}`, {
       method: 'GET',
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
@@ -123,7 +125,7 @@ export class MemoryService {
   }
 
   async deleteAnalysis(analysisId: string): Promise<void> {
-    const resp = await fetch(`${BASE}/analyses/${analysisId}`, {
+    const resp = await fetch(`${BASE}/analyses/${encodeURIComponent(analysisId)}`, {
       method: 'DELETE',
       credentials: 'same-origin',
     });
@@ -134,7 +136,7 @@ export class MemoryService {
   // --- documents ---------------------------------------------------
 
   async listDocuments(analysisId: string): Promise<MemoryDocument[]> {
-    const resp = await fetch(`${BASE}/analyses/${analysisId}/documents`, {
+    const resp = await fetch(`${BASE}/analyses/${encodeURIComponent(analysisId)}/documents`, {
       method: 'GET',
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
@@ -144,10 +146,13 @@ export class MemoryService {
   }
 
   async deleteDocument(analysisId: string, documentId: string): Promise<void> {
-    const resp = await fetch(`${BASE}/analyses/${analysisId}/documents/${documentId}`, {
-      method: 'DELETE',
-      credentials: 'same-origin',
-    });
+    const resp = await fetch(
+      `${BASE}/analyses/${encodeURIComponent(analysisId)}/documents/${encodeURIComponent(documentId)}`,
+      {
+        method: 'DELETE',
+        credentials: 'same-origin',
+      },
+    );
     await parseOrThrow<void>(resp);
   }
 
@@ -168,12 +173,27 @@ export class MemoryService {
 
     const xhr = new XMLHttpRequest();
     let aborted = false;
+    let opened = false;
+    let settled = false;
+    let rejectPromise!: (reason?: unknown) => void;
+
+    const settleResolve = (resolve: (value: MemoryDocument) => void, doc: MemoryDocument): void => {
+      if (settled) return;
+      settled = true;
+      resolve(doc);
+    };
+    const settleReject = (err: unknown): void => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(err);
+    };
 
     const promise = new Promise<MemoryDocument>((resolve, reject) => {
+      rejectPromise = reject;
       (async () => {
         try {
           const token = await this.auth.getAppCheckToken();
-          if (aborted) return;
+          if (aborted || settled) return;
 
           if (onProgress) {
             xhr.upload.addEventListener('progress', (ev) => {
@@ -184,7 +204,28 @@ export class MemoryService {
           }
           xhr.addEventListener('load', () => {
             if (xhr.status >= 200 && xhr.status < 300) {
-              resolve(JSON.parse(xhr.responseText));
+              try {
+                const parsed = JSON.parse(xhr.responseText);
+                const baseDoc = (
+                  parsed &&
+                  typeof parsed === 'object' &&
+                  'document' in parsed &&
+                  parsed.document
+                    ? parsed.document
+                    : parsed
+                ) as MemoryDocument;
+                const warning =
+                  parsed &&
+                  typeof parsed === 'object' &&
+                  typeof parsed.warning === 'string' &&
+                  parsed.warning.trim()
+                    ? parsed.warning.trim()
+                    : undefined;
+                const doc: MemoryDocument = warning ? { ...baseDoc, warning } : baseDoc;
+                settleResolve(resolve, doc);
+              } catch {
+                settleReject(new MemoryApiError(xhr.status, 'invalid_json', 'Malformed response JSON'));
+              }
             } else {
               let code = 'http_error';
               let detail;
@@ -193,24 +234,25 @@ export class MemoryService {
                 if (body.error) code = body.error;
                 if (body.detail) detail = body.detail;
               } catch { /* non-JSON error body — fall through with default code */ }
-              reject(new MemoryApiError(xhr.status, code, detail));
+              settleReject(new MemoryApiError(xhr.status, code, detail));
             }
           });
           xhr.addEventListener('error', () => {
-            reject(new MemoryApiError(0, 'network_error'));
+            settleReject(new MemoryApiError(0, 'network_error'));
           });
           xhr.addEventListener('abort', () => {
             aborted = true;
-            reject(new MemoryApiError(0, 'aborted'));
+            settleReject(new MemoryApiError(0, 'aborted', 'Upload cancelled.'));
           });
-          xhr.open('POST', `${BASE}/analyses/${analysisId}/documents`);
+          xhr.open('POST', `${BASE}/analyses/${encodeURIComponent(analysisId)}/documents`);
+          opened = true;
           xhr.withCredentials = true;
           if (token) {
             xhr.setRequestHeader('X-Firebase-AppCheck', token);
           }
           xhr.send(form);
         } catch (err) {
-          reject(err);
+          settleReject(err);
         }
       })();
     });
@@ -218,7 +260,13 @@ export class MemoryService {
     return {
       promise,
       cancel: () => {
-        if (!aborted) xhr.abort();
+        if (aborted || settled) return;
+        aborted = true;
+        if (opened) {
+          xhr.abort();
+        } else {
+          settleReject(new MemoryApiError(0, 'aborted', 'Upload cancelled.'));
+        }
       },
     };
   }

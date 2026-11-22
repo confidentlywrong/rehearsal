@@ -135,14 +135,14 @@ stripped before proxying to the dev server.
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` | `8080` | HTTP listen port (set to `8502` via `.env`) |
+| `PORT` | `8080` | HTTP listen port (set to `9118` via `.env`) |
 | `GATEWAY_INTERNAL_URL` | -- | Internal gateway URL (highest priority) |
-| `GATEWAY_URL` | `http://localhost:8101` | Gateway URL (fallback) |
+| `GATEWAY_URL` | `http://127.0.0.1:9101` | Gateway URL (fallback) |
 | `IAP_CLIENT_ID` | -- | OAuth client ID for OIDC token generation |
 | `FRONTEND_DEV_URL` | -- | Angular dev server URL (enables dev proxy) |
 
 Gateway URL resolution: `GATEWAY_INTERNAL_URL` > `GATEWAY_URL` >
-`http://localhost:8101`.
+`http://127.0.0.1:9101`.
 
 ## File layout
 

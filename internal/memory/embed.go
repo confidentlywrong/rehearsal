@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -24,7 +25,6 @@ const TargetVectorDimension = 3072
 // vertexEmbeddingModel is the Vertex AI model used for RAG embeddings.
 const vertexEmbeddingModel = "gemini-embedding-001"
 
-
 // vertexMaxBatchSize is the maximum number of texts per predict call.
 const vertexMaxBatchSize = 100
 
@@ -42,12 +42,21 @@ type VertexEmbedder struct {
 // cloud-platform scope. Returns an error if ADC cannot be found (the
 // caller should degrade gracefully).
 func NewVertexEmbedder(projectID, region string) (*VertexEmbedder, error) {
+	projectID = strings.TrimSpace(projectID)
+	region = strings.TrimSpace(region)
+	if projectID == "" || strings.ContainsAny(projectID, "/?#") {
+		return nil, errors.New("memory: vertex embedder: invalid projectID")
+	}
+	if region == "" || strings.ContainsAny(region, "/?#") {
+		return nil, errors.New("memory: vertex embedder: invalid region")
+	}
 	ctx := context.Background()
 	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
 		return nil, fmt.Errorf("memory: vertex embedder: ADC: %w", err)
 	}
 	client := &http.Client{
+		Timeout: 60 * time.Second,
 		Transport: &oauth2.Transport{
 			Source: creds.TokenSource,
 			Base:   http.DefaultTransport,
@@ -126,6 +135,9 @@ type vertexEmbeddings struct {
 // callPredict sends one batch of texts to the Vertex AI predict
 // endpoint and returns the resulting embeddings.
 func (e *VertexEmbedder) callPredict(ctx context.Context, texts []string) ([][]float32, error) {
+	if e == nil || e.client == nil {
+		return nil, errors.New("memory: vertex embedder not initialized")
+	}
 	instances := make([]vertexInstance, len(texts))
 	for i, t := range texts {
 		instances[i] = vertexInstance{Content: t}
@@ -151,11 +163,20 @@ func (e *VertexEmbedder) callPredict(ctx context.Context, texts []string) ([][]f
 		return nil, fmt.Errorf("memory: embedder: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	var result vertexPredictResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("memory: embedder: decode: %w", err)
+	}
+	if len(result.Predictions) != len(texts) {
+		return nil, fmt.Errorf("memory: embedder: prediction count mismatch: got %d, want %d", len(result.Predictions), len(texts))
 	}
 	out := make([][]float32, len(result.Predictions))
 	for i, p := range result.Predictions {
+		if len(p.Embeddings.Values) != TargetVectorDimension {
+			return nil, fmt.Errorf("memory: embedder: prediction[%d] dimension %d != %d", i, len(p.Embeddings.Values), TargetVectorDimension)
+		}
+		if !hasValidEmbeddingNorm(p.Embeddings.Values, TargetVectorDimension) {
+			return nil, fmt.Errorf("memory: embedder: prediction[%d] embedding must be finite and non-zero", i)
+		}
 		out[i] = p.Embeddings.Values
 	}
 	return out, nil
@@ -204,10 +225,10 @@ func NormalizeAndPadVector(vec []float32, targetDim int) []float32 {
 		}
 		sumSq += f * f
 	}
-	norm := float32(math.Sqrt(sumSq))
-	if norm > 1e-12 && !math.IsNaN(float64(norm)) && !math.IsInf(float64(norm), 0) {
+	norm := math.Sqrt(sumSq)
+	if norm > 1e-12 && !math.IsNaN(norm) && !math.IsInf(norm, 0) {
 		for i := 0; i < limit; i++ {
-			out[i] = vec[i] / norm
+			out[i] = float32(float64(vec[i]) / norm)
 		}
 	}
 	return out
@@ -263,26 +284,49 @@ func (e *LocalGemmaEmbedder) EmbedText(ctx context.Context, text string) ([]floa
 // EmbedBatch embeds multiple texts using Ollama's /api/embed batch endpoint,
 // falling back to /api/embeddings if needed, and normalizes/pads each vector to 3072.
 func (e *LocalGemmaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	if e == nil || e.client == nil {
+		return nil, errors.New("memory: local embedder not initialized")
+	}
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	endpoint, model := localai.DefaultEndpoint, localai.DefaultEmbedModel
+	var ep, m string
 	if e.endpointProvider != nil {
-		ep, m := e.endpointProvider()
-		if strings.TrimSpace(ep) != "" {
-			endpoint = strings.TrimSpace(ep)
-		}
-		if strings.TrimSpace(m) != "" {
-			model = strings.TrimSpace(m)
-		}
+		ep, m = e.endpointProvider()
+	}
+	return e.embedBatchWithConfig(ctx, ep, m, texts)
+}
+
+func (e *LocalGemmaEmbedder) embedBatchWithConfig(ctx context.Context, rawEndpoint, rawModel string, texts []string) ([][]float32, error) {
+	if e == nil || e.client == nil {
+		return nil, errors.New("memory: local embedder not initialized")
+	}
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	endpoint := localai.DefaultEndpoint
+	if strings.TrimSpace(rawEndpoint) != "" {
+		endpoint = strings.TrimSpace(rawEndpoint)
+	}
+	model := localai.DefaultEmbedModel
+	modelExplicit := false
+	if strings.TrimSpace(rawModel) != "" {
+		model = strings.TrimSpace(rawModel)
+		modelExplicit = true
 	}
 	cleanEndpoint, err := localai.ValidateLocalEndpoint(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("memory: local embedder invalid endpoint: %w", err)
 	}
-	fetchEndpoint := localai.ResolveIPv4Endpoint(cleanEndpoint)
+	fetchEndpoint, err := localai.ResolveIPv4EndpointValidated(cleanEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("memory: local embedder invalid endpoint: %w", err)
+	}
 	cleanModel := localai.StripModelPrefix(model)
 	if cleanModel == "" {
+		if modelExplicit {
+			return nil, fmt.Errorf("memory: local embedder: empty model name (%q)", model)
+		}
 		cleanModel = localai.DefaultEmbedModel
 	}
 
@@ -302,6 +346,9 @@ func (e *LocalGemmaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([]
 }
 
 func (e *LocalGemmaEmbedder) embedBatchChunk(ctx context.Context, endpoint, model string, texts []string) ([][]float32, error) {
+	if e == nil || e.client == nil {
+		return nil, errors.New("memory: local embedder not initialized")
+	}
 	reqBody, err := json.Marshal(ollamaEmbedRequest{
 		Model: model,
 		Input: texts,
@@ -323,6 +370,12 @@ func (e *LocalGemmaEmbedder) embedBatchChunk(ctx context.Context, endpoint, mode
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		lower := strings.ToLower(string(body))
+		if strings.Contains(lower, "model") && strings.Contains(lower, "not found") {
+			return nil, fmt.Errorf("memory: local embedder HTTP 404: %s", string(body))
+		}
 		// Fallback to legacy /api/embeddings for older Ollama daemons
 		return e.embedLegacy(ctx, endpoint, model, texts)
 	}
@@ -332,7 +385,7 @@ func (e *LocalGemmaEmbedder) embedBatchChunk(ctx context.Context, endpoint, mode
 	}
 
 	var parsed ollamaEmbedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("memory: local embedder decode: %w", err)
 	}
 	if len(parsed.Embeddings) != len(texts) {
@@ -371,7 +424,7 @@ func (e *LocalGemmaEmbedder) embedLegacy(ctx context.Context, endpoint, model st
 			return nil, fmt.Errorf("memory: local legacy embedder HTTP %d: %s", resp.StatusCode, string(b))
 		}
 		var parsed ollamaLegacyEmbedResponse
-		err = json.NewDecoder(resp.Body).Decode(&parsed)
+		err = json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&parsed)
 		resp.Body.Close()
 		if err != nil {
 			return nil, err
@@ -395,31 +448,45 @@ type DynamicEmbedder struct {
 // NewDynamicEmbedder creates an Embedder that switches between Cloud Vertex AI and
 // Local Google embeddinggemma at runtime based on the user's AI Engine settings.
 func NewDynamicEmbedder(aiManager *localai.Manager, vertex *VertexEmbedder) *DynamicEmbedder {
-	local := NewLocalGemmaEmbedder(func() (string, string) {
-		if aiManager == nil {
-			return localai.DefaultEndpoint, localai.DefaultEmbedModel
-		}
-		cfg := aiManager.GetConfig()
-		return cfg.Endpoint, cfg.EmbedModel
-	})
 	return &DynamicEmbedder{
 		aiManager: aiManager,
 		vertex:    vertex,
-		local:     local,
+		local:     NewLocalGemmaEmbedder(nil),
 	}
 }
 
-func (d *DynamicEmbedder) useLocal() bool {
-	if d.aiManager != nil {
-		return d.aiManager.GetConfig().Provider == localai.ProviderLocalGemma
+func (d *DynamicEmbedder) resolveConfig() (localai.Config, error) {
+	if d.aiManager == nil {
+		return localai.Config{Provider: localai.ProviderCloudGemini}, nil
 	}
-	return d.vertex == nil
+	cfg, err := d.aiManager.LoadConfig()
+	if err != nil {
+		return localai.Config{}, fmt.Errorf("memory: load AI settings: %w", err)
+	}
+	return cfg, nil
 }
 
 // EmbedText delegates to either LocalGemmaEmbedder or VertexEmbedder.
 func (d *DynamicEmbedder) EmbedText(ctx context.Context, text string) ([]float32, error) {
-	if d.useLocal() {
-		return d.local.EmbedText(ctx, text)
+	if d == nil {
+		return nil, errors.New("memory: nil DynamicEmbedder")
+	}
+	cfg, err := d.resolveConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Provider == localai.ProviderLocalGemma {
+		if d.local == nil {
+			return nil, errors.New("memory: local embedder not initialized")
+		}
+		batched, err := d.local.embedBatchWithConfig(ctx, cfg.Endpoint, cfg.EmbedModel, []string{text})
+		if err != nil {
+			return nil, err
+		}
+		if len(batched) == 0 {
+			return nil, fmt.Errorf("memory: local embedder returned no results")
+		}
+		return batched[0], nil
 	}
 	if d.vertex == nil {
 		return nil, fmt.Errorf("memory: cloud_gemini embedding requires GOOGLE_CLOUD_PROJECT (or switch AI Engine to Local Google Gemma)")
@@ -429,8 +496,18 @@ func (d *DynamicEmbedder) EmbedText(ctx context.Context, text string) ([]float32
 
 // EmbedBatch delegates to either LocalGemmaEmbedder or VertexEmbedder.
 func (d *DynamicEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	if d.useLocal() {
-		return d.local.EmbedBatch(ctx, texts)
+	if d == nil {
+		return nil, errors.New("memory: nil DynamicEmbedder")
+	}
+	cfg, err := d.resolveConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Provider == localai.ProviderLocalGemma {
+		if d.local == nil {
+			return nil, errors.New("memory: local embedder not initialized")
+		}
+		return d.local.embedBatchWithConfig(ctx, cfg.Endpoint, cfg.EmbedModel, texts)
 	}
 	if d.vertex == nil {
 		return nil, fmt.Errorf("memory: cloud_gemini embedding requires GOOGLE_CLOUD_PROJECT (or switch AI Engine to Local Google Gemma)")

@@ -17,6 +17,10 @@
 -- No keeper table has FK references to these tables.
 -- Deploy new code FIRST, then run this migration.
 
+BEGIN;
+
 DROP TABLE IF EXISTS analysis_proposals CASCADE;
 DROP TABLE IF EXISTS analysis_edges    CASCADE;
 DROP TABLE IF EXISTS analysis_nodes    CASCADE;
+
+COMMIT;

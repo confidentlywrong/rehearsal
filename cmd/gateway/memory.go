@@ -238,6 +238,7 @@ func memoryMaxUploadBytes() int64 {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		log.Printf("GATEWAY: invalid MEMORY_MAX_UPLOAD_MB=%q (%v); defaulting to 32 MiB", v, err)
 		return 32 << 20
 	}
 	return int64(n) << 20
@@ -370,7 +371,12 @@ func createAnalysisHandler(store memStore) gin.HandlerFunc {
 			Title       string `json:"title"`
 			Description string `json:"description"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeStrictJSON(c, &req, 1<<20, false); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json"})
 			return
 		}
@@ -429,7 +435,12 @@ func updateAnalysisHandler(store memStore) gin.HandlerFunc {
 			Description *string `json:"description"`
 			OrgName     *string `json:"org_name"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeStrictJSON(c, &req, 1<<20, false); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json"})
 			return
 		}
@@ -593,6 +604,34 @@ func chunkAndEmbedDocument(ctx context.Context, store memStore, storage docStora
 	return len(chunks), store.ReplaceChunksForDocument(ctx, docID, chunks)
 }
 
+func isMaxBytesError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "http: request body too large")
+}
+
+type maxBytesTracker struct {
+	r   io.ReadCloser
+	hit bool
+}
+
+func (m *maxBytesTracker) Read(p []byte) (int, error) {
+	n, err := m.r.Read(p)
+	if isMaxBytesError(err) {
+		m.hit = true
+	}
+	return n, err
+}
+
+func (m *maxBytesTracker) Close() error {
+	return m.r.Close()
+}
+
 func uploadDocumentHandler(store memStore, storage docStorage, embedder Embedder, maxBytes int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		operatorID := requireOperator(c)
@@ -609,7 +648,21 @@ func uploadDocumentHandler(store memStore, storage docStorage, embedder Embedder
 		// memory. multipart.Reader respects the request body
 		// LimitReader; we wrap explicitly so a malicious client
 		// cannot stream past the cap via chunked encoding.
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		if c.Request.Body == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing_body"})
+			return
+		}
+		tracker := &maxBytesTracker{r: http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)}
+		c.Request.Body = tracker
+
+		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+			if tracker.hit || isMaxBytesError(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_multipart", "detail": err.Error()})
+			return
+		}
 
 		kind := strings.TrimSpace(c.PostForm("kind"))
 		if kind == "" {
@@ -618,6 +671,10 @@ func uploadDocumentHandler(store memStore, storage docStorage, embedder Embedder
 		}
 		file, header, err := c.Request.FormFile("file")
 		if err != nil {
+			if tracker.hit || isMaxBytesError(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "missing_file", "detail": err.Error()})
 			return
 		}
@@ -630,6 +687,10 @@ func uploadDocumentHandler(store memStore, storage docStorage, embedder Embedder
 		docID := uuid.New()
 		uri, size, sha, err := storage.Save(c.Request.Context(), a.ID, docID, filename, file)
 		if err != nil {
+			if tracker.hit || isMaxBytesError(err) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			log.Printf("handler error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 			return
@@ -767,7 +828,12 @@ func retrievePassagesHandler(store memStore, embedder Embedder) gin.HandlerFunc 
 			Query string `json:"query"`
 			Limit int    `json:"limit,omitempty"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := decodeStrictJSON(c, &req, 1<<20, false); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_json"})
 			return
 		}

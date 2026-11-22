@@ -80,7 +80,7 @@ default = true
 packages = ["scripts"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not slow and not integration' --ignore=scripts/tests/deploy_test.py --ignore=scripts/tests/test_deploy.py --ignore=scripts/tests/test_deploy_gke.py --ignore=scripts/e2e/test_vllm_runner.py"
+addopts = "-m 'not slow and not integration' --ignore=scripts/e2e/test_vllm_runner.py"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["agents", "scripts/deploy"]

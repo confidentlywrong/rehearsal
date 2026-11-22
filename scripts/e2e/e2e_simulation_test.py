@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: update default gateway/planner ports to 9101/9106 and await cancelled observer task cleanly.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,12 +42,12 @@ from gen_proto.gateway import gateway_pb2
 # Configuration
 # ---------------------------------------------------------------------------
 
-GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:8101")
+GATEWAY_HTTP_URL = os.getenv("GATEWAY_URL", "http://127.0.0.1:9101")
 GATEWAY_WS_URL = os.getenv(
     "GATEWAY_WS_URL",
     GATEWAY_HTTP_URL.replace("http://", "ws://").replace("https://", "wss://") + "/ws",
 )
-PLANNER_URL = os.getenv("PLANNER_URL", "http://127.0.0.1:8205")
+PLANNER_URL = os.getenv("PLANNER_URL", "http://127.0.0.1:9106")
 PLANNER_A2A_ENDPOINT = f"{PLANNER_URL}/a2a/planner_with_eval/"
 
 # Timeout for the entire event-collection phase (seconds).
@@ -156,7 +158,7 @@ async def ws_observer(results: TestResults, stop_event: asyncio.Event) -> None:
     """Connect to the gateway WS (no sessionId = global observer) and collect
     protobuf Wrapper messages until *stop_event* is set."""
     try:
-        async with websockets.connect(GATEWAY_WS_URL) as ws:
+        async with websockets.connect(GATEWAY_WS_URL, max_size=10 * 1024 * 1024) as ws:
             results.ws_connected = True
             print(f"  [WS] Connected to {GATEWAY_WS_URL}")
 
@@ -293,6 +295,7 @@ async def run_test() -> TestResults:
         await asyncio.wait_for(observer_task, timeout=5.0)
     except asyncio.TimeoutError:
         observer_task.cancel()
+        await asyncio.gather(observer_task, return_exceptions=True)
 
     return results
 

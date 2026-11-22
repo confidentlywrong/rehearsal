@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: dispose unused bulb template geometry and guard non-finite tick deltas.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -180,6 +182,7 @@ export class TrafficSimulator {
   }
 
   tick(delta: number): void {
+    if (!Number.isFinite(delta) || delta <= 0) return;
     for (const ctrl of this.controllers) {
       if (ctrl.phases.length === 0) continue;
 
@@ -277,6 +280,7 @@ export class TrafficSimulator {
       bulb.name = ['bulb-red', 'bulb-yellow', 'bulb-green'][i];
       group.add(bulb);
     }
+    bulbGeo.dispose();
 
     return group;
   }

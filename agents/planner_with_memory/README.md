@@ -120,14 +120,14 @@ Overrides `PLANNER_WITH_EVAL` via `PromptBuilder.override()`:
 | `tools` | **overridden** | Adds "DO NOT HALLUCINATE TOOLS" rule |
 | `workflow` | **overridden** | Triage step (recall vs new planning), parallel recall + rules lookup |
 | `execution` | **overridden** | Execute-by-reference workflow for stored routes |
-| `memory` | **added** | All 9 memory tools, pre-seeded plans, route list A2UI format |
+| `memory` | **added** | All 8 memory tools, pre-seeded plans, route list A2UI format |
 | `post_simulation` | **added** | Record-keeping requirements after simulation |
 
 ## Configuration
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `PLANNER_WITH_MEMORY_PORT` | `8209` | HTTP listen port |
+| `PORT` / `PLANNER_WITH_MEMORY_PORT` | `9109` | HTTP listen port |
 | `GOOGLE_CLOUD_LOCATION` | `global` | Gemini API endpoint |
 | `DATABASE_URL` | -- | AlloyDB/Postgres connection string |
 | `USE_ALLOYDB` | `false` | Use AlloyDB extensions (server-side embeddings) |
@@ -169,12 +169,10 @@ agents/planner_with_memory/
 │   ├── schemas.py            # PlannedRoute, SimulationRecord dataclasses
 │   ├── store.py              # In-memory RouteMemoryStore (with seed auto-load)
 │   ├── store_alloydb.py      # AlloyDBRouteStore (asyncpg, Secret Manager)
-│   ├── tools.py              # 9 tool function implementations
+│   ├── tools.py              # 8 tool function implementations
 │   ├── adk_tools.py          # FunctionTool wrappers, get_memory_tools()
 │   ├── embeddings.py         # Client-side embedding generation
 │   └── seeds/                # 4 pre-built route JSON files
-├── services/
-│   └── session_manager.py    # A2A context_id to session_id mapping
 ├── alloydb/
 │   ├── schema.sql            # Production DDL (4 tables)
 │   ├── schema_local.sql      # Local DDL (pgvector only)

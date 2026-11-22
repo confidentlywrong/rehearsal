@@ -25,9 +25,11 @@ Requires Gemini API access. Run with: make eval
 
 import pytest
 
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL
+
 # Gemini 3 preview models have thought signature incompatibilities with ADK's
 # replay mechanism. Use gemini-3.5-flash-lite for evals.
-_EVAL_MODEL = "gemini-3.5-flash-lite"
+_EVAL_MODEL = DEFAULT_FLASH_LITE_MODEL
 
 
 def _collect_tool_calls(events) -> list[str]:

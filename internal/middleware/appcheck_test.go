@@ -38,13 +38,28 @@ func TestAppCheck_OffIsNoop(t *testing.T) {
 	}
 }
 
-func TestAppCheck_NilVerifierIsNoop(t *testing.T) {
-	r := newAppCheckTestRouter(AppCheckOptions{Mode: "enforce", Verifier: nil})
+func TestAppCheck_EnforceNilVerifierFailsClosed(t *testing.T) {
+	r := newAppCheckTestRouter(AppCheckOptions{
+		Mode:      "enforce",
+		Verifier:  nil,
+		SkipPaths: []string{"/health"},
+	})
+
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
 	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d (want 200 — nil verifier degrades to off)", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d (want 503 fail-closed when enforce has nil verifier), body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "appcheck_unavailable") {
+		t.Fatalf("body = %q (want appcheck_unavailable)", w.Body.String())
+	}
+
+	// Skipped paths like /health still pass through.
+	wHealth := httptest.NewRecorder()
+	r.ServeHTTP(wHealth, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if wHealth.Code != http.StatusOK {
+		t.Fatalf("/health status = %d (want 200)", wHealth.Code)
 	}
 }
 
@@ -114,12 +129,18 @@ func TestAppCheckFromEnv_OffByDefault(t *testing.T) {
 	}
 }
 
-func TestAppCheckFromEnv_DisablesWhenProjectMissing(t *testing.T) {
+func TestAppCheckFromEnv_PreservesModeWhenProjectMissing(t *testing.T) {
 	env := map[string]string{"APPCHECK_ENFORCE": "report-only"}
 	get := func(k string) string { return env[k] }
 	opts := AppCheckFromEnv(get)
-	if opts.Mode != "off" {
-		t.Fatalf("mode = %q (want off — no project number/id)", opts.Mode)
+	if opts.Mode != "report-only" {
+		t.Fatalf("mode = %q (want preserved report-only)", opts.Mode)
+	}
+	if opts.InitErr == nil {
+		t.Fatal("expected InitErr when project number/id missing")
+	}
+	if _, err := AppCheckFromEnvE(get); err == nil {
+		t.Fatal("expected AppCheckFromEnvE error when project missing")
 	}
 }
 
@@ -142,14 +163,114 @@ func TestAppCheckFromEnv_HappyConfig(t *testing.T) {
 	}
 }
 
-func TestAppCheckFromEnv_UnknownModeDisables(t *testing.T) {
+func TestAppCheckFromEnv_UnknownModePreserved(t *testing.T) {
 	env := map[string]string{
 		"APPCHECK_ENFORCE":        "yes-please",
 		"FIREBASE_PROJECT_NUMBER": "12345",
 	}
 	get := func(k string) string { return env[k] }
 	opts := AppCheckFromEnv(get)
-	if opts.Mode != "off" {
-		t.Fatalf("mode = %q (want off for unknown)", opts.Mode)
+	if opts.Mode != "yes-please" {
+		t.Fatalf("mode = %q (want yes-please preserved for AppCheck boot guard)", opts.Mode)
+	}
+	if opts.InitErr == nil {
+		t.Fatal("expected InitErr for unknown mode")
+	}
+	if _, err := AppCheckFromEnvE(get); err == nil {
+		t.Fatal("expected AppCheckFromEnvE error for unknown mode")
+	}
+}
+
+func TestAppCheckFromEnv_AllowsExplicitOff(t *testing.T) {
+	for _, val := range []string{"", "off", "false", "0"} {
+		opts, err := AppCheckFromEnvE(func(k string) string {
+			if k == "APPCHECK_ENFORCE" {
+				return val
+			}
+			return ""
+		})
+		if err != nil {
+			t.Fatalf("val=%q unexpected err: %v", val, err)
+		}
+		if opts.Mode != "off" {
+			t.Fatalf("val=%q mode=%q want off", val, opts.Mode)
+		}
+	}
+}
+
+func TestAppCheck_SkipPathsSegmentBoundary(t *testing.T) {
+	v := &account.AppCheckVerifier{}
+	r := gin.New()
+	r.Use(AppCheck(AppCheckOptions{
+		Mode:      "enforce",
+		Verifier:  v,
+		SkipPaths: []string{"/health"},
+	}))
+	r.GET("/health", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	r.GET("/health/ready", func(c *gin.Context) { c.String(http.StatusOK, "ready") })
+	r.GET("/healthcare", func(c *gin.Context) { c.String(http.StatusOK, "oops") })
+
+	for _, path := range []string{"/health", "/health/ready"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d (want 200)", path, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthcare", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /healthcare status = %d (want 401; /health must not prefix-match /healthcare)", w.Code)
+	}
+}
+
+func TestAppCheckFromEnv_SkipsWebSocketAndHealthz(t *testing.T) {
+	env := map[string]string{
+		"APPCHECK_ENFORCE":        "enforce",
+		"FIREBASE_PROJECT_NUMBER": "12345",
+		"FIREBASE_PROJECT_ID":     "my-project",
+	}
+	opts := AppCheckFromEnv(func(k string) string { return env[k] })
+	for _, want := range []string{"/health", "/healthz", "/config", "/ws"} {
+		found := false
+		for _, p := range opts.SkipPaths {
+			if p == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("SkipPaths %v missing %q", opts.SkipPaths, want)
+		}
+	}
+}
+
+func TestAppCheck_SkipPathsTrailingSlashNormalized(t *testing.T) {
+	v := &account.AppCheckVerifier{}
+	r := gin.New()
+	r.RedirectTrailingSlash = false
+	r.Use(AppCheck(AppCheckOptions{
+		Mode:      "enforce",
+		Verifier:  v,
+		SkipPaths: []string{"/health/"},
+	}))
+	r.GET("/health", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	r.GET("/health/", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	r.GET("/health/ready", func(c *gin.Context) { c.String(http.StatusOK, "ready") })
+	r.GET("/healthcare", func(c *gin.Context) { c.String(http.StatusOK, "oops") })
+
+	for _, p := range []string{"/health", "/health/", "/health/ready"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, p, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d (want 200 when SkipPaths has /health/)", p, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthcare", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /healthcare status = %d (want 401)", w.Code)
 	}
 }

@@ -1,11 +1,24 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changed for The Rehearsal: notify AgentRuntimeControlsService when demo runtime flags update, clear stale currentAgent on reset, remove synthetic route/message fallback injection for 100% SSOT, and handle sendBroadcast failures cleanly.
  */
 
 import { Injectable } from '@angular/core';
-import { DEMO_CONFIG, PRECONFIGURED_ROUTES } from '../../../../../demo-config';
+import { DEMO_CONFIG } from '../../../../../demo-config';
 import type { ChatAgent } from '../../../../../types';
 import {
   SECURE_AGENT_PROMPT,
@@ -17,9 +30,13 @@ import type { AgentScreenComponent } from '../agent-screen.component';
 @Injectable()
 export class AgentDemoSessionService {
   private _lifecycleGen = 0;
+
+  dispose(): void {
+    ++this._lifecycleGen;
+  }
+
   async runDemoLifecycle(host: AgentScreenComponent): Promise<void> {
     const gen = ++this._lifecycleGen;
-    void host.demoService.cachedMessagesToggle();
 
     host.stopCachedDataStream();
 
@@ -39,6 +56,7 @@ export class AgentDemoSessionService {
     if (host.errorMessageInterval) clearInterval(host.errorMessageInterval);
 
     host.isSecuringAgent = false;
+    host.currentAgent = null;
     host.gateway.resetDemoChatPipelineState();
     host.chatDisplay.clearForDemoReset();
     host.chatMessages = [];
@@ -71,6 +89,7 @@ export class AgentDemoSessionService {
     host.cachedMessageTimeScale = activeDemo.recordingConfig
       ? host.clampSnapCachedMessageTimeScale(activeDemo.recordingConfig.timeScale ?? 1)
       : 1;
+    host.notifyRuntimeControlsUpdate();
 
     // Respect an explicit Raw chat-filter tier (so demo switches don't
     // silently strip load_skill events the user asked to see). For
@@ -94,11 +113,11 @@ export class AgentDemoSessionService {
     host.isAgentWorking = false;
 
     const sessionId = host.agents[activeDemo.agent];
-    if (!sessionId) return;
+    if (!sessionId && !host.runCachedMessages) return;
 
     host.currentAgent = {
       agentType: activeDemo.agent as ChatAgent,
-      sessionId,
+      sessionId: sessionId ?? '',
     };
 
     if (activeDemoKey === '5b') {
@@ -114,11 +133,14 @@ export class AgentDemoSessionService {
         host.isSecuringAgent = true;
         const guid = host.agents[host.currentAgent.agentType];
         if (guid) {
-          host.gateway.sendBroadcast(
-            SECURE_AGENT_PROMPT,
-            [guid],
-            true,
-          );
+          void host.gateway
+            .sendBroadcast(SECURE_AGENT_PROMPT, [guid], true)
+            .catch((err) => {
+              console.error('Failed to enable secure agent mode:', err);
+              if (this._lifecycleGen !== gen) return;
+              host.isSecuringAgent = false;
+              host.cdr.markForCheck();
+            });
         }
       }
     } else if (activeDemoKey === '7a') {
@@ -128,54 +150,23 @@ export class AgentDemoSessionService {
         host.isSecuringAgent = true;
         const guid = host.agents[host.currentAgent.agentType];
         if (guid) {
-          host.gateway.sendBroadcast(
-            UNSECURE_AGENT_PROMPT,
-            [guid],
-            true,
-          );
+          void host.gateway
+            .sendBroadcast(UNSECURE_AGENT_PROMPT, [guid], true)
+            .catch((err) => {
+              console.error('Failed to disable secure agent mode:', err);
+              if (this._lifecycleGen !== gen) return;
+              host.isSecuringAgent = false;
+              host.cdr.markForCheck();
+            });
         }
       }
     }
 
     if (this._lifecycleGen !== gen) return;
 
-    // Preload the demo's placeholder route into the 3D map ONLY when
-    // the demo's agent is a marathon planner. Leadership demos have
-    // `placeholderRoutes: 'cachedRoute0X'` set in demo-config.ts as
-    // pre-2026-07-17 marathon leftover — dispatching those preloads a
-    // fake Vegas polyline that never corresponds to the selected
-    // leadership scenario, and then leaves it stuck on the map until
-    // the user clicks Show Scenario. Skipping the dispatch for
-    // leadership agents keeps the map honestly empty until an actual
-    // route arrives from a marathon flow (never, in this fork). See
-    // a2ui-actions.service.ts show_route handler for the click-time
-    // counterpart (also clears rather than fabricates).
-    const agent = typeof activeDemo.agent === 'string' ? activeDemo.agent : '';
-    const isLeadershipDemo = agent.startsWith('leadership_') || agent === 'simulator_with_failure';
-    if (activeDemoKey !== 'Sandbox' && activeDemo.placeholderRoutes && !isLeadershipDemo) {
-      const routeJson = PRECONFIGURED_ROUTES[activeDemo.placeholderRoutes] as {
-        route_data?: unknown;
-      };
-      const geojson = routeJson.route_data ?? routeJson;
-
-      window.dispatchEvent(new CustomEvent('gateway:routeGeojson', { detail: { geojson } }));
-    } else if (isLeadershipDemo) {
-      // Actively clear any stale route that may have been left on the
-      // map by a prior demo. `undefined` geojson is the documented
-      // "no route" signal the viewport-lookdev component honours.
-      window.dispatchEvent(new CustomEvent('gateway:routeGeojson', { detail: { geojson: undefined } }));
-    }
-
-    if (activeDemo.placeholderAgentMessage) {
-      const message = {
-        ...activeDemo.placeholderAgentMessage,
-        guid: host.currentAgent?.sessionId ?? '',
-        speaker: (host.currentAgent?.agentType as string) ?? '',
-      };
-
-      host.chatMessages = [message];
-      host.chatDisplay.processMessageForDisplay(host, message);
-    }
+    // Keep the 3D viewport and chat thread honestly empty until live gateway
+    // messages or user-triggered cached stream replay arrive.
+    window.dispatchEvent(new CustomEvent('gateway:routeGeojson', { detail: { geojson: undefined } }));
 
     if (activeDemo.promptPlaceholder) {
       if (host.chatTextAreaRef) {

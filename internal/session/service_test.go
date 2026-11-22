@@ -1,4 +1,6 @@
 // Copyright 2026 Google LLC
+// Modifications copyright 2026 Christian Haeussinger
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +19,9 @@ package session
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -190,4 +194,73 @@ func TestBatchTrackSessionsWithSimulationID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, sims, 2)
 	assert.ElementsMatch(t, []string{"sim-abc", "sim-xyz"}, sims)
+}
+
+func TestInMemorySessionService_SaaSMultiTenantIsolation(t *testing.T) {
+	t.Setenv("SAAS_MODE", "on")
+	svc := NewInMemorySessionService()
+
+	ctxA := account.WithContext(context.Background(), account.UserContext{UserID: "user-a"})
+	ctxB := account.WithContext(context.Background(), account.UserContext{UserID: "user-b"})
+
+	require.NoError(t, svc.TrackSession(ctxA, "sess-1", "runner_a", "sim-a"))
+	require.NoError(t, svc.TrackSession(ctxB, "sess-1", "runner_b", "sim-b"))
+
+	atA, okA, err := svc.FindAgentType(ctxA, "sess-1")
+	require.NoError(t, err)
+	assert.True(t, okA)
+	assert.Equal(t, "runner_a", atA)
+
+	atB, okB, err := svc.FindAgentType(ctxB, "sess-1")
+	require.NoError(t, err)
+	assert.True(t, okB)
+	assert.Equal(t, "runner_b", atB)
+
+	simsA, err := svc.ListSimulations(ctxA)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-a"}, simsA)
+
+	simsB, err := svc.ListSimulations(ctxB)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-b"}, simsB)
+
+	// Flush user-a only; user-b must remain untouched
+	flushed, err := svc.Flush(ctxA)
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushed)
+
+	sessA, err := svc.ListSessions(ctxA)
+	require.NoError(t, err)
+	assert.Empty(t, sessA)
+
+	sessB, err := svc.ListSessions(ctxB)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sess-1"}, sessB)
+}
+
+func TestInMemorySessionService_ValidationCtxAndTTL(t *testing.T) {
+	svc := NewInMemorySessionServiceWithTTL(25 * time.Millisecond)
+	ctx := context.Background()
+
+	require.Error(t, svc.TrackSession(ctx, "", "runner", ""))
+	require.Error(t, svc.TrackSession(ctx, "bad:simulation", "runner", ""))
+	require.Error(t, svc.TrackSession(ctx, "bad sid", "runner", ""))
+	require.Error(t, svc.TrackSession(ctx, "valid-sid", "", ""))
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, svc.TrackSession(canceledCtx, "s1", "runner", ""), context.Canceled)
+	_, err := svc.ListSimulations(canceledCtx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	require.NoError(t, svc.TrackSession(ctx, "ttl-sess", "runner", "sim-ttl"))
+	time.Sleep(40 * time.Millisecond)
+
+	reaped, err := svc.Reap(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, reaped)
+
+	sims, err := svc.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, sims)
 }

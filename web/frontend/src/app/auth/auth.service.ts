@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: block protocol-relative URLs in isSameOrigin, preserve Request headers in fetch interceptor, and retain hash fragments across 401/410 auth redirects.
  */
 
 import { APP_INITIALIZER, Injectable, Provider } from '@angular/core';
@@ -336,7 +339,9 @@ export class AuthService {
         return originalFetch(input, init);
       }
       const merged: RequestInit = { ...(init || {}) };
-      const headers = new Headers(merged.headers || {});
+      const headers = new Headers(
+        merged.headers ?? (typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined),
+      );
       // Hint to the BFF's htmlAwareUnauthorized that this is an
       // XHR, not a top-level document load — so failure should be
       // 401 JSON rather than a 302 to /login.
@@ -409,8 +414,11 @@ function triggerSignOutOnce(auth: AuthService, status: number): void {
   // /login (defence in depth — isAuthReactionEligible already filters).
   let returnTo = '/';
   try {
-    if (!window.location.pathname.startsWith('/login')) {
-      returnTo = window.location.pathname + window.location.search;
+    if (!window.location.pathname?.startsWith('/login')) {
+      returnTo =
+        (window.location.pathname || '/') +
+        (window.location.search || '') +
+        (window.location.hash || '');
     }
   } catch {
     // ignore
@@ -422,11 +430,15 @@ function isSameOrigin(url: string): boolean {
   if (typeof window === 'undefined') {
     return false;
   }
-  if (url.startsWith('/')) {
+  const trimmed = url.trim();
+  if (trimmed.startsWith('//') || trimmed.startsWith('/\\')) {
+    return false;
+  }
+  if (trimmed.startsWith('/')) {
     return true;
   }
   try {
-    const u = new URL(url, window.location.href);
+    const u = new URL(trimmed, window.location.href);
     return u.origin === window.location.origin;
   } catch {
     return false;

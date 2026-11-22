@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: add unit tests for protocol-relative URL AppCheck isolation, Request header preservation, and hash-route preservation on 401 bounce.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -94,6 +97,12 @@ function installLocalStorageStub(): void {
 beforeEach(() => {
   installLocalStorageStub();
   resetEnv(undefined);
+  delete (window as unknown as Record<string, unknown>)['__rcFetchPatched'];
+  try {
+    window.sessionStorage?.clear();
+  } catch {
+    // ignore
+  }
   fb.onIdTokenChanged.mockReset();
   fb.signOut.mockReset();
   fb.signOut.mockResolvedValue(undefined);
@@ -350,5 +359,70 @@ describe('AuthService.signOut() — revokes Firebase session when present', () =
     svc.signOut('/');
 
     expect(fb.signOut).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthService.installFetchInterceptor() — Round 2 security & routing', () => {
+  it('blocks protocol-relative // URLs from same-origin AppCheck injection and preserves Request headers', async () => {
+    const rawFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    window.fetch = rawFetch;
+
+    const svc = new AuthService();
+    (svc as any).appCheckMod = {
+      getToken: vi.fn().mockResolvedValue({ token: 'appcheck-secret-jwt' }),
+    };
+    (svc as any).appCheck = { __tag: 'appcheck' };
+    svc.installFetchInterceptor();
+
+    // Protocol-relative cross-origin URL MUST NOT receive X-Firebase-AppCheck or same-origin credentials override
+    await window.fetch('//evil.example.com/collect');
+    const [, crossInit] = rawFetch.mock.calls[0];
+    expect(crossInit).toBeUndefined();
+
+    // Same-origin Request object MUST preserve its existing headers while receiving X-Firebase-AppCheck
+    const req = new Request('http://localhost/api/v1/profile', {
+      headers: { 'X-Custom-Header': 'keep-me' },
+    });
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: {
+        origin: 'http://localhost',
+        href: 'http://localhost/',
+        pathname: '/',
+        search: '',
+        hash: '',
+        assign: vi.fn(),
+      },
+    });
+    await window.fetch(req);
+    const [, sameInit] = rawFetch.mock.calls[1];
+    const mergedHeaders = new Headers(sameInit.headers);
+    expect(mergedHeaders.get('X-Custom-Header')).toBe('keep-me');
+    expect(mergedHeaders.get('X-Firebase-AppCheck')).toBe('appcheck-secret-jwt');
+  });
+
+  it('preserves hash route in redirect param when bouncing on HTTP 401', async () => {
+    const rawFetch = vi.fn().mockResolvedValue(new Response('', { status: 401 }));
+    window.fetch = rawFetch;
+    const assignSpy = vi.fn();
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: {
+        origin: 'http://localhost',
+        href: 'http://localhost/#/settings/billing?checkout=success',
+        pathname: '/',
+        search: '',
+        hash: '#/settings/billing?checkout=success',
+        assign: assignSpy,
+      },
+    });
+
+    const svc = new AuthService();
+    svc.installFetchInterceptor();
+
+    await window.fetch('/api/v1/billing/plans');
+    expect(assignSpy).toHaveBeenCalledWith(
+      `/login?redirect=${encodeURIComponent('/#/settings/billing?checkout=success')}`,
+    );
   });
 });

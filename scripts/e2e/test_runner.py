@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: support IPv6 host:port parsing and REDIS_PASSWORD in Redis runner mode.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,15 +26,15 @@ communication modes:
 Usage examples::
 
     # Local autopilot via A2A
-    python scripts/e2e/test_runner.py --mode a2a --target http://localhost:8210 \\
+    python scripts/e2e/test_runner.py --mode a2a --target http://localhost:9110 \\
         --agent-type runner_autopilot
 
     # 100 runners through the gateway
-    python scripts/e2e/test_runner.py --mode gateway --target http://localhost:8101 \\
+    python scripts/e2e/test_runner.py --mode gateway --target http://localhost:9101 \\
         --agent-type runner_autopilot --count 100
 
     # Single LLM runner (Gemma 4 via Ollama)
-    python scripts/e2e/test_runner.py --mode a2a --target http://localhost:8207 \\
+    python scripts/e2e/test_runner.py --mode a2a --target http://localhost:9108 \\
         --agent-type runner --ticks 3
 
     # GCP-deployed runner via A2A with auth
@@ -41,7 +43,7 @@ Usage examples::
         --agent-type runner --gcp-project your-gcp-project-id
 
     # Redis direct path
-    python scripts/e2e/test_runner.py --mode redis --redis-addr 127.0.0.1:8102 \\
+    python scripts/e2e/test_runner.py --mode redis --redis-addr 127.0.0.1:9102 \\
         --agent-type runner_autopilot --count 10
 """
 
@@ -51,6 +53,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -213,6 +216,62 @@ async def _get_gcp_auth_headers(project: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _event_result_from_a2a_response(
+    resp: httpx.Response,
+    event_name: str,
+    latency_ms: float,
+    verbose: bool = False,
+) -> EventResult:
+    """Convert an A2A HTTP response into an EventResult without masking HTTP errors."""
+    if resp.status_code >= 400:
+        detail = resp.text[:200]
+        try:
+            err_body = resp.json()
+            if isinstance(err_body, dict) and isinstance(err_body.get("error"), dict):
+                detail = err_body["error"].get("message", detail)
+        except ValueError:
+            pass
+        return EventResult(
+            event_name=event_name,
+            latency_ms=latency_ms,
+            success=False,
+            error=f"HTTP {resp.status_code}: {detail}",
+        )
+
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        return EventResult(
+            event_name=event_name,
+            latency_ms=latency_ms,
+            success=False,
+            error=f"Invalid JSON response: {exc}",
+        )
+
+    if verbose:
+        print(f"  [A2A] {event_name} -> {resp.status_code}")
+        print(f"    {json.dumps(body, indent=2)[:500]}")
+
+    if isinstance(body, dict) and body.get("error"):
+        err_obj = body["error"]
+        msg = err_obj.get("message", "unknown") if isinstance(err_obj, dict) else str(err_obj)
+        return EventResult(
+            event_name=event_name,
+            latency_ms=latency_ms,
+            success=False,
+            error=msg,
+        )
+
+    text, tools = _extract_a2a_response(body)
+    return EventResult(
+        event_name=event_name,
+        latency_ms=latency_ms,
+        success=True,
+        tool_calls=tools,
+        raw_response=text[:300] if verbose else None,
+    )
+
+
 async def run_a2a(
     client: httpx.AsyncClient,
     target: str,
@@ -239,36 +298,9 @@ async def run_a2a(
                     timeout=EVENT_TIMEOUT,
                 )
                 latency = (time.monotonic() - t0) * 1000
-                body = resp.json()
-
-                if verbose:
-                    print(
-                        f"  [A2A] {evt['event']} -> {resp.status_code}",
-                    )
-                    print(
-                        f"    {json.dumps(body, indent=2)[:500]}",
-                    )
-
-                if "error" in body:
-                    runner_result.events.append(
-                        EventResult(
-                            event_name=evt["event"],
-                            latency_ms=latency,
-                            success=False,
-                            error=body["error"].get("message", "unknown"),
-                        )
-                    )
-                else:
-                    text, tools = _extract_a2a_response(body)
-                    runner_result.events.append(
-                        EventResult(
-                            event_name=evt["event"],
-                            latency_ms=latency,
-                            success=True,
-                            tool_calls=tools,
-                            raw_response=text[:300] if verbose else None,
-                        )
-                    )
+                runner_result.events.append(
+                    _event_result_from_a2a_response(resp, evt["event"], latency, verbose)
+                )
             except Exception as exc:
                 latency = (time.monotonic() - t0) * 1000
                 runner_result.events.append(
@@ -307,22 +339,7 @@ async def run_a2a_parallel(
             try:
                 resp = await client.post(a2a_url, json=payload, timeout=EVENT_TIMEOUT)
                 latency = (time.monotonic() - t0) * 1000
-                body = resp.json()
-                if "error" in body:
-                    return EventResult(
-                        event_name=evt_name,
-                        latency_ms=latency,
-                        success=False,
-                        error=body["error"].get("message", "unknown"),
-                    )
-                text, tools = _extract_a2a_response(body)
-                return EventResult(
-                    event_name=evt_name,
-                    latency_ms=latency,
-                    success=True,
-                    tool_calls=tools,
-                    raw_response=text[:300] if verbose else None,
-                )
+                return _event_result_from_a2a_response(resp, evt_name, latency, verbose)
             except Exception as exc:
                 latency = (time.monotonic() - t0) * 1000
                 return EventResult(
@@ -399,6 +416,9 @@ async def run_gateway(
     except httpx.ConnectError:
         print(f"  ERROR: Cannot connect to gateway at {gw}")
         return []
+    if agent_types_resp.status_code != 200:
+        print(f"  ERROR: Agent discovery failed: {agent_types_resp.status_code} {agent_types_resp.text}")
+        return []
     agent_cards = agent_types_resp.json()
 
     if agent_type not in agent_cards:
@@ -407,10 +427,11 @@ async def run_gateway(
         return []
 
     card = agent_cards[agent_type]
-    agent_url_raw = card.get("url", "")
+    raw_url = card.get("url") if isinstance(card, dict) else None
+    agent_url_raw = raw_url.strip() if isinstance(raw_url, str) else ""
 
     # The card URL may include the full A2A path (e.g.
-    # http://127.0.0.1:8210/a2a/runner_autopilot) or just the base host.
+    # http://127.0.0.1:9110/a2a/runner_autopilot) or just the base host.
     # Strip the /a2a/{name} suffix to get the agent's base URL, since
     # run_a2a/run_a2a_parallel re-append /a2a/{agent_type}/.
     agent_base = agent_url_raw.rstrip("/")
@@ -418,7 +439,7 @@ async def run_gateway(
     if agent_base.endswith(a2a_suffix):
         agent_base = agent_base[: -len(a2a_suffix)]
     if not agent_base:
-        agent_base = gw  # fallback to gateway
+        raise RuntimeError(f"Agent card for {agent_type!r} is missing a valid 'url' field")
 
     print(f"  Agent base URL: {agent_base}")
 
@@ -448,8 +469,15 @@ async def run_redis(
         print("ERROR: redis package required for --mode redis", file=sys.stderr)
         sys.exit(1)
 
-    host, port_str = redis_addr.split(":")
-    r = aioredis.Redis(host=host, port=int(port_str), decode_responses=True)
+    if ":" in redis_addr:
+        raw_host, port_str = redis_addr.rsplit(":", 1)
+        host = raw_host.strip("[]")
+        port = int(port_str)
+    else:
+        host = redis_addr.strip("[]")
+        port = 6379
+    redis_password = os.environ.get("REDIS_PASSWORD") or None
+    r = aioredis.Redis(host=host, port=port, password=redis_password, decode_responses=True)
 
     session_ids = [str(uuid4()) for _ in range(count)]
     results: dict[str, RunnerResult] = {sid: RunnerResult(session_id=sid) for sid in session_ids}
@@ -490,8 +518,8 @@ async def run_redis(
                                 raw_response=data[:300] if verbose else None,
                             )
                         )
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as exc:
+                    print(f"  WARNING: Invalid JSON in collector buffer {collector_key}: {exc}", file=sys.stderr)
 
         latency = (time.monotonic() - t0) * 1000
         responded = {sid for sid in session_ids if any(e.event_name == evt_name for e in results[sid].events)}
@@ -817,8 +845,10 @@ async def main() -> None:
         as_json=args.json_output,
     )
 
-    # Exit code: 0 if all events succeeded, 1 otherwise
-    all_ok = all(er.success for rr in results for er in rr.events)
+    # Exit code: 0 if at least one runner executed events and all events succeeded, 1 otherwise
+    all_ok = bool(results) and all(
+        bool(rr.events) and all(er.success for er in rr.events) for rr in results
+    )
     sys.exit(0 if all_ok else 1)
 
 

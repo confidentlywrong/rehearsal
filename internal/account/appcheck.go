@@ -80,11 +80,13 @@ type AppCheckVerifier struct {
 // NewAppCheckVerifier returns a ready-to-use verifier. Errors on
 // completely-empty config (no project number AND no project id).
 func NewAppCheckVerifier(cfg AppCheckConfig) (*AppCheckVerifier, error) {
-	if strings.TrimSpace(cfg.ProjectNumber) == "" && strings.TrimSpace(cfg.ProjectID) == "" {
+	cfg.ProjectNumber = strings.TrimSpace(cfg.ProjectNumber)
+	cfg.ProjectID = strings.TrimSpace(cfg.ProjectID)
+	if cfg.ProjectNumber == "" && cfg.ProjectID == "" {
 		return nil, errors.New("account: AppCheckConfig needs ProjectNumber or ProjectID")
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	return &AppCheckVerifier{
 		cfg:  cfg,
@@ -97,8 +99,8 @@ func NewAppCheckVerifier(cfg AppCheckConfig) (*AppCheckVerifier, error) {
 // per-app analytics but should not gate on it (we don't enforce an
 // app allowlist server-side).
 func (v *AppCheckVerifier) Verify(ctx context.Context, raw string) (appID string, err error) {
-	if v == nil {
-		return "", errors.New("account: nil AppCheckVerifier")
+	if v == nil || v.keys == nil {
+		return "", errors.New("account: uninitialized AppCheckVerifier")
 	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -123,12 +125,15 @@ func (v *AppCheckVerifier) Verify(ctx context.Context, raw string) (appID string
 		return "", errors.New("account: app check claims wrong shape")
 	}
 	// iss validation. App Check issuer is the project-scoped URL.
+	iss, _ := claims["iss"].(string)
+	const appCheckIssuerPrefix = "https://firebaseappcheck.googleapis.com/"
 	if v.cfg.ProjectNumber != "" {
-		iss, _ := claims["iss"].(string)
-		expected := "https://firebaseappcheck.googleapis.com/" + v.cfg.ProjectNumber
+		expected := appCheckIssuerPrefix + v.cfg.ProjectNumber
 		if iss != expected {
 			return "", fmt.Errorf("account: app check unexpected iss %q (want %q)", iss, expected)
 		}
+	} else if !strings.HasPrefix(iss, appCheckIssuerPrefix) || len(iss) == len(appCheckIssuerPrefix) {
+		return "", fmt.Errorf("account: app check unexpected iss %q (want %s<project-number>)", iss, appCheckIssuerPrefix)
 	}
 	// aud validation. May be a single string or an array; accept any
 	// member that matches our project number / project id.
@@ -184,9 +189,11 @@ type jwksJSONCache struct {
 	url    string
 	client *http.Client
 
-	mu     sync.RWMutex
-	keys   map[string]*rsa.PublicKey
-	expiry time.Time
+	refreshMu sync.Mutex
+	mu        sync.RWMutex
+	keys      map[string]*rsa.PublicKey
+	fetchedAt time.Time
+	expiry    time.Time
 }
 
 func newJWKSJSONCache(url string, client *http.Client) *jwksJSONCache {
@@ -194,14 +201,36 @@ func newJWKSJSONCache(url string, client *http.Client) *jwksJSONCache {
 }
 
 func (c *jwksJSONCache) get(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+	now := time.Now()
 	c.mu.RLock()
-	if time.Now().Before(c.expiry) {
+	if now.Before(c.expiry) {
 		if k, ok := c.keys[kid]; ok {
 			c.mu.RUnlock()
 			return k, nil
 		}
+		if len(c.keys) > 0 && !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < jwksMinRefreshInterval {
+			c.mu.RUnlock()
+			return nil, fmt.Errorf("account: appcheck jwks missing kid %q", kid)
+		}
 	}
 	c.mu.RUnlock()
+
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	now = time.Now()
+	c.mu.RLock()
+	if now.Before(c.expiry) {
+		if k, ok := c.keys[kid]; ok {
+			c.mu.RUnlock()
+			return k, nil
+		}
+		if len(c.keys) > 0 && !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < jwksMinRefreshInterval {
+			c.mu.RUnlock()
+			return nil, fmt.Errorf("account: appcheck jwks missing kid %q", kid)
+		}
+	}
+	c.mu.RUnlock()
+
 	if err := c.refresh(ctx); err != nil {
 		return nil, err
 	}
@@ -226,7 +255,7 @@ func (c *jwksJSONCache) refresh(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("account: appcheck jwks endpoint returned %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return err
 	}
@@ -251,25 +280,35 @@ func (c *jwksJSONCache) refresh(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("account: appcheck jwks kid %s bad n: %w", k.Kid, err)
 		}
+		if len(n) == 0 {
+			return fmt.Errorf("account: appcheck jwks kid %s empty modulus", k.Kid)
+		}
 		e, err := base64.RawURLEncoding.DecodeString(k.E)
 		if err != nil {
 			return fmt.Errorf("account: appcheck jwks kid %s bad e: %w", k.Kid, err)
 		}
-		eInt := 0
-		for _, b := range e {
-			eInt = eInt<<8 | int(b)
+		if len(e) == 0 || len(e) > 4 {
+			return fmt.Errorf("account: appcheck jwks kid %s invalid exponent length %d", k.Kid, len(e))
 		}
-		if eInt == 0 {
-			return fmt.Errorf("account: appcheck jwks kid %s zero exponent", k.Kid)
+		var eUint uint32
+		for _, b := range e {
+			eUint = eUint<<8 | uint32(b)
+		}
+		if eUint < 3 || eUint > 0x7fffffff {
+			return fmt.Errorf("account: appcheck jwks kid %s invalid exponent", k.Kid)
 		}
 		next[k.Kid] = &rsa.PublicKey{
 			N: new(big.Int).SetBytes(n),
-			E: eInt,
+			E: int(eUint),
 		}
+	}
+	if len(next) == 0 {
+		return errors.New("account: appcheck jwks returned 0 RSA keys")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.keys = next
+	c.fetchedAt = time.Now()
 	// parseMaxAge lives in firebase.go (same package).
 	expiresIn := time.Hour
 	if cc := resp.Header.Get("Cache-Control"); cc != "" {
@@ -280,6 +319,6 @@ func (c *jwksJSONCache) refresh(ctx context.Context) error {
 			}
 		}
 	}
-	c.expiry = time.Now().Add(expiresIn)
+	c.expiry = c.fetchedAt.Add(expiresIn)
 	return nil
 }

@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: evaluate simTargetGuid dynamically at event time, validate JSON event objects, and add clearRunners cleanup.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,10 +57,11 @@ export class RunnerManager {
     opts?: { mesh?: THREE.Mesh; sidewaysOffset?: number },
   ): void {
     if (this.runners.has(guid)) return;
-    const broadcastFn =
-      guid.startsWith('sim-') && this.simTargetGuid
-        ? (g: string, text: string) => this.bufferSimEvent(g, text)
-        : undefined;
+    // Evaluate simTargetGuid dynamically at event time so runners added before
+    // simTargetGuid is configured still emit batched events once set.
+    const broadcastFn = guid.startsWith('sim-')
+      ? (g: string, text: string) => this.bufferSimEvent(g, text)
+      : undefined;
     const runner = new Runner(guid, {
       scene: this.scene,
       path,
@@ -171,14 +174,23 @@ export class RunnerManager {
   }
 
   private bufferSimEvent(guid: string, text: string): void {
+    if (!this.simTargetGuid) return;
     try {
-      const parsed = JSON.parse(text);
-      this.simEventBuffer.push({
-        guid,
-        event: parsed.event ?? 'unknown',
-        text: parsed.text ?? text,
-        water: parsed.water,
-      });
+      const parsed: unknown = JSON.parse(text);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const obj = parsed as Record<string, unknown>;
+        this.simEventBuffer.push({
+          guid,
+          event: typeof obj['event'] === 'string' && obj['event'] ? obj['event'] : 'unknown',
+          text: typeof obj['text'] === 'string' ? obj['text'] : text,
+          water:
+            typeof obj['water'] === 'number' && Number.isFinite(obj['water'])
+              ? obj['water']
+              : undefined,
+        });
+      } else {
+        this.simEventBuffer.push({ guid, event: 'unknown', text, water: undefined });
+      }
     } catch {
       this.simEventBuffer.push({ guid, event: 'unknown', text, water: undefined });
     }
@@ -227,9 +239,18 @@ export class RunnerManager {
     agentGateway.sendBroadcast(JSON.stringify({ events: lines }), [this.simTargetGuid]);
   }
 
-  dispose(): void {
-    if (this.simFlushTimer) clearTimeout(this.simFlushTimer);
+  clearRunners(): void {
+    if (this.simFlushTimer) {
+      clearTimeout(this.simFlushTimer);
+      this.simFlushTimer = null;
+    }
+    this.simEventBuffer = [];
     for (const runner of this.runners.values()) runner.dispose();
     this.runners.clear();
+  }
+
+  dispose(): void {
+    this.clearRunners();
+    this.simTargetGuid = null;
   }
 }

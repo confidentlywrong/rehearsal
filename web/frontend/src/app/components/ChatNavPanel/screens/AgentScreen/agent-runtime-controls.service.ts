@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: add notifyUpdate() so OnPush subscribers re-render when runtime control flags mutate.
  */
 
 import { Injectable } from '@angular/core';
@@ -77,6 +80,12 @@ export class AgentRuntimeControlsService {
 
   register(controls: AgentRuntimeControls): void {
     this.controls$$.next(controls);
+  }
+
+  notifyUpdate(): void {
+    if (this.controls$$.value) {
+      this.controls$$.next(this.controls$$.value);
+    }
   }
 
   /**

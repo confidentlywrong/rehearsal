@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -94,7 +96,6 @@ async def test_full_runner_lifecycle():
 
     # --- Send START_GUN to all runners ---
     start_msg = _msg(RunnerEventType.START_GUN)
-    velocities = []
     for sid, r in runners.items():
         await _run_agent(r, sid, start_msg)
         session = await r.session_service.get_session(
@@ -103,16 +104,12 @@ async def test_full_runner_lifecycle():
             app_name=APP_NAME,
         )
         assert session is not None
-        v = session.state.get("velocity", 0)
-        assert v > 0, f"Runner {sid} has zero velocity after START_GUN"
-        velocities.append(v)
-
-    # Verify velocity distribution has variation (not all identical)
-    unique_velocities = set(round(v, 4) for v in velocities)
-    assert len(unique_velocities) > 1, "All runners have identical velocity"
+        # Runner initialization (velocity, distance=0) is deferred to tick 0.
+        assert session.state.get("velocity") is None
 
     # --- Run ticks ---
     per_runner_distances: dict[str, list[float]] = {sid: [0.0] for sid in runner_sessions}
+    velocities: list[float] = []
 
     for tick in range(MAX_TICKS):
         elapsed = (tick + 1) * minutes_per_tick
@@ -133,7 +130,16 @@ async def test_full_runner_lifecycle():
                 app_name=APP_NAME,
             )
             assert session is not None
+            if tick == 0:
+                v = session.state.get("velocity", 0)
+                assert v > 0, f"Runner {sid} has zero velocity after tick 0"
+                velocities.append(v)
             per_runner_distances[sid].append(session.state.get("distance", 0.0))
+
+        if tick == 0:
+            # Verify velocity distribution has variation (not all identical)
+            unique_velocities = set(round(v, 4) for v in velocities)
+            assert len(unique_velocities) > 1, "All runners have identical velocity"
 
     # --- Collect final states ---
     finished_runners = []

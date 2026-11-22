@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard tickZones and start-zone animations against non-finite deltas, clamp Web-Mercator latitudes, validate traffic coordinates, and dispose discarded placeholder textures/materials.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -198,6 +200,7 @@ function registerZone(
 
 // Check if any runners are within the zone radius
 export function tickZones(ctx: Context, delta: number): void {
+  if (!Number.isFinite(delta) || delta <= 0) return;
   // Always lerp material uniforms for smooth visual transitions
   for (const zone of ctx.zones) {
     const current = zone.material.uniforms['activeStrength'].value as number;
@@ -253,13 +256,27 @@ export function removeZone(ctx: Context, mesh: THREE.Mesh): void {
 
 // ── Water zone ─────────────────────────────────────────────────────────────────
 
+function replaceUniformTexture(
+  material: THREE.ShaderMaterial,
+  uniformName: string,
+  nextTex: THREE.Texture,
+): void {
+  const uniform = material.uniforms?.[uniformName];
+  if (!uniform) return;
+  const prev = uniform.value as THREE.Texture | null | undefined;
+  if (prev && prev !== nextTex && typeof prev.dispose === 'function') {
+    prev.dispose();
+  }
+  uniform.value = nextTex;
+}
+
 export async function getWaterZone(ctx: Context): Promise<THREE.Mesh> {
   await loadIconTextures(ctx);
 
   const causticsMaterial = createCausticsMaterial();
   const causticsTex = await ctx.textureLoader.loadAsync('/assets/textures/caustics.jpg');
   causticsTex.wrapT = causticsTex.wrapS = THREE.RepeatWrapping;
-  causticsMaterial.uniforms['causticsMap'].value = causticsTex;
+  replaceUniformTexture(causticsMaterial, 'causticsMap', causticsTex);
   ctx.zonesMaterialArray.push(causticsMaterial);
   const geo = new THREE.SphereGeometry(100, 36, 36, 0, Math.PI * 2, 0, Math.PI * 0.5);
   const mesh = new THREE.Mesh(geo, causticsMaterial);
@@ -282,6 +299,7 @@ export async function getWaterZone(ctx: Context): Promise<THREE.Mesh> {
   if (!ctx.causticsParticleMaterial) {
     ctx.causticsParticleMaterial = points.material as THREE.ShaderMaterial;
   } else {
+    (points.material as THREE.Material).dispose();
     points.material = ctx.causticsParticleMaterial;
   }
 
@@ -302,7 +320,7 @@ export async function getMedicalZone(ctx: Context): Promise<THREE.Mesh> {
   const medicalMaterial = createMedicalMaterial();
   const medicalTex = await ctx.textureLoader.loadAsync('/assets/textures/ekg.jpg');
   medicalTex.wrapS = THREE.RepeatWrapping;
-  medicalMaterial.uniforms['medicalMap'].value = medicalTex;
+  replaceUniformTexture(medicalMaterial, 'medicalMap', medicalTex);
   ctx.zonesMaterialArray.push(medicalMaterial);
   const geo = new THREE.SphereGeometry(100, 36, 36, 0, Math.PI * 2, 0, Math.PI * 0.5);
   const mesh = new THREE.Mesh(geo, medicalMaterial);
@@ -326,6 +344,7 @@ export async function getMedicalZone(ctx: Context): Promise<THREE.Mesh> {
   if (!ctx.medicalParticleMaterial) {
     ctx.medicalParticleMaterial = points.material as THREE.ShaderMaterial;
   } else {
+    (points.material as THREE.Material).dispose();
     points.material = ctx.medicalParticleMaterial;
   }
   mesh.add(points);
@@ -345,7 +364,7 @@ export async function getToiletZone(ctx: Context): Promise<THREE.Mesh> {
   const toiletMaterial = createToiletMaterial();
   const toiletTex = await ctx.textureLoader.loadAsync('/assets/textures/toilet.jpg');
   //toiletTex.wrapT = toiletTex.wrapS = THREE.RepeatWrapping;
-  toiletMaterial.uniforms['toiletMap'].value = toiletTex;
+  replaceUniformTexture(toiletMaterial, 'toiletMap', toiletTex);
   ctx.zonesMaterialArray.push(toiletMaterial);
   const geo = new THREE.SphereGeometry(100, 36, 36, 0, Math.PI * 2, 0, Math.PI * 0.5);
   const mesh = new THREE.Mesh(geo, toiletMaterial);
@@ -392,9 +411,15 @@ const _CX = ((MAP_CENTER_LON * Math.PI) / 180) * _R;
 const _CY = Math.log(Math.tan(Math.PI / 4 + (MAP_CENTER_LAT * Math.PI) / 180 / 2)) * _R;
 const _S = GLB_TRANSFORM.scale * 10;
 
+const MAX_MERCATOR_LAT = 85.05112878;
+
 export function lngLatToWorld(lon: number, lat: number): THREE.Vector3 {
+  if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+    return new THREE.Vector3(0, 0, 0);
+  }
+  const clampedLat = Math.max(-MAX_MERCATOR_LAT, Math.min(MAX_MERCATOR_LAT, lat));
   const mx = ((lon * Math.PI) / 180) * _R;
-  const my = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 180 / 2)) * _R;
+  const my = Math.log(Math.tan(Math.PI / 4 + (clampedLat * Math.PI) / 180 / 2)) * _R;
   return new THREE.Vector3(
     (mx - _CX) * _S + GLB_TRANSFORM.offsetX,
     0,
@@ -409,7 +434,7 @@ export async function getPortableToiletZone(ctx: Context): Promise<THREE.Mesh> {
 
   const portableToiletMaterial = createToiletMaterial();
   const toiletTex = await ctx.textureLoader.loadAsync('/assets/textures/toilet.jpg');
-  portableToiletMaterial.uniforms['toiletMap'].value = toiletTex;
+  replaceUniformTexture(portableToiletMaterial, 'toiletMap', toiletTex);
   portableToiletMaterial.uniforms['baseColor'].value = new THREE.Color(0x331a22);
   portableToiletMaterial.uniforms['activeColor'].value = new THREE.Color(0xff9494);
   ctx.zonesMaterialArray.push(portableToiletMaterial);
@@ -423,6 +448,7 @@ export async function getPortableToiletZone(ctx: Context): Promise<THREE.Mesh> {
     ctx.crowdParticleMaterial = points.material as THREE.ShaderMaterial;
     ctx.crowdParticleMaterial.uniforms['uHeight'].value = 300;
   } else {
+    (points.material as THREE.Material).dispose();
     points.material = ctx.crowdParticleMaterial;
   }
   mesh.add(points);
@@ -453,6 +479,7 @@ export async function getCrowdZone(ctx: Context): Promise<THREE.Mesh> {
     ctx.crowdParticleMaterial = points.material as THREE.ShaderMaterial;
     ctx.crowdParticleMaterial.uniforms['uHeight'].value = 300;
   } else {
+    (points.material as THREE.Material).dispose();
     points.material = ctx.crowdParticleMaterial;
   }
   mesh.add(points);
@@ -521,11 +548,16 @@ export function triggerStartZoneAnimation(
 
 /** Called every frame from the animate loop. */
 export function tickStartZoneAnimations(ctx: Context, delta: number): void {
+  if (!Number.isFinite(delta) || delta < 0) return;
   for (let i = ctx.startZoneAnimations.length - 1; i >= 0; i--) {
     const anim = ctx.startZoneAnimations[i];
+    const pulseDuration =
+      Number.isFinite(anim.pulseDuration) && anim.pulseDuration > 0 ? anim.pulseDuration : 0.35;
+    const restoreDuration =
+      Number.isFinite(anim.restoreDuration) && anim.restoreDuration > 0 ? anim.restoreDuration : 0.5;
     anim.elapsed += delta;
 
-    const pulseIndex = Math.floor(anim.elapsed / anim.pulseDuration);
+    const pulseIndex = Math.floor(anim.elapsed / pulseDuration);
 
     if (pulseIndex >= anim.pulseCount || anim.restoring) {
       // Restore phase — ease colour and darkness back to originals
@@ -534,7 +566,7 @@ export function tickStartZoneAnimations(ctx: Context, delta: number): void {
         anim.restoreFromDarkness = ctx.vignettePass.uniforms['darkness'].value as number;
       }
       anim.restoreElapsed += delta;
-      const rt = Math.min(anim.restoreElapsed / anim.restoreDuration, 1.0);
+      const rt = Math.min(anim.restoreElapsed / restoreDuration, 1.0);
       const reased = rt * rt * (3 - 2 * rt); // smoothstep
       (ctx.vignettePass.uniforms['uColor'].value as THREE.Color)
         .copy(_white)
@@ -557,7 +589,7 @@ export function tickStartZoneAnimations(ctx: Context, delta: number): void {
       }
     }
 
-    const t = (anim.elapsed % anim.pulseDuration) / anim.pulseDuration;
+    const t = (anim.elapsed % pulseDuration) / pulseDuration;
     const eased = 1 - (1 - t) * (1 - t);
     const bump = Math.sin((1 - t) * Math.PI);
     const s = anim.fromScale + (anim.toScale - anim.fromScale) * eased;
@@ -585,6 +617,13 @@ export interface AffectedIntersection {
 
 let _trafficParticleMaterial: THREE.ShaderMaterial | null = null;
 
+/** Dispose and reset module-level shared zone materials on viewport teardown. */
+export function disposeSharedIconResources(): void {
+  _trafficParticleMaterial?.dispose();
+  _trafficParticleMaterial = null;
+  _zoneTickAccum = 0;
+}
+
 /**
  * Creates one traffic-warning zone mesh per entry in `intersections`,
  * pre-positioned at the corresponding real-world geo coordinates.
@@ -594,11 +633,21 @@ export async function getTrafficZones(
   ctx: Context,
   intersections: AffectedIntersection[],
 ): Promise<THREE.Mesh[]> {
+  if (!Array.isArray(intersections) || intersections.length === 0) return [];
   await loadIconTextures(ctx);
 
   const meshes: THREE.Mesh[] = [];
 
   for (const intersection of intersections) {
+    if (
+      !intersection ||
+      !Array.isArray(intersection.coordinates) ||
+      intersection.coordinates.length < 2 ||
+      !Number.isFinite(intersection.coordinates[0]) ||
+      !Number.isFinite(intersection.coordinates[1])
+    ) {
+      continue;
+    }
     const trafficMaterial = createMedicalMaterial();
     trafficMaterial.uniforms['baseColor'].value = new THREE.Color(0x180800);
     trafficMaterial.uniforms['activeColor'].value = new THREE.Color(0xff6a00);
@@ -613,16 +662,19 @@ export async function getTrafficZones(
       _trafficParticleMaterial = points.material as THREE.ShaderMaterial;
       _trafficParticleMaterial.uniforms['uHeight'].value = 300;
     } else {
+      (points.material as THREE.Material).dispose();
       points.material = _trafficParticleMaterial;
     }
     mesh.add(points);
 
-    const crossStreets = intersection.cross_streets.join(' & ');
+    const crossStreets = Array.isArray(intersection.cross_streets)
+      ? intersection.cross_streets.join(' & ')
+      : '';
     const infoIcon = await getInfoIcon(
       ctx,
       null,
       crossStreets || 'Traffic Alert',
-      `Impact: ${intersection.impact_level}`,
+      `Impact: ${intersection.impact_level ?? 'unknown'}`,
       'traffic',
     );
     mesh.add(infoIcon);

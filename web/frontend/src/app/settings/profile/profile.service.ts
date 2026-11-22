@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate JSON object payloads returned from /api/v1/me/profile.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,8 +67,11 @@ export class ProfileService {
       if (!resp.ok) {
         return { available: false, status: resp.status };
       }
-      const data = (await resp.json()) as UserProfile;
-      return { available: true, status: resp.status, data };
+      const data: unknown = await resp.json();
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return { available: false, status: resp.status };
+      }
+      return { available: true, status: resp.status, data: data as UserProfile };
     } catch {
       return { available: false, status: 0 };
     }

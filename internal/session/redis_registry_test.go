@@ -1,4 +1,6 @@
 // Copyright 2026 Google LLC
+// Modifications copyright 2026 Christian Haeussinger
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +18,8 @@ package session
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -539,4 +543,421 @@ func TestRedisRegistry_BatchTrackSessions_WithSimulationID(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, sims, 2)
 	assert.ElementsMatch(t, []string{"sim-abc", "sim-xyz"}, sims)
+}
+
+func TestRedisRegistry_ListSimulations_PrunesExpiredAfter2TTL(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	require.NoError(t, reg.TrackSession(ctx, "sess-1", "runner_autopilot", "sim-expired"))
+	require.NoError(t, reg.TrackSession(ctx, "sess-2", "runner_autopilot", "sim-live"))
+
+	// Simulate >2*ttl expiry of sim-expired: both session key and simulation:*:sessions expired,
+	// leaving sim-expired stranded in active-simulations.
+	require.NoError(t, client.Del(ctx, "test:session:sess-1", "test:session:sess-1:simulation", "test:simulation:sim-expired:sessions").Err())
+
+	sims, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-live"}, sims, "expired simulation must be pruned and not cause permanent quota lockout")
+
+	// Verify active-simulations SET was also cleaned in Redis.
+	members, err := client.SMembers(ctx, "test:active-simulations").Result()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-live"}, members)
+}
+
+func TestRedisRegistry_Reap_PrunesActiveSimulationsWhenSimSetMissing(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	require.NoError(t, reg.TrackSession(ctx, "sess-1", "runner_autopilot", "sim-expired"))
+	require.NoError(t, client.Del(ctx, "test:session:sess-1", "test:session:sess-1:simulation", "test:simulation:sim-expired:sessions").Err())
+
+	_, err := reg.Reap(ctx)
+	require.NoError(t, err)
+
+	members, err := client.SMembers(ctx, "test:active-simulations").Result()
+	require.NoError(t, err)
+	assert.Empty(t, members)
+}
+
+func TestRedisRegistry_OverwriteCleansReverseIndexes(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	require.NoError(t, reg.TrackSession(ctx, "sess-1", "agent-alpha", "sim-old"))
+	require.NoError(t, reg.TrackSession(ctx, "sess-1", "agent-beta", "sim-new"))
+
+	types, err := reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"agent-beta"}, types)
+
+	sims, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-new"}, sims)
+
+	simID, err := reg.FindSimulation(ctx, "sess-1")
+	require.NoError(t, err)
+	assert.Equal(t, "sim-new", simID)
+
+	// Overwrite via BatchTrackSessions clearing simulationID
+	require.NoError(t, reg.BatchTrackSessions(ctx, []SessionTrackingEntry{
+		{SessionID: "sess-1", AgentType: "agent-gamma", SimulationID: ""},
+	}))
+
+	types, err = reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"agent-gamma"}, types)
+
+	sims, err = reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, sims)
+
+	simID, err = reg.FindSimulation(ctx, "sess-1")
+	require.NoError(t, err)
+	assert.Empty(t, simID)
+}
+
+func TestRedisRegistry_RejectsInvalidInputsAndNilClient(t *testing.T) {
+	ctx := context.Background()
+
+	// Nil receiver and nil client must never panic
+	var nilReg *RedisSessionRegistry
+	for _, err := range []error{
+		nilReg.TrackSession(ctx, "s1", "a1", ""),
+		nilReg.BatchTrackSessions(ctx, []SessionTrackingEntry{{SessionID: "s1", AgentType: "a1"}}),
+		nilReg.UntrackSession(ctx, "s1"),
+	} {
+		require.Error(t, err)
+	}
+	nilClientReg := NewRedisSessionRegistry(nil, "test", time.Hour)
+	_, _, err := nilClientReg.FindAgentType(ctx, "s1")
+	require.Error(t, err)
+	_, err = nilClientReg.ActiveAgentTypes(ctx)
+	require.Error(t, err)
+	_, err = nilClientReg.FindSimulation(ctx, "s1")
+	require.Error(t, err)
+	_, err = nilClientReg.ListSimulations(ctx)
+	require.Error(t, err)
+	_, err = nilClientReg.ListSessions(ctx)
+	require.Error(t, err)
+	_, err = nilClientReg.Flush(ctx)
+	require.Error(t, err)
+	_, err = nilClientReg.Reap(ctx)
+	require.Error(t, err)
+
+	// Input validation
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+	reg := NewRedisSessionRegistry(client, "test", time.Hour)
+
+	for _, badSID := range []string{"", "foo:simulation", "has space", "ctrl\nchar"} {
+		require.Error(t, reg.TrackSession(ctx, badSID, "runner", ""), "expected error for sessionID %q", badSID)
+		require.Error(t, reg.BatchTrackSessions(ctx, []SessionTrackingEntry{{SessionID: badSID, AgentType: "runner"}}))
+		_, _, ferr := reg.FindAgentType(ctx, badSID)
+		require.Error(t, ferr)
+		_, serr := reg.FindSimulation(ctx, badSID)
+		require.Error(t, serr)
+		require.Error(t, reg.UntrackSession(ctx, badSID))
+	}
+	for _, badAgent := range []string{"", "   ", "agent type"} {
+		require.Error(t, reg.TrackSession(ctx, "valid-sid", badAgent, ""), "expected error for agentType %q", badAgent)
+	}
+}
+
+func TestRedisRegistry_PropagatesRedisErrors(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+	reg := NewRedisSessionRegistry(client, "test", time.Hour)
+	ctx := context.Background()
+
+	// Close miniredis to force connection errors
+	s.Close()
+
+	require.Error(t, reg.TrackSession(ctx, "s1", "a1", "sim-1"))
+	require.Error(t, reg.UntrackSession(ctx, "s1"))
+	_, err := reg.ListSimulations(ctx)
+	require.Error(t, err)
+	_, err = reg.Flush(ctx)
+	require.Error(t, err)
+	_, err = reg.Reap(ctx)
+	require.Error(t, err)
+}
+
+func TestRedisRegistry_Flush_DeletesOrphanedAgentSessionSets(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", time.Hour)
+
+	require.NoError(t, client.SAdd(ctx, "test:agent-sessions:orphan_type", "old-sess").Err())
+	_, err := reg.Flush(ctx)
+	require.NoError(t, err)
+
+	exists, err := client.Exists(ctx, "test:agent-sessions:orphan_type").Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), exists)
+}
+
+func TestRedisRegistry_ConcurrentOverwrites_AtomicReverseIndexes(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	const workers = 16
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			agentType := fmt.Sprintf("agent-%d", idx)
+			simID := fmt.Sprintf("sim-%d", idx)
+			if err := reg.TrackSession(ctx, "shared-sess", agentType, simID); err != nil {
+				errs <- err
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	winningAgent, ok, err := reg.FindAgentType(ctx, "shared-sess")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	winningSim, err := reg.FindSimulation(ctx, "shared-sess")
+	require.NoError(t, err)
+	require.NotEmpty(t, winningSim)
+
+	types, err := reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{winningAgent}, types, "concurrent overwrites must not leak phantom active-agents")
+
+	sims, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{winningSim}, sims, "concurrent overwrites must not leak phantom active-simulations")
+
+	require.NoError(t, reg.UntrackSession(ctx, "shared-sess"))
+
+	typesAfter, err := reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, typesAfter)
+
+	simsAfter, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, simsAfter)
+}
+
+func TestRedisRegistry_BatchTrackSessions_ConcurrentOverwrites_Atomic(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	const workers = 12
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			entries := []SessionTrackingEntry{
+				{
+					SessionID:    "shared-batch-sess",
+					AgentType:    fmt.Sprintf("batch-agent-%d", idx),
+					SimulationID: fmt.Sprintf("batch-sim-%d", idx),
+				},
+				{
+					SessionID:    fmt.Sprintf("owned-sess-%d", idx),
+					AgentType:    "batch-shared-type",
+					SimulationID: "batch-shared-sim",
+				},
+			}
+			if err := reg.BatchTrackSessions(ctx, entries); err != nil {
+				errs <- err
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	winningAgent, ok, err := reg.FindAgentType(ctx, "shared-batch-sess")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	winningSim, err := reg.FindSimulation(ctx, "shared-batch-sess")
+	require.NoError(t, err)
+	require.NotEmpty(t, winningSim)
+
+	types, err := reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"batch-shared-type", winningAgent}, types)
+
+	sims, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"batch-shared-sim", winningSim}, sims)
+}
+
+func TestRedisRegistry_ConcurrentTrackAndUntrack_AtomicReverseIndexes(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	const iterations = 60
+	for i := 0; i < iterations; i++ {
+		require.NoError(t, reg.TrackSession(ctx, "sess-1", "agent-init", "sim-init"))
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var trackErr, untrackErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			trackErr = reg.TrackSession(ctx, "sess-1", "agent-new", "sim-new")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			untrackErr = reg.UntrackSession(ctx, "sess-1")
+		}()
+
+		close(start)
+		wg.Wait()
+
+		require.NoError(t, trackErr, "iter %d", i)
+		require.NoError(t, untrackErr, "iter %d", i)
+
+		agentType, ok, err := reg.FindAgentType(ctx, "sess-1")
+		require.NoError(t, err, "iter %d", i)
+
+		simID, err := reg.FindSimulation(ctx, "sess-1")
+		require.NoError(t, err, "iter %d", i)
+
+		types, err := reg.ActiveAgentTypes(ctx)
+		require.NoError(t, err, "iter %d", i)
+
+		sims, err := reg.ListSimulations(ctx)
+		require.NoError(t, err, "iter %d", i)
+
+		if !ok {
+			assert.Empty(t, simID, "iter %d: simulation key must not outlive untracked session", i)
+			assert.Empty(t, types, "iter %d: FindAgentType==false but ActiveAgentTypes leaked %v", i, types)
+			assert.Empty(t, sims, "iter %d: FindAgentType==false but ListSimulations leaked %v", i, sims)
+		} else {
+			assert.Equal(t, "agent-new", agentType, "iter %d", i)
+			assert.Equal(t, "sim-new", simID, "iter %d", i)
+			assert.Equal(t, []string{"agent-new"}, types, "iter %d", i)
+			assert.Equal(t, []string{"sim-new"}, sims, "iter %d", i)
+
+			// Verify subsequent untrack also cleans up cleanly before next iteration.
+			require.NoError(t, reg.UntrackSession(ctx, "sess-1"), "iter %d", i)
+			typesAfter, err := reg.ActiveAgentTypes(ctx)
+			require.NoError(t, err, "iter %d", i)
+			assert.Empty(t, typesAfter, "iter %d", i)
+			simsAfter, err := reg.ListSimulations(ctx)
+			require.NoError(t, err, "iter %d", i)
+			assert.Empty(t, simsAfter, "iter %d", i)
+		}
+	}
+}
+
+func TestRedisRegistry_UntrackSession_EdgeCasesAndScriptFlush(t *testing.T) {
+	s := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+	reg := NewRedisSessionRegistry(client, "test", 1*time.Hour)
+
+	// 1. Untracking a non-existent session is a clean no-op.
+	require.NoError(t, reg.UntrackSession(ctx, "does-not-exist"))
+	types, err := reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, types)
+	sims, err := reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, sims)
+
+	// 2. Untracking a session with empty simulation ID cleans only its agent index.
+	require.NoError(t, reg.TrackSession(ctx, "sess-nosim", "agent-only", ""))
+	require.NoError(t, reg.TrackSession(ctx, "sess-other", "agent-other", "sim-other"))
+	require.NoError(t, reg.UntrackSession(ctx, "sess-nosim"))
+
+	_, ok, err := reg.FindAgentType(ctx, "sess-nosim")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	types, err = reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"agent-other"}, types)
+
+	sims, err = reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sim-other"}, sims)
+
+	// 3. Cancelled context returns ctx.Err() without mutating Redis.
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	require.ErrorIs(t, reg.UntrackSession(cancelledCtx, "sess-other"), context.Canceled)
+
+	agentType, ok, err := reg.FindAgentType(ctx, "sess-other")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "agent-other", agentType)
+
+	// 4. SCRIPT FLUSH (NOSCRIPT) automatically reloads and succeeds on UntrackSession.
+	require.NoError(t, client.ScriptFlush(ctx).Err())
+	require.NoError(t, reg.UntrackSession(ctx, "sess-other"))
+
+	_, ok, err = reg.FindAgentType(ctx, "sess-other")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	types, err = reg.ActiveAgentTypes(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, types)
+
+	sims, err = reg.ListSimulations(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, sims)
 }

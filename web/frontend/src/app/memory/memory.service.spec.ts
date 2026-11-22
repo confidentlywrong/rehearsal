@@ -14,6 +14,8 @@
 
 /**
  * Copyright 2026 Google LLC. Apache-2.0.
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: add URL-encoding, config fetch, document wrapper unwrap, and malformed 2xx XHR JSON tests.
  *
  * MemoryService unit tests — exercises the request shape and the
  * error-mapping contract for /api/v1/memory/*. We mock window.fetch
@@ -266,6 +268,188 @@ describe('MemoryService.uploadDocument', () => {
     } finally {
       globalThis.XMLHttpRequest = origXHR;
     }
+  });
+
+  it('URL-encodes analysisId and rejects with MemoryApiError("invalid_json") on malformed 2xx XHR JSON', async () => {
+    let mockXhr!: MockXHR;
+    const origXHR = globalThis.XMLHttpRequest;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).XMLHttpRequest = class extends MockXHR {
+      constructor() {
+        super();
+        mockXhr = this;
+      }
+    };
+
+    try {
+      const file = new File(['hi!'], 'plan.txt', { type: 'text/plain' });
+      const result = new MemoryService({ getAppCheckToken: async () => 'test-token' } as any).uploadDocument(
+        'analysis/with spaces?#1',
+        'memo',
+        file,
+      );
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockXhr.openArgs).toEqual([
+        'POST',
+        '/api/v1/memory/analyses/analysis%2Fwith%20spaces%3F%231/documents',
+      ]);
+
+      mockXhr.status = 200;
+      mockXhr.responseText = '<html>not json</html>';
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const cb of (mockXhr as any)._listeners['load'] ?? []) cb();
+
+      await expect(result.promise).rejects.toMatchObject({
+        name: 'MemoryApiError',
+        status: 200,
+        code: 'invalid_json',
+      });
+    } finally {
+      globalThis.XMLHttpRequest = origXHR;
+    }
+  });
+
+  it('unwraps { document, warning } gateway payload and preserves server warning on MemoryDocument', async () => {
+    const doc = {
+      id: 'd-wrapped',
+      analysis_id: 'a1',
+      kind: 'memo',
+      filename: 'wrapped.txt',
+      sha256: 'bb',
+      storage_uri: 'file:///tmp/wrapped',
+      byte_size: 12,
+      ingested_at: '2026-06-26T10:00:00Z',
+    };
+
+    let mockXhr!: MockXHR;
+    const origXHR = globalThis.XMLHttpRequest;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).XMLHttpRequest = class extends MockXHR {
+      constructor() {
+        super();
+        mockXhr = this;
+      }
+    };
+
+    try {
+      const file = new File(['hello world!'], 'wrapped.txt', { type: 'text/plain' });
+      const result = new MemoryService({ getAppCheckToken: async () => null } as any).uploadDocument('a1', 'memo', file);
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const indexingWarning = 'Document saved but indexing failed. It will not appear in search results until re-indexed.';
+      mockXhr._fireLoad(201, { document: doc, warning: indexingWarning });
+      const out = await result.promise;
+      expect(out).toEqual({ ...doc, warning: indexingWarning });
+    } finally {
+      globalThis.XMLHttpRequest = origXHR;
+    }
+  });
+
+  it('rejects with MemoryApiError("aborted") and never opens XHR when cancel() is called before getAppCheckToken resolves', async () => {
+    let mockXhr: MockXHR | undefined;
+    const origXHR = globalThis.XMLHttpRequest;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).XMLHttpRequest = class extends MockXHR {
+      constructor() {
+        super();
+        mockXhr = this;
+      }
+    };
+
+    try {
+      let resolveToken!: (tok: string | null) => void;
+      const authMock = {
+        getAppCheckToken: vi.fn(
+          () =>
+            new Promise<string | null>((resolve) => {
+              resolveToken = resolve;
+            }),
+        ),
+      } as unknown as AuthService;
+
+      const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+      const upload = new MemoryService(authMock).uploadDocument('a1', 'memo', file);
+
+      upload.cancel();
+
+      await expect(upload.promise).rejects.toMatchObject({
+        name: 'MemoryApiError',
+        status: 0,
+        code: 'aborted',
+      });
+
+      resolveToken('late-token');
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockXhr?.openArgs).toEqual([]);
+      expect(mockXhr?.sendArgs).toEqual([]);
+    } finally {
+      globalThis.XMLHttpRequest = origXHR;
+    }
+  });
+
+  it('calls xhr.abort() and rejects once when cancel() is called after xhr.open()', async () => {
+    let mockXhr!: MockXHR;
+    let abortCalled = false;
+    const origXHR = globalThis.XMLHttpRequest;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).XMLHttpRequest = class extends MockXHR {
+      constructor() {
+        super();
+        mockXhr = this;
+      }
+      override abort() {
+        abortCalled = true;
+        for (const cb of (this as unknown as { _listeners: Record<string, Array<() => void>> })._listeners['abort'] ?? []) {
+          cb();
+        }
+      }
+    };
+
+    try {
+      const file = new File(['hello'], 'notes.txt', { type: 'text/plain' });
+      const upload = new MemoryService({ getAppCheckToken: async () => 'tok' } as unknown as AuthService).uploadDocument('a1', 'memo', file);
+
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(mockXhr.openArgs).toHaveLength(2);
+
+      upload.cancel();
+      expect(abortCalled).toBe(true);
+      await expect(upload.promise).rejects.toMatchObject({
+        name: 'MemoryApiError',
+        status: 0,
+        code: 'aborted',
+      });
+    } finally {
+      globalThis.XMLHttpRequest = origXHR;
+    }
+  });
+});
+
+describe('MemoryService.getMemoryConfig', () => {
+  it('GETs /api/v1/memory/config with same-origin credentials', async () => {
+    const spy = vi.fn().mockResolvedValue(
+      jsonResponse({
+        text_readable_kinds: ['memo', 'note', 'plan', 'postmortem', 'transcript'],
+        max_upload_bytes: 33554432,
+      }),
+    );
+    installFetch(spy);
+
+    const cfg = await new MemoryService({ getAppCheckToken: async () => 't' } as any).getMemoryConfig();
+    expect(spy).toHaveBeenCalledWith('/api/v1/memory/config', expect.objectContaining({
+      method: 'GET',
+      credentials: 'same-origin',
+    }));
+    expect(cfg.text_readable_kinds).toEqual(['memo', 'note', 'plan', 'postmortem', 'transcript']);
+    expect(cfg.max_upload_bytes).toBe(33554432);
   });
 });
 

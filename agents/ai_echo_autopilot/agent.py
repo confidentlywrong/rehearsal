@@ -89,11 +89,19 @@ echo_a2a_agent, agent_card = create_a2a_deployment(
     agent_getter=get_agent,
 )
 
+def _resolve_port() -> int:
+    return int(
+        config.optional("PORT", "").strip()
+        or config.optional("AI_ECHO_AUTOPILOT_PORT", "").strip()
+        or "9125"
+    )
+
+
 if __name__ == "__main__":
     from agents.utils.serve import create_agent_app, serve_agent
 
     config.load_env()
-    port = int(config.optional("PORT", config.optional("AI_ECHO_AUTOPILOT_PORT", "8217")))
+    port = _resolve_port()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     logger.info("Starting AI Echo Autopilot (Tier 3) agent server on port %d", port)
 

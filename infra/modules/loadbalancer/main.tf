@@ -132,7 +132,11 @@ resource "google_compute_backend_service" "backends" {
 # something useful.
 locals {
   # services keys that the operator actually exposed a domain for.
-  routed_keys = sort([for k in keys(var.domain_names) : k if contains(keys(var.services), k)])
+  routed_domains = {
+    for k, v in var.domain_names : k => v
+    if contains(keys(var.services), k)
+  }
+  routed_keys = sort(keys(local.routed_domains))
   # default_backend is the first routed backend, alphabetically.
   # Falls back to "frontend" if it exists, then to the first key in
   # var.services; the conditional handles the "no domains" edge
@@ -148,7 +152,7 @@ resource "google_compute_url_map" "url_map" {
   default_service = google_compute_backend_service.backends[local.default_backend_key].id
 
   dynamic "host_rule" {
-    for_each = var.domain_names
+    for_each = local.routed_domains
     content {
       hosts        = [host_rule.value]
       path_matcher = host_rule.key
@@ -156,7 +160,7 @@ resource "google_compute_url_map" "url_map" {
   }
 
   dynamic "path_matcher" {
-    for_each = var.domain_names
+    for_each = local.routed_domains
     content {
       name            = path_matcher.key
       default_service = google_compute_backend_service.backends[path_matcher.key].id
@@ -177,11 +181,11 @@ resource "google_compute_managed_ssl_certificate" "cert" {
   # Cert name includes a content hash of the domain list so a domain
   # change forces a recreate (managed certs are immutable on the
   # `managed.domains` field).
-  name    = "${var.environment}-lb-cert-${substr(sha256(jsonencode(values(var.domain_names))), 0, 8)}"
+  name    = "${var.environment}-lb-cert-${substr(sha256(jsonencode(values(local.routed_domains))), 0, 8)}"
   project = var.project_id
 
   managed {
-    domains = values(var.domain_names)
+    domains = values(local.routed_domains)
   }
 
   lifecycle {
@@ -258,7 +262,7 @@ resource "google_compute_global_forwarding_rule" "http" {
 # operator points DNS by hand (typical for zones hosted outside
 # Google Cloud or in a different project).
 resource "google_dns_record_set" "a_records" {
-  for_each = var.dns_zone_name != "" ? var.domain_names : {}
+  for_each = var.dns_zone_name != "" ? local.routed_domains : {}
 
   project      = var.project_id
   managed_zone = var.dns_zone_name

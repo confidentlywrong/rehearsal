@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -39,12 +42,14 @@ import (
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/agent"
+	"github.com/GoogleCloudPlatform/race-condition/internal/auth"
 	"github.com/GoogleCloudPlatform/race-condition/internal/billing"
 	"github.com/GoogleCloudPlatform/race-condition/internal/config"
 	"github.com/GoogleCloudPlatform/race-condition/internal/logging"
 	"github.com/GoogleCloudPlatform/race-condition/internal/middleware"
 	"github.com/GoogleCloudPlatform/race-condition/internal/tracing"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -98,6 +103,13 @@ func (g *grpcPubSubChecker) CheckHealth(projectID, topicID string) error {
 	return err
 }
 
+func (g *grpcPubSubChecker) Close() error {
+	if g == nil || g.client == nil {
+		return nil
+	}
+	return g.client.Close()
+}
+
 // pubsubHealthChecker lazily connects to PubSub and retries on failure.
 type pubsubHealthChecker struct {
 	mu          sync.Mutex
@@ -136,15 +148,25 @@ func defaultPubSubConnect() (pubsubChecker, error) {
 	topicID := config.Optional("PUBSUB_TOPIC_ID", "")
 	if emulatorHost != "" && topicID != "" {
 		topicName := fmt.Sprintf("projects/%s/topics/%s", projectID, topicID)
-		_, getErr := client.GetTopic(context.Background(), &pubsubpb.GetTopicRequest{Topic: topicName})
+		_, getErr := client.GetTopic(ctx, &pubsubpb.GetTopicRequest{Topic: topicName})
 		if getErr != nil {
 			log.Printf("Creating PubSub topic %s in emulator", topicID)
-			if _, createErr := client.CreateTopic(context.Background(), &pubsubpb.Topic{Name: topicName}); createErr != nil {
+			if _, createErr := client.CreateTopic(ctx, &pubsubpb.Topic{Name: topicName}); createErr != nil {
 				log.Printf("Warning: Failed to create topic %s: %v", topicID, createErr)
 			}
 		}
 	}
 	return &grpcPubSubChecker{client: client}, nil
+}
+
+// Close releases any underlying gRPC client held by the health checker.
+func (p *pubsubHealthChecker) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if closer, ok := p.checker.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	p.checker = nil
 }
 
 // Check returns "online" or "offline" based on PubSub health.
@@ -171,7 +193,10 @@ func (p *pubsubHealthChecker) Check() string {
 
 	// Health check
 	if err := p.checker.CheckHealth(projectID, topicID); err != nil {
-		// Connection may be stale; clear it so next check retries
+		// Connection may be stale; close and clear it so next check retries cleanly.
+		if closer, ok := p.checker.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		p.checker = nil
 		return "offline"
 	}
@@ -238,6 +263,29 @@ func (a *alloydbHealthChecker) Check(connStr string) string {
 	return "online"
 }
 
+// Close releases any open database pool held by the health checker.
+func (a *alloydbHealthChecker) Close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.conn != nil {
+		a.conn.Close()
+		a.conn = nil
+	}
+}
+
+// wireAdminAccountLookup connects a FirebaseResolver to the Postgres
+// users table so IsSuperadmin, Status, deleted_at, and token revocation
+// are hydrated on every admin request (matching cmd/gateway and cmd/frontend).
+func wireAdminAccountLookup(resolver account.Resolver, store *account.Store) {
+	if store == nil {
+		return
+	}
+	if fr, ok := resolver.(*account.FirebaseResolver); ok && fr != nil {
+		fr.WithLookup(store.GetUserAnyState)
+		log.Printf("ADMIN: FirebaseResolver wired with DB user lookup")
+	}
+}
+
 // newGCPClient returns an HTTP client with GCP Application Default Credentials.
 // Uses OAuth2 access tokens (not ID tokens) with cloud-platform scope,
 // matching the pattern in switchboard.go and catalog.go for AE communication.
@@ -262,32 +310,40 @@ var defaultCategories = []CategoryInfo{
 	{ID: "frontend", Name: "Frontend", Icon: "🌐"},
 }
 
-
 // aeCardPath is the Agent Engine card endpoint used for health checks.
 const aeCardPath = "/a2a/v1/card"
 
 // defaultPortMap provides fallback ports for agents when env vars are not set.
 var defaultPortMap = map[string]string{
-	"planner":                "9105",
-	"simulator":              "9104",
-	"runner_autopilot":       "9110",
-	"planner_with_eval":      "9106",
-	"simulator_with_failure": "9107",
-	"planner_with_memory":    "9109",
+	"simulator":                      "9104",
+	"planner":                        "9105",
+	"planner_with_eval":              "9106",
+	"simulator_with_failure":         "9107",
+	"runner":                         "9108",
+	"planner_with_memory":            "9109",
+	"runner_autopilot":               "9110",
+	"leadership_planner":             "9114",
+	"leadership_planner_with_eval":   "9115",
+	"leadership_planner_with_memory": "9116",
+	"leadership_runner":              "9117",
+	"leadership_runner_autopilot":    "9120",
+	"ai_echo":                        "9123",
+	"ai_echo_reactive":               "9124",
+	"ai_echo_autopilot":              "9125",
 }
 
 // staticServices returns the hardcoded non-agent services.
 func staticServices() []ServiceInfo {
 	return []ServiceInfo{
-		{ID: "admin", Name: "Admin Dash", Category: "admin", Description: "Centralized health monitoring and service portal.", URL: resolveURL("ADMIN", "9121"), HealthPath: "/health", Browseable: true, Type: "go"},
-		{ID: "gateway", Name: "Gateway", Category: "core", Description: "Primary API entry point and session router.", URL: resolveURL("GATEWAY", "9101"), HealthPath: "/health", Browseable: true, Type: "go"},
+		{ID: "admin", Name: "Admin Dash", Category: "admin", Description: "Centralized health monitoring and service portal.", URL: resolveURL("ADMIN", config.DefaultAdminPort), HealthPath: "/health", Browseable: true, Type: "go"},
+		{ID: "gateway", Name: "Gateway", Category: "core", Description: "Primary API entry point and session router.", URL: resolveURL("GATEWAY", config.DefaultGatewayPort), HealthPath: "/health", Browseable: true, Type: "go"},
 		{ID: "redis", Name: "Redis", Category: "core", Description: "Session state & orchestration store.", URL: "n/a", HealthPath: "/", Browseable: false, Type: "infra"},
 		{ID: "pubsub", Name: "PubSub", Category: "core", Description: "Global telemetry bus emulator.", URL: "n/a", HealthPath: "/", Browseable: false, Type: "infra"},
 		{ID: "alloydb", Name: "AlloyDB", Category: "core", Description: "Durable session state store (PostgreSQL-compatible).", URL: "n/a", HealthPath: "/", Browseable: false, Type: "infra"},
-		{ID: "tester", Name: "Tester UI", Category: "ui", Description: "Manual A2UI component testing laboratory.", URL: resolveURL("TESTER", "9112"), HealthPath: "/health", Browseable: true, Type: "vite"},
+		{ID: "tester", Name: "Tester UI", Category: "ui", Description: "Manual A2UI component testing laboratory.", URL: resolveURL("TESTER", config.DefaultTesterPort), HealthPath: "/health", Browseable: true, Type: "vite"},
 		{ID: "dash", Name: "Telemetry Dash", Category: "ui", Description: "Pub/Sub telemetry log and agent activity stream.", URL: resolveURL("DASH", "9111"), HealthPath: "/health", Browseable: true, Type: "python"},
 		{ID: "frontend-app", Name: "Primary Frontend", Category: "frontend", Description: "Main consumer-facing simulation interface.", URL: resolveURL("FRONTEND_APP", "9119"), HealthPath: "/health", Browseable: false, Type: "external"},
-		{ID: "frontend-bff", Name: "Frontend BFF", Category: "frontend", Description: "Local BFF proxy mirroring cloud frontend service.", URL: resolveURL("FRONTEND_BFF", "9118"), HealthPath: "/health", Browseable: true, Type: "go"},
+		{ID: "frontend-bff", Name: "Frontend BFF", Category: "frontend", Description: "Local BFF proxy mirroring cloud frontend service.", URL: resolveURL("FRONTEND_BFF", config.DefaultFrontendPort), HealthPath: "/health", Browseable: true, Type: "go"},
 	}
 }
 
@@ -356,19 +412,49 @@ func resolveURL(prefix, defaultPort string) string {
 	return "http://127.0.0.1:" + defaultPort
 }
 
+// resolveGatewayOIDCAudience determines whether Cloud Run OIDC tokens should
+// be minted when calling the Gateway. Local HTTP loopback dev (127.0.0.1 /
+// localhost) returns "" so local runs never fail without GCP ADC.
+func resolveGatewayOIDCAudience(gatewayURL string) string {
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_AUDIENCE")); v != "" {
+		return v
+	}
+	if strings.TrimSpace(os.Getenv("IAP_CLIENT_ID")) != "" {
+		return auth.ResolveAudience(gatewayURL)
+	}
+	if auth.IsCloudRunURL(gatewayURL) {
+		return auth.AudienceFor(gatewayURL)
+	}
+	return ""
+}
+
 // loadAgentsFromGateway fetches the agent catalog from the gateway's HTTP API.
 // This replaces the old loadAgentsFromCatalog that read from a static JSON file.
 func loadAgentsFromGateway(gatewayURL string) []ServiceInfo {
-	if gatewayURL == "" {
+	if strings.TrimSpace(gatewayURL) == "" {
 		log.Printf("Warning: GATEWAY_URL not set, cannot discover agents")
 		return nil
 	}
 
-	url := strings.TrimRight(gatewayURL, "/") + "/api/v1/agent-types"
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	catalogURL := strings.TrimRight(strings.TrimSpace(gatewayURL), "/") + "/api/v1/agent-types"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, catalogURL, nil)
 	if err != nil {
-		log.Printf("Warning: Could not fetch agent catalog from %s: %v", url, err)
+		log.Printf("Warning: Could not build agent catalog request for %s: %v", catalogURL, err)
+		return nil
+	}
+	if aud := resolveGatewayOIDCAudience(gatewayURL); aud != "" {
+		if oidcErr := middleware.AttachOIDCTokenAsE(ctx, req.Header, aud, "X-Serverless-Authorization"); oidcErr != nil {
+			log.Printf("Warning: Could not acquire OIDC token for gateway catalog %s: %v", catalogURL, oidcErr)
+			return nil
+		}
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Warning: Could not fetch agent catalog from %s: %v", catalogURL, err)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -378,7 +464,7 @@ func loadAgentsFromGateway(gatewayURL string) []ServiceInfo {
 		return nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		log.Printf("Warning: Could not read gateway response: %v", err)
 		return nil
@@ -409,26 +495,37 @@ func loadAgentsFromGateway(gatewayURL string) []ServiceInfo {
 		if name == "" {
 			name = id
 		}
-		// Title-case the name for display
-		if len(name) > 0 {
+		// Title-case the name for display (UTF-8 rune-safe).
+		if r, size := utf8.DecodeRuneInString(name); r != utf8.RuneError && size > 0 {
+			name = string(unicode.ToUpper(r)) + name[size:]
+		} else if len(name) > 0 {
 			name = strings.ToUpper(name[:1]) + name[1:]
 		}
 
-		prefix := strings.ToUpper(id)
-		defaultPort := defaultPortMap[id]
-		if defaultPort == "" {
-			defaultPort = "0"
-		}
+		normID := strings.ToLower(strings.ReplaceAll(id, "-", "_"))
+		prefix := strings.ToUpper(normID)
 
 		// Detect Agent Engine agents from their card URL.
 		agentType := "python"
 		healthPath := "/health"
-		agentURL := resolveURL(prefix, defaultPort)
-
-		if agent.IsAgentEngineURL(entry.URL) {
+		var agentURL string
+		switch {
+		case agent.IsAgentEngineURL(entry.URL):
 			agentType = "ae"
 			healthPath = aeCardPath
 			agentURL = strings.TrimRight(entry.URL, "/")
+		case strings.TrimSpace(config.Optional(prefix+"_URL", "")) != "":
+			agentURL = strings.TrimSpace(config.Optional(prefix+"_URL", ""))
+		case auth.IsCloudRunURL(entry.URL):
+			agentURL = auth.AudienceFor(entry.URL)
+		case defaultPortMap[normID] != "":
+			agentURL = "http://127.0.0.1:" + defaultPortMap[normID]
+		default:
+			if aud := auth.AudienceFor(entry.URL); aud != "" {
+				agentURL = aud
+			} else {
+				agentURL = "n/a"
+			}
 		}
 
 		agents = append(agents, ServiceInfo{
@@ -457,6 +554,123 @@ func buildServiceRegistry(gatewayURL string) ServiceRegistryResponse {
 	}
 }
 
+func configureTrustedProxies(r *gin.Engine) error {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return r.SetTrustedProxies(nil)
+	}
+	var proxies []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			proxies = append(proxies, trimmed)
+		}
+	}
+	if len(proxies) == 0 {
+		return r.SetTrustedProxies(nil)
+	}
+	return r.SetTrustedProxies(proxies)
+}
+
+func environmentResetHandler(gatewayURL, oidcAudience string, client *http.Client) gin.HandlerFunc {
+	if client == nil {
+		client = &http.Client{Timeout: 25 * time.Second}
+	}
+	trimmedBase := strings.TrimRight(strings.TrimSpace(gatewayURL), "/")
+	return func(c *gin.Context) {
+		if trimmedBase == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "gateway URL not configured"})
+			return
+		}
+		parsed, err := url.Parse(trimmedBase)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "gateway URL invalid"})
+			return
+		}
+
+		var bodyBytes []byte
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+			bodyBytes, err = io.ReadAll(c.Request.Body)
+			if err != nil {
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+					return
+				}
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
+		defer cancel()
+
+		targetURL := trimmedBase + "/api/v1/environment/reset"
+		var bodyReader io.Reader
+		if len(bodyBytes) > 0 {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		outReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bodyReader)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "gateway request construction failed"})
+			return
+		}
+
+		if ct := strings.TrimSpace(c.GetHeader("Content-Type")); ct != "" {
+			outReq.Header.Set("Content-Type", ct)
+		} else if len(bodyBytes) > 0 {
+			outReq.Header.Set("Content-Type", "application/json")
+		}
+		for _, h := range []string{"Authorization", "Cookie", "X-Firebase-AppCheck", "X-Local-Dev-Superadmin", "X-Request-ID"} {
+			if vals := c.Request.Header.Values(h); len(vals) > 0 {
+				for _, v := range vals {
+					outReq.Header.Add(h, v)
+				}
+			}
+		}
+		// Ensure caller cannot smuggle internal OIDC or GCP headers.
+		outReq.Header.Del("X-Serverless-Authorization")
+		for k := range outReq.Header {
+			if strings.HasPrefix(strings.ToLower(k), "x-goog-") {
+				outReq.Header.Del(k)
+			}
+		}
+
+		if oidcAudience != "" {
+			if oidcErr := middleware.AttachOIDCTokenAsE(ctx, outReq.Header, oidcAudience, "X-Serverless-Authorization"); oidcErr != nil {
+				log.Printf("ADMIN: gateway reset OIDC token error: %v", oidcErr)
+				c.JSON(http.StatusBadGateway, gin.H{"error": "gateway service authentication unavailable"})
+				return
+			}
+		}
+
+		resp, err := client.Do(outReq)
+		if err != nil {
+			log.Printf("ADMIN: gateway reset proxy error: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				c.JSON(http.StatusGatewayTimeout, gin.H{"error": "gateway timeout"})
+				return
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"error": "gateway unreachable"})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			log.Printf("ADMIN: gateway reset response read error: %v", readErr)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "gateway response unreadable"})
+			return
+		}
+
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json; charset=utf-8"
+		}
+		c.Data(resp.StatusCode, contentType, respBody)
+	}
+}
+
 // setupRouter creates the admin Gin engine with all routes.
 //
 // accountResolver is required; it resolves the per-user identity for
@@ -466,6 +680,10 @@ func buildServiceRegistry(gatewayURL string) ServiceRegistryResponse {
 // /admin/billing/reconcile returns 503 in that case.
 func setupRouter(rdb *redis.Client, psHealthChecker *pubsubHealthChecker, dbHealthChecker *alloydbHealthChecker, gatewayURL string, gcpClient *http.Client, accountResolver account.Resolver, accountStore *account.Store, reconciler *billing.Reconciler) *gin.Engine {
 	r := gin.Default()
+	if err := configureTrustedProxies(r); err != nil {
+		log.Printf("ADMIN: invalid TRUSTED_PROXIES (%v); disabling trusted proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	// G5a: structured request log + request_id propagation. Mounted
 	// FIRST so request_id is on ctx for everything downstream.
@@ -517,9 +735,15 @@ func setupRouter(rdb *redis.Client, psHealthChecker *pubsubHealthChecker, dbHeal
 			}
 		}
 
-		pubsubStatus := psHealthChecker.Check()
-		alloydbConnStr := buildAlloyDBConnStr()
-		alloydbStatus := dbHealthChecker.Check(alloydbConnStr)
+		pubsubStatus := "offline"
+		if psHealthChecker != nil {
+			pubsubStatus = psHealthChecker.Check()
+		}
+		alloydbStatus := "offline"
+		if dbHealthChecker != nil {
+			alloydbConnStr := buildAlloyDBConnStr()
+			alloydbStatus = dbHealthChecker.Check(alloydbConnStr)
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"redis":   redisStatus,
@@ -635,14 +859,28 @@ func setupRouter(rdb *redis.Client, psHealthChecker *pubsubHealthChecker, dbHeal
 		usageUserHandler(usageReaderForAdmin, nil),
 	)
 
+	// Authenticated BFF proxy for environment reset -> Gateway /api/v1/environment/reset.
+	resetHTTPClient := &http.Client{Timeout: 25 * time.Second}
+	r.POST("/api/admin/environment/reset",
+		requireSA,
+		environmentResetHandler(gatewayURL, resolveGatewayOIDCAudience(gatewayURL), resetHTTPClient),
+	)
+
 	// Serve index.html for root and any unknown routes (SPA support)
 	r.NoRoute(func(c *gin.Context) {
+		var path string
+		if c.Request.URL != nil {
+			path = c.Request.URL.Path
+		}
+		if strings.HasPrefix(path, "/api/") || path == "/api" || strings.HasPrefix(path, "/admin/") || path == "/admin" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
 		if c.Request.Method != "GET" {
 			c.Status(http.StatusNotFound)
 			return
 		}
 
-		path := c.Request.URL.Path
 		// If it looks like a file (has an extension) or is in /assets, and we are here, it's a 404
 		if strings.Contains(path, ".") || strings.HasPrefix(path, "/assets/") {
 			c.Status(http.StatusNotFound)
@@ -684,6 +922,35 @@ func buildAlloyDBConnStr() string {
 	return u.String()
 }
 
+var errTrailingJSON = errors.New("unexpected trailing data after JSON value")
+
+// decodeStrictJSON decodes a single JSON value from c.Request.Body (capped at
+// maxBytes via http.MaxBytesReader), rejecting trailing non-whitespace tokens
+// or concatenated JSON values.
+func decodeStrictJSON(c *gin.Context, dst any, maxBytes int64) error {
+	if c.Request == nil || c.Request.Body == nil {
+		return errors.New("request body is empty")
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	dec := json.NewDecoder(c.Request.Body)
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errTrailingJSON
+		}
+		return err
+	}
+	if binding.Validator != nil {
+		if err := binding.Validator.ValidateStruct(dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // setUserPlanHandler returns a gin handler that changes the plan
 // tier on an existing user. Operator (superadmin) only — the
 // /admin/users/:id/plan path is gated by RequireSuperadmin.
@@ -711,9 +978,13 @@ func setUserPlanHandler(store *account.Store) gin.HandlerFunc {
 			return
 		}
 		var body req
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
-		if err := c.ShouldBindJSON(&body); err != nil {
-			log.Printf("ShouldBindJSON: %v", err)
+		if err := decodeStrictJSON(c, &body, 1<<20); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
+			log.Printf("decodeStrictJSON: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 			return
 		}
@@ -801,9 +1072,13 @@ func reconcileBillingHandler(store *account.Store, reconciler *billing.Reconcile
 			return
 		}
 		var body req
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
-		if err := c.ShouldBindJSON(&body); err != nil {
-			log.Printf("ShouldBindJSON: %v", err)
+		if err := decodeStrictJSON(c, &body, 1<<20); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
+			log.Printf("decodeStrictJSON: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 			return
 		}
@@ -852,7 +1127,8 @@ func reconcileBillingHandler(store *account.Store, reconciler *billing.Reconcile
 				})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+			log.Printf("handler error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 		}
 	}
 }
@@ -962,7 +1238,7 @@ func setUserStatusHandler(store *account.Store, target account.UserStatus) gin.H
 		if err != nil {
 			switch {
 			case errors.Is(err, account.ErrInvalidStatus):
-				log.Printf("ShouldBindJSON: %v", err)
+				log.Printf("SetUserStatus: %v", err)
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 				return
 			case errors.Is(err, account.ErrNotFound):
@@ -979,7 +1255,8 @@ func setUserStatusHandler(store *account.Store, target account.UserStatus) gin.H
 			action = account.ActionUserRejected
 		}
 		recordAuditBestEffort(ctx, store, c, account.AuditEntry{
-			UserID:   actorID,
+			UserID:   userID,
+			ActorID:  actorID,
 			Action:   action,
 			Target:   userID,
 			Metadata: map[string]any{"status": string(target)},
@@ -1091,7 +1368,7 @@ func main() {
 	}
 	defer func() { _ = tracingShutdown(context.Background()) }()
 
-	port := config.Optional("PORT", config.Optional("ADMIN_PORT", "9121"))
+	port := config.Optional("PORT", config.Optional("ADMIN_PORT", config.DefaultAdminPort))
 	if err := config.ValidatePort(port); err != nil {
 		log.Fatalf("❌ Invalid PORT: %v", err)
 	}
@@ -1101,19 +1378,22 @@ func main() {
 	var rdb *redis.Client
 	if redisAddr != "" {
 		rdb = redis.NewClient(newAdminRedisOptions(redisAddr))
+		defer func() { _ = rdb.Close() }()
 	}
 
 	// Initialize PubSub Health Checker (lazy, self-healing)
 	psHealthChecker := newPubSubHealthChecker()
+	defer psHealthChecker.Close()
 
 	// Use internal URL for service-to-service agent catalog fetch.
 	// The external GATEWAY_URL is IAP-protected and unreachable from Cloud Run.
 	gatewayURL := config.Optional("GATEWAY_INTERNAL_URL",
-		config.Optional("GATEWAY_URL", "http://127.0.0.1:8101"))
+		config.Optional("GATEWAY_URL", config.DefaultGatewayURL))
 	registry := buildServiceRegistry(gatewayURL)
 	gcpClient := newGCPClient()
 
 	dbHealthChecker := newAlloyDBHealthChecker()
+	defer dbHealthChecker.Close()
 
 	// Build the per-user account resolver + optional store. The
 	// resolver is ALWAYS required (the Account middleware fails
@@ -1140,9 +1420,8 @@ func main() {
 		// close temp → open runtime pool.
 		//
 		// NOTE: the secondary alloydbHealthChecker around
-		// defaultAlloyDBConnect() at the bottom of this file still
-		// uses *pgx.Conn, but that path is mutex-serialized (a.mu)
-		// so it is not part of this bug class and is left as-is.
+		// defaultAlloyDBConnect() (lines 223-231) uses *pgxpool.Pool
+		// and is mutex-serialized (a.mu).
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		migConn, connErr := pgx.Connect(ctx, connStr)
 		cancel()
@@ -1182,6 +1461,7 @@ func main() {
 	if adminDBPool != nil {
 		defer adminDBPool.Close()
 	}
+	wireAdminAccountLookup(accountResolver, accountStore)
 
 	// E1: build the Stripe reconciler. Armed only when
 	// STRIPE_API_KEY is set AND a valid STRIPE_PRICE_MAP parsed
@@ -1216,7 +1496,7 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 

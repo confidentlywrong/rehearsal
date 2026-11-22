@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,10 +28,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/auth"
@@ -65,6 +68,76 @@ var gatewayClient = &http.Client{
 	},
 }
 
+// isHopByHopOrFramingHeader reports whether key is an RFC 7230 hop-by-hop
+// header or a body-framing header (Content-Length / Content-Type) already set
+// by Gin's c.DataFromReader. Skipping these avoids duplicate Content-Type
+// headers and mismatched Content-Length headers when upstream error bodies are
+// capped before forwarding.
+func isHopByHopHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"te", "trailer", "trailers", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func connectionHeaderTokens(h http.Header) map[string]struct{} {
+	var out map[string]struct{}
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			tok = strings.ToLower(strings.TrimSpace(tok))
+			if tok == "" {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]struct{})
+			}
+			out[tok] = struct{}{}
+		}
+	}
+	return out
+}
+
+func isHopByHopOrFramingHeader(key string) bool {
+	if isHopByHopHeader(key) {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "content-length", "content-type":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildGatewayAPIURL(backendURL, action string, reqURL *url.URL, groupPrefix string) (string, error) {
+	baseU, err := url.Parse(backendURL)
+	if err != nil || baseU.Scheme == "" || baseU.Host == "" {
+		return "", fmt.Errorf("invalid backend URL %q: %w", backendURL, err)
+	}
+	targetU := *baseU
+	basePath := strings.TrimSuffix(baseU.Path, "/")
+	targetU.Path = basePath + "/api/v1" + action
+	targetU.RawPath = ""
+	if reqURL != nil {
+		if escaped := reqURL.EscapedPath(); escaped != "" {
+			rawActionPath := escaped
+			if groupPrefix != "" && strings.HasPrefix(rawActionPath, groupPrefix+"/api/v1") {
+				rawActionPath = strings.TrimPrefix(rawActionPath, groupPrefix)
+			}
+			if strings.HasPrefix(rawActionPath, "/api/v1") {
+				baseEscaped := strings.TrimSuffix(baseU.EscapedPath(), "/")
+				targetU.RawPath = baseEscaped + rawActionPath
+			}
+		}
+		targetU.RawQuery = reqURL.RawQuery
+	}
+	targetU.Fragment = ""
+	return targetU.String(), nil
+}
+
 // buildTenantConnStr assembles a PostgreSQL connection string for the
 // account control-plane tables (users). Same resolution rules as
 // cmd/gateway's buildBillingConnStr so a single env file works for
@@ -97,18 +170,118 @@ func buildTenantConnStr() string {
 	return u.String()
 }
 
+type wsOIDCHeaderKey struct{}
+
+func resolveBackendURL() string {
+	return config.Optional("GATEWAY_INTERNAL_URL",
+		config.Optional("GATEWAY_URL", config.DefaultGatewayURL))
+}
+
+func resolveGatewayOIDCAudience(gatewayURL string) string {
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_AUDIENCE")); v != "" {
+		return v
+	}
+	if strings.TrimSpace(os.Getenv("IAP_CLIENT_ID")) != "" {
+		return auth.ResolveAudience(gatewayURL)
+	}
+	if auth.IsCloudRunURL(gatewayURL) {
+		return auth.AudienceFor(gatewayURL)
+	}
+	return ""
+}
+
+func buildGatewayWSURL(backendURL string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(backendURL))
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("invalid gateway URL %q: %w", backendURL, err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return nil, fmt.Errorf("unsupported gateway scheme %q", u.Scheme)
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/ws"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u, nil
+}
+
+func configureTrustedProxies(r *gin.Engine) error {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return r.SetTrustedProxies(nil)
+	}
+	var proxies []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			proxies = append(proxies, trimmed)
+		}
+	}
+	if len(proxies) == 0 {
+		return r.SetTrustedProxies(nil)
+	}
+	return r.SetTrustedProxies(proxies)
+}
+
+type cacheControlWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *cacheControlWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		if code >= 200 && code < 300 {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *cacheControlWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func hasDirIndexFile(staticDir, relPath string) bool {
+	if !strings.HasSuffix(relPath, "/") {
+		return false
+	}
+	indexRel := path.Clean("/" + relPath + "index.html")
+	f, err := http.Dir(staticDir).Open(indexRel)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 // cachedFileServer wraps http.FileServer with cache control headers.
-// Hashed assets (non-HTML files) get long-term immutable caching.
-// HTML files get no-cache to ensure the latest version is served.
+// Hashed assets (non-HTML files) get long-term immutable caching on 2xx.
+// HTML files and non-2xx responses get no-cache to ensure the latest version is served.
 func cachedFileServer(root http.FileSystem) http.Handler {
 	fs := http.FileServer(root)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".html") || r.URL.Path == "/" || !strings.Contains(r.URL.Path, ".") {
-			w.Header().Set("Cache-Control", "no-cache")
-		} else {
-			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		reqPath := "/"
+		if r.URL != nil {
+			reqPath = r.URL.Path
 		}
-		fs.ServeHTTP(w, r)
+		base := path.Base(reqPath)
+		if reqPath == "" || reqPath == "/" || strings.HasSuffix(reqPath, "/") || strings.HasSuffix(reqPath, ".html") || !strings.Contains(base, ".") {
+			w.Header().Set("Cache-Control", "no-cache")
+			fs.ServeHTTP(w, r)
+			return
+		}
+		fs.ServeHTTP(&cacheControlWriter{ResponseWriter: w}, r)
 	})
 }
 
@@ -116,6 +289,10 @@ func cachedFileServer(root http.FileSystem) http.Handler {
 // audience for proxied gateway requests; empty disables attachment.
 func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Engine {
 	r := gin.Default()
+	if err := configureTrustedProxies(r); err != nil {
+		log.Printf("FRONTEND: invalid TRUSTED_PROXIES (%v); disabling trusted proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	// G5a: structured request log + request_id propagation. Mounted
 	// FIRST so request_id is on ctx for everything downstream.
@@ -161,10 +338,10 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 			"/api/v1/me/init",
 			"/api/v1/auth/exchange",
 			"/api/v1/me/logout",
-			"/api/v1/settings/ai",
-			"/api/v1/settings/ai/test",
-			"/api/v1/settings/ai/start",
-			"/api/v1/settings/ai/pull",
+			"/frontend/api/v1/me",
+			"/frontend/api/v1/me/init",
+			"/frontend/api/v1/auth/exchange",
+			"/frontend/api/v1/me/logout",
 		},
 		// NeedsInitHandler: the SPA shell (HTML doc fetch + every
 		// asset the browser then pulls in — JS bundle, CSS,
@@ -181,7 +358,11 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 	}))
 
 	r.Use(func(c *gin.Context) {
-		log.Printf("Incoming Request: %s %s (Remote: %s)", c.Request.Method, c.Request.URL.Path, c.ClientIP())
+		reqPath := ""
+		if c.Request.URL != nil {
+			reqPath = c.Request.URL.Path
+		}
+		log.Printf("Incoming Request: %s %s (Remote: %s)", c.Request.Method, reqPath, c.ClientIP())
 		c.Next()
 	})
 
@@ -212,21 +393,23 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 		"RECAPTCHA_ENTERPRISE_SITE_KEY": config.Optional("RECAPTCHA_ENTERPRISE_SITE_KEY", ""),
 	})
 
-	backendURL := config.Optional("GATEWAY_INTERNAL_URL",
-		config.Optional("GATEWAY_URL", "http://localhost:8101"))
-
-	wsURLStr := strings.Replace(backendURL, "http://", "ws://", 1)
-	wsURLStr = strings.Replace(wsURLStr, "https://", "wss://", 1)
-	if !strings.HasSuffix(wsURLStr, "/ws") {
-		wsURLStr = strings.TrimSuffix(wsURLStr, "/") + "/ws"
-	}
-
-	u, err := url.Parse(wsURLStr)
+	backendURL := resolveBackendURL()
+	u, err := buildGatewayWSURL(backendURL)
 	if err != nil {
-		log.Fatalf("WebSocket Proxy: Invalid URL %q: %v", wsURLStr, err)
+		log.Fatalf("WebSocket Proxy: Invalid URL %q: %v", backendURL, err)
 	}
-	log.Printf("WebSocket Proxy: Initializing for %s", wsURLStr)
+	log.Printf("WebSocket Proxy: Initializing for %s", u.String())
 	wsProxy := websocketproxy.NewProxy(u)
+	wsProxy.Backend = func(r *http.Request) *url.URL {
+		target := *u
+		target.Path = u.Path
+		target.RawPath = u.RawPath
+		if r != nil && r.URL != nil {
+			target.RawQuery = r.URL.RawQuery
+			target.Fragment = r.URL.Fragment
+		}
+		return &target
+	}
 
 	// Fix D (2026-07-03): configure the BFF's client-side upgrader
 	// with a permissive CheckOrigin. ``koding/websocketproxy``
@@ -248,8 +431,9 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 
 	wsProxy.Director = func(incoming *http.Request, out http.Header) {
 		out.Set("Host", u.Host)
+		out.Del("X-Serverless-Authorization")
 		for key := range out {
-			if strings.HasPrefix(strings.ToLower(key), "x-goog-iap-") {
+			if strings.HasPrefix(strings.ToLower(key), "x-goog-") {
 				out.Del(key)
 			}
 		}
@@ -267,33 +451,52 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 		if o := incoming.Header.Get("Origin"); o != "" {
 			out.Set("Origin", o)
 		}
+		// Preserve the user's Authorization header so the gateway's
+		// account middleware authenticates the WebSocket user.
+		if authHdr := incoming.Header.Get("Authorization"); authHdr != "" {
+			out.Set("Authorization", authHdr)
+		}
 		// Forward Cloud Run service-to-service auth via the
-		// X-Serverless-Authorization header so the original
-		// Authorization header (or __session cookie) carrying the
-		// user's Firebase ID token reaches the gateway untouched.
-		// See AttachOIDCTokenAs godoc for the underlying Cloud Run
-		// contract that strips X-Serverless-Authorization before
-		// container delivery.
-		middleware.AttachOIDCTokenAs(incoming.Context(), out, oidcAudience, "X-Serverless-Authorization")
+		// X-Serverless-Authorization header acquired fail-fast in wsHandler.
+		if tok, ok := incoming.Context().Value(wsOIDCHeaderKey{}).(string); ok && tok != "" {
+			out.Set("X-Serverless-Authorization", tok)
+		}
 	}
 
 	wsHandler := func(c *gin.Context) {
+		if oidcAudience != "" {
+			oidcHdr := make(http.Header)
+			if err := middleware.AttachOIDCTokenAsE(c.Request.Context(), oidcHdr, oidcAudience, "X-Serverless-Authorization"); err != nil {
+				log.Printf("WebSocket Proxy: OIDC token acquisition failed: %v", err)
+				c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{"error": "upstream_auth_unavailable"})
+				return
+			}
+			if tok := oidcHdr.Get("X-Serverless-Authorization"); tok != "" {
+				ctx := context.WithValue(c.Request.Context(), wsOIDCHeaderKey{}, tok)
+				c.Request = c.Request.WithContext(ctx)
+			}
+		}
 		wsProxy.ServeHTTP(c.Writer, c.Request)
 	}
 
 	apiHandler := func(c *gin.Context) {
-		backendURL := config.Optional("GATEWAY_INTERNAL_URL",
-			config.Optional("GATEWAY_URL", "http://localhost:8101"))
+		backendURL := resolveBackendURL()
 
 		action := c.Param("action")
-		targetURL := strings.TrimSuffix(backendURL, "/") + "/api/v1" + action
-		if c.Request.URL.RawQuery != "" {
-			targetURL += "?" + c.Request.URL.RawQuery
+		targetURL, err := buildGatewayAPIURL(backendURL, action, c.Request.URL, "/frontend")
+		if err != nil {
+			log.Printf("Proxy Error: Invalid target URL: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
 		}
 
-		log.Printf("Proxy Handler triggered for path: %s, target: %s", c.Request.URL.Path, targetURL)
+		reqPath := ""
+		if c.Request.URL != nil {
+			reqPath = c.Request.URL.Path
+		}
+		log.Printf("Proxy Handler triggered for path: %s, target: %s", reqPath, targetURL)
 
-		req, err := http.NewRequest(c.Request.Method, targetURL, c.Request.Body)
+		req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, c.Request.Body)
 		if err != nil {
 			log.Printf("Proxy Error: Failed to create request: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
@@ -308,10 +511,16 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 		// __session cookie from that token. We previously stripped
 		// it and replaced it with a service-account OIDC token, which
 		// silently broke every login.
+		connTokens := connectionHeaderTokens(c.Request.Header)
 		for key, values := range c.Request.Header {
+			lowerKey := strings.ToLower(strings.TrimSpace(key))
 			if strings.EqualFold(key, "Host") ||
 				strings.EqualFold(key, "X-Serverless-Authorization") ||
-				strings.HasPrefix(strings.ToLower(key), "x-goog-") {
+				strings.HasPrefix(lowerKey, "x-goog-") ||
+				isHopByHopHeader(key) {
+				continue
+			}
+			if _, hop := connTokens[lowerKey]; hop {
 				continue
 			}
 			for _, value := range values {
@@ -324,23 +533,40 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 		// accepts the call and strips the header before delivering
 		// to the gateway container. The user's bearer in
 		// Authorization (set above) is then visible to gateway code.
-		middleware.AttachOIDCTokenAs(c.Request.Context(), req.Header, oidcAudience, "X-Serverless-Authorization")
+		if err := middleware.AttachOIDCTokenAsE(c.Request.Context(), req.Header, oidcAudience, "X-Serverless-Authorization"); err != nil {
+			log.Printf("Proxy Error: OIDC token acquisition failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "upstream_auth_unavailable"})
+			return
+		}
 
 		client := gatewayClient
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("Proxy Error: Client.Do failed: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			if errors.Is(err, context.DeadlineExceeded) {
+				c.JSON(http.StatusGatewayTimeout, gin.H{"error": "gateway timeout"})
+				return
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"error": "bad gateway"})
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 			resp.Body.Close()
+			if readErr != nil {
+				log.Printf("Proxy Error: failed reading upstream error body: %v", readErr)
+				c.JSON(http.StatusBadGateway, gin.H{"error": "bad gateway"})
+				return
+			}
 			bodyStr := string(body)
 			if len(bodyStr) > 500 {
-				bodyStr = bodyStr[:500] + "..."
+				cut := 500
+				for cut > 0 && !utf8.RuneStart(bodyStr[cut]) {
+					cut--
+				}
+				bodyStr = bodyStr[:cut] + "..."
 			}
 			log.Printf("Proxy: Gateway returned status %d. Body: %s", resp.StatusCode, bodyStr)
 			resp.Body = io.NopCloser(bytes.NewBuffer(body))
@@ -348,6 +574,9 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 		}
 
 		for key, values := range resp.Header {
+			if isHopByHopOrFramingHeader(key) {
+				continue
+			}
 			for _, value := range values {
 				c.Writer.Header().Add(key, value)
 			}
@@ -408,13 +637,16 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 			return
 		}
 
-		path := c.Request.URL.Path
+		reqPath := "/"
+		if c.Request.URL != nil {
+			reqPath = c.Request.URL.Path
+		}
 
 		if devProxy != nil {
 			// Strip /frontend/ prefix before proxying to dev server
-			if strings.HasPrefix(path, "/frontend/") {
-				c.Request.URL.Path = strings.TrimPrefix(path, "/frontend")
-			} else if path == "/frontend" {
+			if strings.HasPrefix(reqPath, "/frontend/") {
+				c.Request.URL.Path = strings.TrimPrefix(reqPath, "/frontend")
+			} else if reqPath == "/frontend" {
 				c.Request.URL.Path = "/"
 			}
 			devProxy.ServeHTTP(c.Writer, c.Request)
@@ -436,11 +668,12 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 			}
 		}
 
-		if strings.HasPrefix(path, "/frontend/") || path == "/frontend" {
-			trimmed := strings.TrimPrefix(strings.TrimPrefix(path, "/frontend"), "/")
-			if trimmed == "" || !strings.Contains(filepath.Base(trimmed), ".") {
+		if strings.HasPrefix(reqPath, "/frontend/") || reqPath == "/frontend" {
+			trimmed := strings.TrimPrefix(strings.TrimPrefix(reqPath, "/frontend"), "/")
+			if trimmed == "" || (strings.HasSuffix(reqPath, "/") && !hasDirIndexFile(staticDir, trimmed)) || !strings.Contains(filepath.Base(trimmed), ".") {
 				indexPath := filepath.Join(staticDir, "index.html")
 				if _, err := os.Stat(indexPath); err == nil {
+					c.Header("Cache-Control", "no-cache")
 					c.File(indexPath)
 					return
 				}
@@ -451,10 +684,11 @@ func setupRouter(oidcAudience string, accountResolver account.Resolver) *gin.Eng
 
 		// SPA index fallback: for client-side navigation (non-file routes), serve index.html
 		// (e.g. ./web/frontend/dist/client/browser/index.html).
-		relPath := strings.TrimPrefix(path, "/")
-		if relPath != "" && !strings.Contains(filepath.Base(relPath), ".") {
+		relPath := strings.TrimPrefix(reqPath, "/")
+		if relPath != "" && ((strings.HasSuffix(reqPath, "/") && !hasDirIndexFile(staticDir, relPath)) || !strings.Contains(filepath.Base(relPath), ".")) {
 			indexPath := filepath.Join(staticDir, "index.html")
 			if _, err := os.Stat(indexPath); err == nil {
+				c.Header("Cache-Control", "no-cache")
 				c.File(indexPath)
 				return
 			}
@@ -489,7 +723,10 @@ func htmlAwareUnauthorized(c *gin.Context) {
 	if wantsHTML {
 		// Preserve where the user was going so /login can bounce
 		// them back after a successful sign-in.
-		dest := c.Request.URL.RequestURI()
+		dest := "/"
+		if c.Request.URL != nil {
+			dest = c.Request.URL.RequestURI()
+		}
 		c.Redirect(http.StatusFound, "/login?redirect="+url.QueryEscape(dest))
 		c.Abort()
 		return
@@ -641,7 +878,10 @@ func safeLocalLoginRedirect(target string) string {
 //     only NeedsInit=true differentiates them from a fully-set-up
 //     user, and NeedsInit gates only matter for API contracts.
 func htmlAwareNeedsInit(c *gin.Context) {
-	p := c.Request.URL.Path
+	p := ""
+	if c.Request.URL != nil {
+		p = c.Request.URL.Path
+	}
 	if strings.HasPrefix(p, "/api/") ||
 		strings.HasPrefix(p, "/frontend/api/") ||
 		strings.HasPrefix(p, "/ws") ||
@@ -674,8 +914,8 @@ func main() {
 	}
 
 	gatewayURL := config.Optional("GATEWAY_INTERNAL_URL",
-		config.Optional("GATEWAY_URL", ""))
-	oidcAudience := auth.ResolveAudience(gatewayURL)
+		config.Optional("GATEWAY_URL", config.DefaultGatewayURL))
+	oidcAudience := resolveGatewayOIDCAudience(gatewayURL)
 
 	// Per-user identity resolver. Built at boot so a
 	// misconfigured production deploy fails immediately, not on
@@ -757,7 +997,7 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      120 * time.Second,
+		WriteTimeout:      0, // Disabled: WebSocket upgrades on /ws and 90s upstream proxies outlive fixed deadlines
 		IdleTimeout:       60 * time.Second,
 	}
 

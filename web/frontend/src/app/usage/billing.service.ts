@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate external redirect URLs, align BillingPlan with Go plans API, and send tier/success_url/cancel_url on checkout.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +54,6 @@ export interface BillingPlan {
   tier: string;
   monthly_token_cap: number;
   max_concurrent_runs: number;
-  max_users: number;
   description: string;
 }
 
@@ -76,6 +77,32 @@ export type CheckoutOutcome =
 // saasModeOn() was removed 2026-06-22 (B-5). See usage.service.ts
 // for the rationale: SAAS_MODE has no consumers and is no longer
 // emitted into window.ENV.
+
+export function resolveBillingOrigin(): string {
+  if (typeof window !== 'undefined') {
+    const origin = window.location?.origin;
+    if (origin && origin !== 'null' && /^https?:\/\//i.test(origin)) {
+      return origin;
+    }
+  }
+  return 'https://localhost';
+}
+
+export function isSafeBillingRedirectUrl(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  if (/[\u0000-\u001f\u007f\\]/.test(trimmed)) return false;
+  if (trimmed.startsWith('//')) return false;
+  const baseOrigin = resolveBillingOrigin();
+  try {
+    const parsed = new URL(trimmed, baseOrigin);
+    if (parsed.protocol === 'https:') return true;
+    return parsed.protocol === 'http:' && parsed.origin === baseOrigin;
+  } catch {
+    return false;
+  }
+}
 
 @Injectable({ providedIn: 'root' })
 export class BillingService {
@@ -101,7 +128,16 @@ export class BillingService {
     }
   }
 
-  async createCheckoutSession(planTier: string): Promise<CheckoutOutcome> {
+  async createCheckoutSession(
+    planTier: string,
+    successUrl?: string,
+    cancelUrl?: string,
+  ): Promise<CheckoutOutcome> {
+    const origin = resolveBillingOrigin();
+    const resolvedSuccessUrl =
+      successUrl?.trim() || `${origin}/#/settings/billing?checkout=success`;
+    const resolvedCancelUrl =
+      cancelUrl?.trim() || `${origin}/#/settings/billing?checkout=cancel`;
     try {
       const resp = await fetch('/api/v1/billing/checkout', {
         method: 'POST',
@@ -110,7 +146,11 @@ export class BillingService {
           Accept: 'application/json',
         },
         credentials: 'same-origin',
-        body: JSON.stringify({ plan_tier: planTier }),
+        body: JSON.stringify({
+          tier: planTier,
+          success_url: resolvedSuccessUrl,
+          cancel_url: resolvedCancelUrl,
+        }),
       });
       if (resp.status === 503) {
         // Stub creator OR Stripe-without-key. Echo the provider
@@ -144,9 +184,16 @@ export class BillingService {
           status: 200,
         };
       }
+      if (!isSafeBillingRedirectUrl(body.url)) {
+        return {
+          outcome: 'error',
+          message: 'Invalid checkout redirect URL.',
+          status: 200,
+        };
+      }
       return {
         outcome: 'redirect',
-        url: body.url,
+        url: body.url.trim(),
         provider: body.provider ?? '',
       };
     } catch (e) {

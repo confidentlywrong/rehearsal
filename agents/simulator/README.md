@@ -37,7 +37,7 @@ flowchart TD
     class race loop
 ```
 
-All three sub-agents use `gemini-2.5-flash-lite` (override: `SIMULATOR_MODEL`, temperature 0.1), but
+All three sub-agents use `gemini-3.5-flash-lite` (override: `SIMULATOR_MODEL`, temperature 0.1), but
 their `before_model_callback` intercepts every invocation and issues
 deterministic `FunctionCall` responses. The LLM is never called during a
 simulation. The model declarations exist only because ADK requires them on
@@ -159,9 +159,9 @@ Both paths converge at the `drain()` method, which does an atomic
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `SIMULATOR_PORT` | `8202` | HTTP listen port |
+| `PORT` / `SIMULATOR_PORT` | `9104` | HTTP listen port |
 | `REDIS_ADDR` | -- | Redis for collector, broadcast, simulation registry |
-| `GATEWAY_INTERNAL_URL` / `GATEWAY_URL` | `http://localhost:8101` | Gateway for runner spawning |
+| `GATEWAY_INTERNAL_URL` / `GATEWAY_URL` | `http://127.0.0.1:9101` | Gateway for runner spawning |
 
 ## File layout
 
@@ -173,10 +173,10 @@ agents/simulator/
 ├── pre_race_callback.py     # Five-phase deterministic state machine
 ├── tick_callback.py         # Three-phase deterministic state machine
 ├── skills/
-│   ├── pre-race/tools.py    # prepare_simulation, spawn_runners, fire_start_gun (~410 lines)
-│   ├── advancing-race-ticks/tools.py   # advance_tick, check_race_complete (~410 lines)
-│   └── completing-the-race/tools.py   # compile_results, stop_race_collector
-└── tests/                   # 13 test files including stress and integration tests
+│   ├── preparing-the-race/tools.py     # prepare_simulation, spawn_runners, fire_start_gun
+│   ├── advancing-race-ticks/tools.py   # advance_tick, check_race_complete
+│   └── completing-the-race/tools.py    # compile_results, stop_race_collector
+└── tests/                   # Simulator unit, integration, and stress tests
 ```
 
 ## Testing

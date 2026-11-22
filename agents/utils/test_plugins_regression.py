@@ -4,6 +4,7 @@
 import pytest
 import json
 from unittest.mock import MagicMock, AsyncMock, patch
+from agents.utils.models import DEFAULT_PLANNER_MODEL
 from agents.utils.plugins import RedisDashLogPlugin
 from google.adk.tools.tool_context import ToolContext
 
@@ -88,7 +89,7 @@ async def test_redis_dash_log_plugin_filters_narrative_events(mock_gateway, mock
     # Test a start event type that SHOULD trigger a narrative emission
     mock_gateway.reset_mock()
     await plugin._publish(
-        mock_context, {"type": "model_start", "agent": "runner_autopilot", "model": "gemini-3-flash-preview"}
+        mock_context, {"type": "model_start", "agent": "runner_autopilot", "model": DEFAULT_PLANNER_MODEL}
     )
     mock_gateway.assert_called_once()
 
@@ -320,3 +321,36 @@ async def test_tool_start_omits_hints_when_arg_value_is_none(mock_gateway, mock_
     call_kwargs = mock_gateway.call_args[1]
     data = call_kwargs["data"]
     assert "tool_hints" not in data
+
+
+def test_plugins_does_not_hardcode_test_project(monkeypatch, caplog):
+    """RedisDashLogPlugin must not default to 'test-project' when project env vars are unset."""
+    import logging
+
+    for var in ("PUBSUB_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "PROJECT_ID"):
+        monkeypatch.delenv(var, raising=False)
+
+    with (
+        patch("google.cloud.pubsub_v1.PublisherClient") as mock_pubsub,
+        caplog.at_level(logging.WARNING, logger="agents.utils.plugins"),
+    ):
+        plugin = RedisDashLogPlugin()
+
+    assert plugin.project_id == ""
+    assert plugin.publisher is None
+    mock_pubsub.assert_not_called()
+    assert any("Pub/Sub telemetry disabled" in r.message for r in caplog.records)
+
+
+def test_plugins_whitespace_env_vars_do_not_shadow_fallback(monkeypatch):
+    """Whitespace-only PUBSUB_PROJECT_ID / PUBSUB_TOPIC_ID must fall through to fallback/default."""
+    monkeypatch.setenv("PUBSUB_PROJECT_ID", "   ")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "real-gcp-proj")
+    monkeypatch.setenv("PUBSUB_TOPIC_ID", "   ")
+
+    with patch("google.cloud.pubsub_v1.PublisherClient"):
+        plugin = RedisDashLogPlugin()
+
+    assert plugin.project_id == "real-gcp-proj"
+    assert plugin.topic_id == "agent-telemetry"
+    assert plugin.topic_path == "projects/real-gcp-proj/topics/agent-telemetry"

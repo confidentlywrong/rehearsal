@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: validate confetti particle counts, parameters, and empty color palettes.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,7 +71,14 @@ export function createConfettiParticles(options: ConfettiOptions = {}): THREE.Me
     colors           = DEFAULT_COLORS,
   } = options;
 
-  const vertexCount = count * 4;
+  const safeCount = Number.isFinite(count) && count > 0 ? Math.min(100000, Math.floor(count)) : 0;
+  const safeRadius = Number.isFinite(spawnRadius) && spawnRadius >= 0 ? spawnRadius : 800;
+  const safeSpeedMin = Number.isFinite(speedMin) ? speedMin : 0.15;
+  const safeSpeedMax = Number.isFinite(speedMax) ? speedMax : safeSpeedMin;
+  const safeMaxRot = Number.isFinite(maxRotationSpeed) ? maxRotationSpeed : 8.0;
+  const palette = Array.isArray(colors) && colors.length > 0 ? colors : DEFAULT_COLORS;
+
+  const vertexCount = safeCount * 4;
 
   const positions = new Float32Array(vertexCount * 3); // quad corner offsets (x,y,0)
   const aSpawnPos = new Float32Array(vertexCount * 3); // XZ spread, Y unused (driven by shader)
@@ -79,15 +88,15 @@ export function createConfettiParticles(options: ConfettiOptions = {}): THREE.Me
   const aRotSpeed = new Float32Array(vertexCount);
   const aSize     = new Float32Array(vertexCount * 2);
   const aColor    = new Float32Array(vertexCount * 3);
-  const indices   = new Uint32Array(count * 6);
+  const indices   = new Uint32Array(safeCount * 6);
 
   const CORNERS: [number, number][] = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
   const _col = new THREE.Color();
 
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i < safeCount; i++) {
     // Flat XZ scatter — Y is driven by the shader loop
     const angle = Math.random() * Math.PI * 2;
-    const r     = Math.sqrt(Math.random()) * spawnRadius; // uniform disc
+    const r     = Math.sqrt(Math.random()) * safeRadius; // uniform disc
     const sx    = Math.cos(angle) * r;
     const sz    = Math.sin(angle) * r;
 
@@ -98,11 +107,11 @@ export function createConfettiParticles(options: ConfettiOptions = {}): THREE.Me
     const al = Math.sqrt(ax * ax + ay * ay + az * az) || 1;
     ax /= al; ay /= al; az /= al;
 
-    const rotSpeed = (Math.random() * 2 - 1) * maxRotationSpeed;
+    const rotSpeed = (Math.random() * 2 - 1) * safeMaxRot;
     const phase    = Math.random();                             // distribute pieces across fall range
-    const speed    = speedMin + Math.random() * (speedMax - speedMin);
+    const speed    = safeSpeedMin + Math.random() * (safeSpeedMax - safeSpeedMin);
 
-    _col.set(colors[Math.floor(Math.random() * colors.length)]);
+    _col.set(palette[Math.floor(Math.random() * palette.length)]);
 
     for (let v = 0; v < 4; v++) {
       const vi = i * 4 + v;

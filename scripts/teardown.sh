@@ -47,29 +47,132 @@ ae_api_base() {
 
 # Lists every Agent Engine resource_name in the given project + region.
 # Returns nothing on empty list (NOT a fatal condition for teardown).
+# Fails cleanly (exit 1 + message to stderr) if ADC token lookup, curl,
+# HTTP status (non-2xx), JSON parsing, or an API "error" payload fails.
 list_agent_engines() {
-  local project="$1" region="$2"
-  local base url token
+  local project="${1:-}" region="${2:-}"
+  if [[ -z "$project" || -z "$region" ]]; then
+    echo "ERROR: list_agent_engines requires project and region." >&2
+    return 1
+  fi
+  local base url token page_token=""
   base=$(ae_api_base "$region")
   url="${base}/v1beta1/projects/${project}/locations/${region}/reasoningEngines"
   # ADC token (NOT `gcloud auth print-access-token`): the latter returns a
   # CBA-bound token on some workstations that aiplatform.googleapis.com
   # rejects. ADC works from both Cloud Shell (auto-configured) and local
   # dev (after `gcloud auth application-default login`).
-  token=$(gcloud auth application-default print-access-token)
-  curl -sS -H "Authorization: Bearer $token" "$url" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(e["name"]) for e in d.get("reasoningEngines",[])]'
+  if ! token=$(gcloud auth application-default print-access-token) || [[ -z "$token" ]]; then
+    echo "ERROR: failed to acquire ADC access token; run 'gcloud auth application-default login'." >&2
+    return 1
+  fi
+
+  while :; do
+    local req_url="$url"
+    if [[ -n "$page_token" ]]; then
+      local encoded_tok
+      encoded_tok=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$page_token")
+      req_url="${url}?pageToken=${encoded_tok}"
+    fi
+
+    local raw http_code body
+    if ! raw=$(curl -sS -w $'\n%{http_code}' -H "Authorization: Bearer $token" "$req_url"); then
+      echo "ERROR: Agent Engine list request failed for ${req_url}" >&2
+      return 1
+    fi
+    http_code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    if [[ "$raw" == "$http_code" ]]; then
+      body=""
+    fi
+
+    if [[ ! "$http_code" =~ ^[0-9]+$ ]] || (( http_code < 200 || http_code >= 300 )); then
+      echo "ERROR: Agent Engine list API returned HTTP ${http_code} for ${req_url}: ${body}" >&2
+      return 1
+    fi
+
+    local parsed
+    if ! parsed=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as exc:
+    print(f"ERROR: invalid JSON from Agent Engine list API: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(d, dict):
+    print(f"ERROR: unexpected JSON payload from Agent Engine list API: {type(d).__name__}", file=sys.stderr)
+    sys.exit(1)
+if "error" in d and d["error"] is not None:
+    err = d["error"]
+    print(f"ERROR: Agent Engine list API error: {err}", file=sys.stderr)
+    sys.exit(1)
+print(d.get("nextPageToken") or "")
+for e in d.get("reasoningEngines") or []:
+    if isinstance(e, dict) and e.get("name"):
+        print(e["name"])
+'); then
+      return 1
+    fi
+
+    page_token=""
+    local first_line=1 line
+    while IFS= read -r line; do
+      if (( first_line )); then
+        page_token="$line"
+        first_line=0
+      elif [[ -n "$line" ]]; then
+        printf '%s\n' "$line"
+      fi
+    done <<EOF
+${parsed}
+EOF
+    [[ -n "$page_token" ]] || break
+  done
 }
 
 # Deletes one Agent Engine by its resource_name (force=true so child
 # deployments are dropped along with the engine).
 delete_agent_engine() {
-  local region="$1" resource_name="$2"
-  local base token
+  local region="${1:-}" resource_name="${2:-}"
+  if [[ -z "$region" || -z "$resource_name" ]]; then
+    echo "ERROR: delete_agent_engine requires region and resource_name." >&2
+    return 1
+  fi
+  local base token raw http_code body
   base=$(ae_api_base "$region")
-  token=$(gcloud auth application-default print-access-token)
-  curl -sS -X DELETE -H "Authorization: Bearer $token" \
-    "${base}/v1beta1/${resource_name}?force=true" >/dev/null
+  if ! token=$(gcloud auth application-default print-access-token) || [[ -z "$token" ]]; then
+    echo "ERROR: failed to acquire ADC access token for deleting ${resource_name}." >&2
+    return 1
+  fi
+  if ! raw=$(curl -sS -w $'\n%{http_code}' -X DELETE -H "Authorization: Bearer $token" \
+      "${base}/v1beta1/${resource_name}?force=true"); then
+    echo "ERROR: Agent Engine delete request failed for ${resource_name}" >&2
+    return 1
+  fi
+  http_code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  if [[ "$raw" == "$http_code" ]]; then
+    body=""
+  fi
+  if [[ ! "$http_code" =~ ^[0-9]+$ ]] || (( http_code < 200 || http_code >= 300 )); then
+    echo "ERROR: Agent Engine delete API returned HTTP ${http_code} for ${resource_name}: ${body}" >&2
+    return 1
+  fi
+  if [[ -n "${body//[[:space:]]/}" ]]; then
+    if ! printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d, dict) and "error" in d and d["error"] is not None:
+    err = d["error"]
+    print(f"ERROR: Agent Engine delete API error: {err}", file=sys.stderr)
+    sys.exit(1)
+'; then
+      return 1
+    fi
+  fi
 }
 
 # Deletes Agent Engines for the given project + region. Idempotent (no-op
@@ -77,8 +180,20 @@ delete_agent_engine() {
 # Terraform destroy that follows still gets a chance to run.
 teardown_agent_engines() {
   local project="$1" region="$2"
-  local engines
-  mapfile -t engines < <(list_agent_engines "$project" "$region" || true)
+  local engines_out=""
+  if ! engines_out=$(list_agent_engines "$project" "$region"); then
+    echo "⚠️  Could not list Agent Engines in ${region} (check ADC credentials / permissions); skipping Agent Engine cleanup." >&2
+    return 1
+  fi
+  local engines=()
+  local line
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      engines+=("$line")
+    fi
+  done <<EOF
+${engines_out}
+EOF
   if [[ ${#engines[@]} -eq 0 ]]; then
     echo "✅ No Agent Engines to remove."
     return 0
@@ -103,22 +218,33 @@ fi
 
 # --- Phase 1: project selection ------------------------------------------
 PROJECT_ID=""
+OPT=""
 echo "📁 Project Selection:"
 PS3="Choose: "
 select OPT in "Enter project ID" "Pick from list (gcloud projects list)"; do
   case "$OPT" in
     "Enter project ID")
-      read -p "Project ID: " PROJECT_ID
+      read -r -p "Project ID: " PROJECT_ID || { echo "Cancelled."; exit 1; }
       break
       ;;
     "Pick from list (gcloud projects list)")
-      mapfile -t PROJS < <(gcloud projects list --limit=20 --format="value(projectId)")
+      PROJS=()
+      projs_out=""
+      if projs_out=$(gcloud projects list --limit=20 --format="value(projectId)" 2>/dev/null); then
+        while IFS= read -r line; do
+          if [[ -n "$line" ]]; then
+            PROJS+=("$line")
+          fi
+        done <<EOF
+${projs_out}
+EOF
+      fi
       if [[ ${#PROJS[@]} -eq 0 ]]; then
         echo "No projects accessible to current gcloud auth. Falling back to manual entry."
-        read -p "Project ID: " PROJECT_ID
+        read -r -p "Project ID: " PROJECT_ID || { echo "Cancelled."; exit 1; }
       else
         select PROJECT_ID in "${PROJS[@]}"; do
-          [[ -n "$PROJECT_ID" ]] && break
+          [[ -n "${PROJECT_ID:-}" ]] && break
         done
       fi
       break
@@ -131,11 +257,22 @@ done
 # --- Phase 2: region selection -------------------------------------------
 echo ""
 echo "🌐 Region (must match what you deployed to):"
-mapfile -t REGIONS < <(allowed_regions)
+REGIONS=()
+regions_out=$(allowed_regions)
+while IFS= read -r line; do
+  if [[ -n "$line" ]]; then
+    REGIONS+=("$line")
+  fi
+done <<EOF
+${regions_out}
+EOF
+[[ ${#REGIONS[@]} -gt 0 ]] || { echo "ERROR: no allowed regions configured" >&2; exit 1; }
+REGION=""
 PS3="Choose: "
 select REGION in "${REGIONS[@]}"; do
-  [[ -n "$REGION" ]] && break
+  [[ -n "${REGION:-}" ]] && break
 done
+[[ -n "$REGION" ]] || { echo "ERROR: region is required" >&2; exit 1; }
 
 # --- Phase 3: confirmation -----------------------------------------------
 STATE_BUCKET="${PROJECT_ID}-tf-state"
@@ -163,17 +300,21 @@ This does NOT remove:
 Resources cannot be recovered after destroy completes.
 ====================================================
 EOF
-read -p "Type 'destroy' to proceed: " REPLY
+REPLY=""
+read -r -p "Type 'destroy' to proceed: " REPLY || { echo "Cancelled."; exit 1; }
 [[ "$REPLY" == "destroy" ]] || { echo "Cancelled."; exit 1; }
 
 # --- Phase 4: Agent Engines ----------------------------------------------
 echo ""
-teardown_agent_engines "$PROJECT_ID" "$REGION"
+teardown_agent_engines "$PROJECT_ID" "$REGION" || \
+  echo "⚠️  Agent Engine cleanup did not complete cleanly (see error above); continuing to Terraform destroy." >&2
 
 # --- Phase 5: Terraform destroy ------------------------------------------
 echo ""
 echo "🏗️  Initialising Terraform against gs://${STATE_BUCKET}/oss/state ..."
-cd infra
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}/infra"
 terraform init -input=false -reconfigure \
   -backend-config="bucket=${STATE_BUCKET}" \
   -backend-config="prefix=oss/state" >/dev/null
@@ -187,10 +328,16 @@ terraform init -input=false -reconfigure \
 # of resources already; nothing else needs to be done).
 echo "💥 Running terraform destroy (≈3-5 min) ..."
 # Ensure Cloud SQL deletion_protection is lifted in GCP before destroy runs.
-gcloud sql instances patch race-condition-postgres \
-  --no-deletion-protection \
-  --project="${PROJECT_ID}" \
-  --quiet >/dev/null 2>&1 || true
+SQL_INSTANCE="${CLOUD_SQL_INSTANCE:-$(terraform output -raw database_instance_name 2>/dev/null || true)}"
+if [[ -z "${SQL_INSTANCE}" ]]; then
+  SQL_INSTANCE="$(gcloud sql instances list --project="${PROJECT_ID}" --format='value(name)' --filter='name~postgres' --limit=1 2>/dev/null || true)"
+fi
+if [[ -n "${SQL_INSTANCE}" ]]; then
+  gcloud sql instances patch "${SQL_INSTANCE}" \
+    --no-deletion-protection \
+    --project="${PROJECT_ID}" \
+    --quiet >/dev/null 2>&1 || true
+fi
 
 attempt=1
 max_attempts=4
@@ -228,13 +375,14 @@ MSG
   sleep 60
   attempt=$(( attempt + 1 ))
 done
-cd ..
+cd "${REPO_ROOT}"
 
 # --- Phase 6: optional state bucket removal ------------------------------
 echo ""
-read -p "Also delete the Terraform state bucket gs://${STATE_BUCKET}? (y/N) " -n 1 -r REPLY
+REPLY=""
+read -p "Also delete the Terraform state bucket gs://${STATE_BUCKET}? (y/N) " -n 1 -r REPLY || true
 echo
-if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
   echo "🗑️  Deleting state bucket ..."
   gcloud storage rm --recursive "gs://${STATE_BUCKET}" --project="$PROJECT_ID" --quiet || \
     echo "⚠️  Bucket delete failed (it may not exist or you may lack permission)."

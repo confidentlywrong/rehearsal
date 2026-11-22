@@ -16,13 +16,11 @@ package tracing
 
 import (
 	"context"
-	"os"
 	"testing"
 )
 
 func TestSetupFromEnv(t *testing.T) {
-	os.Setenv("TRACING_ENABLED", "false")
-	defer os.Unsetenv("TRACING_ENABLED")
+	t.Setenv("OTEL_EXPORTER", "")
 
 	shutdown, err := SetupFromEnv(context.Background(), "test-service")
 	if err != nil {

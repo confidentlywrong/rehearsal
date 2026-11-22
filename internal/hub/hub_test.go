@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1151,4 +1151,129 @@ func TestCrossInstance_StaleRedis_DoesNotDeliverAfterUnsubscribe(t *testing.T) {
 	// Client should NOT receive the message because they have no local
 	// simulation subscription, even though Redis says they do.
 	helperExpectNoMessage(t, ws, 200*time.Millisecond)
+}
+
+type countingSubStore struct {
+	mu            sync.Mutex
+	unsubCalls    int
+	unsubAllCalls int
+}
+
+func (c *countingSubStore) Subscribe(_ context.Context, _, _ string) error { return nil }
+func (c *countingSubStore) Lookup(_ context.Context, _ string) ([]string, error) {
+	return nil, nil
+}
+func (c *countingSubStore) Unsubscribe(_ context.Context, _, _ string) error {
+	c.mu.Lock()
+	c.unsubCalls++
+	c.mu.Unlock()
+	return nil
+}
+func (c *countingSubStore) UnsubscribeAll(_ context.Context, _ string) error {
+	c.mu.Lock()
+	c.unsubAllCalls++
+	c.mu.Unlock()
+	return nil
+}
+
+func TestHubMultiTab_UnregisterPreservesRedisSubscriptionUntilLastTabCloses(t *testing.T) {
+	store := &countingSubStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := NewHub(WithSubscriptionStore(store))
+	go h.Run(ctx)
+
+	var srvMu sync.Mutex
+	var srvConns []*websocket.Conn
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		srvMu.Lock()
+		srvConns = append(srvConns, conn)
+		srvMu.Unlock()
+		h.Register(r.URL.Query().Get("sessionId"), conn)
+	}))
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http", "ws", 1) + "?sessionId=shared-session"
+	ws1, resp1, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	if resp1 != nil && resp1.Body != nil {
+		defer resp1.Body.Close()
+	}
+	defer ws1.Close()
+
+	ws2, resp2, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	if resp2 != nil && resp2.Body != nil {
+		defer resp2.Body.Close()
+	}
+	defer ws2.Close()
+
+	require.Eventually(t, func() bool {
+		srvMu.Lock()
+		defer srvMu.Unlock()
+		return len(srvConns) == 2
+	}, time.Second, 10*time.Millisecond)
+
+	srvMu.Lock()
+	conn1, conn2 := srvConns[0], srvConns[1]
+	srvMu.Unlock()
+
+	h.SubscribeSimulation(conn1, "sim-multi")
+	h.SubscribeSimulation(conn2, "sim-multi")
+	time.Sleep(50 * time.Millisecond)
+
+	// Unregistering tab 1 must NOT wipe Redis subscriptions while tab 2 is still active.
+	h.Unregister("shared-session", conn1)
+	time.Sleep(50 * time.Millisecond)
+
+	store.mu.Lock()
+	assert.Equal(t, 0, store.unsubAllCalls, "UnsubscribeAll must not fire while sibling tab remains connected")
+	store.mu.Unlock()
+
+	// Unregistering the last tab MUST clean up Redis subscriptions.
+	h.Unregister("shared-session", conn2)
+	assert.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.unsubAllCalls == 1
+	}, time.Second, 10*time.Millisecond, "UnsubscribeAll must fire when the last tab disconnects")
+}
+
+func TestHubShutdown_PostShutdownCallsDoNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := NewHub()
+	runDone := make(chan struct{})
+	go func() {
+		h.Run(ctx)
+		close(runDone)
+	}()
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("Hub.Run did not exit on context cancellation")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		h.Register("after-shutdown", nil)
+		h.Unregister("after-shutdown", nil)
+		h.SubscribeSimulation(nil, "sim-1")
+		h.UnsubscribeSimulation(nil, "sim-1")
+		h.HandleTextMessage(nil, []byte(`{"hi":1}`))
+		h.HandleRemoteMessage(&gateway.Wrapper{Type: "evt", SessionId: "after-shutdown"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Hub methods deadlocked after Hub.Run exited")
+	}
 }

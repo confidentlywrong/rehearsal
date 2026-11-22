@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -37,6 +40,7 @@ import (
 	"github.com/GoogleCloudPlatform/race-condition/gen_proto/gateway"
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/agent"
+	"github.com/GoogleCloudPlatform/race-condition/internal/auth"
 	"github.com/GoogleCloudPlatform/race-condition/internal/billing"
 	"github.com/GoogleCloudPlatform/race-condition/internal/config"
 	"github.com/GoogleCloudPlatform/race-condition/internal/hub"
@@ -46,6 +50,7 @@ import (
 	"github.com/GoogleCloudPlatform/race-condition/internal/session"
 	"github.com/GoogleCloudPlatform/race-condition/internal/tracing"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
@@ -57,13 +62,30 @@ import (
 var validSessionID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
 
 // H8 fix: Track in-flight dispatch goroutines so shutdown can await them.
-var dispatchWG sync.WaitGroup
+// dispatchMu serializes shuttingDown transitions against dispatchWG.Add(1)
+// so a WebSocket frame arriving concurrently with shutdown cannot call
+// dispatchWG.Add(1) concurrently with dispatchWG.Wait().
+var (
+	dispatchMu   sync.Mutex
+	dispatchWG   sync.WaitGroup
+	shuttingDown atomic.Bool
+)
 
-// Shutdown guard: prevents new dispatch goroutines from being spawned
-// after the gateway starts shutting down. Without this, a WebSocket
-// message arriving during shutdown can call dispatchWG.Add(1)
-// concurrently with dispatchWG.Wait(), causing a runtime panic.
-var shuttingDown atomic.Bool
+func tryStartDispatch() bool {
+	dispatchMu.Lock()
+	defer dispatchMu.Unlock()
+	if shuttingDown.Load() {
+		return false
+	}
+	dispatchWG.Add(1)
+	return true
+}
+
+func markShuttingDown() {
+	dispatchMu.Lock()
+	shuttingDown.Store(true)
+	dispatchMu.Unlock()
+}
 
 // quotaChecker is the SaaS Phase 5a pre-flight quota gate. Wired by
 // main() after billingStore is constructed; stays nil under
@@ -259,21 +281,29 @@ func enforceQuotaGate(c *gin.Context, activeSimsForUser func(context.Context) (i
 	return true
 }
 
-// countActiveSimulationsFor returns a closure suitable for
-// enforceQuotaGate's `activeSimsForUser` parameter. The closure
-// delegates to the supplied registry's ListSimulations, which is
-// user-scoped via the request context — so no manual filtering
-// by user is needed here.
-func countActiveSimulationsFor(reg session.DistributedRegistry) func(context.Context) (int, error) {
+// countActiveSimulationsExcluding counts active simulations for the tenant on
+// ctx, excluding excludeSimID when adding sessions/runners to an already
+// initialized simulation so it does not double-count against MaxConcurrentRuns.
+func countActiveSimulationsExcluding(reg session.DistributedRegistry, excludeSimID string) func(context.Context) (int, error) {
 	if reg == nil {
 		return nil
 	}
+	trimmedExclude := strings.TrimSpace(excludeSimID)
 	return func(ctx context.Context) (int, error) {
 		sims, err := reg.ListSimulations(ctx)
 		if err != nil {
 			return 0, err
 		}
-		return len(sims), nil
+		if trimmedExclude == "" {
+			return len(sims), nil
+		}
+		count := 0
+		for _, s := range sims {
+			if s != trimmedExclude {
+				count++
+			}
+		}
+		return count, nil
 	}
 }
 
@@ -361,14 +391,168 @@ func dispatchEvent(ctx context.Context, sb hub.Switchboard, agentType string, ev
 	}
 }
 
-func handleBinaryMessage(ctx context.Context, sid string, message []byte, sb hub.Switchboard, reg session.DistributedRegistry, h *hub.Hub) {
+func sendWSBinaryError(h *hub.Hub, conn *websocket.Conn, sid, event, code, simID, details string, targetSessionIDs ...string) {
+	if h == nil {
+		return
+	}
+	if conn != nil {
+		h.SendConnError(conn, event, code, simID, details, targetSessionIDs...)
+		return
+	}
+	if sid != "" {
+		dataMap := map[string]string{
+			"error":   code,
+			"details": details,
+		}
+		if simID != "" {
+			dataMap["simulation_id"] = simID
+		}
+		for _, rawTarget := range targetSessionIDs {
+			if t := strings.TrimSpace(rawTarget); t != "" {
+				dataMap["session_id"] = t
+				break
+			}
+		}
+		h.SendMessage(sid, "error", event, dataMap)
+	}
+}
+
+func handleBinaryMessage(ctx context.Context, conn *websocket.Conn, sid string, message []byte, sb hub.Switchboard, reg session.DistributedRegistry, h *hub.Hub) {
 	log.Printf("GATEWAY: Received binary message from session [%s] (size: %d bytes)", sid, len(message))
 	var wrapper gateway.Wrapper
 	if err := proto.Unmarshal(message, &wrapper); err == nil {
 		log.Printf("GATEWAY: Parsed Wrapper msg. Type=%s, Event=%s", wrapper.Type, wrapper.Event)
-		// Gateway handles: broadcast, tool_call, narrative
+		// Gateway handles: broadcast, a2ui_action
 		if wrapper.Type == "broadcast" {
 			log.Printf("GATEWAY: Processing broadcast intent")
+			uc, ok := account.FromContextOK(ctx)
+			if !ok || strings.TrimSpace(uc.UserID) == "" {
+				sendWSBinaryError(h, conn, sid, "unauthorized", "authentication_required", "", "authenticated user required for broadcast")
+				return
+			}
+			if reg == nil {
+				sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", "", "session registry unavailable")
+				return
+			}
+
+			var broadcastReq gateway.BroadcastRequest
+			if err := proto.Unmarshal(wrapper.Payload, &broadcastReq); err != nil {
+				log.Printf("GATEWAY: Failed to unmarshal BroadcastRequest: %v", err)
+				sendWSBinaryError(h, conn, sid, "bad_request", "invalid_broadcast_request", "", "Failed to unmarshal BroadcastRequest proto")
+				return
+			}
+			if len(broadcastReq.TargetSessionIds) == 0 {
+				sendWSBinaryError(h, conn, sid, "bad_request", "missing_target_sessions", "", "target_session_ids is required")
+				return
+			}
+
+			lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			simID := strings.TrimSpace(wrapper.SimulationId)
+			if simID != "" {
+				sims, err := reg.ListSimulations(lookupCtx)
+				if err != nil {
+					log.Printf("GATEWAY: broadcast simulation lookup failed user=%s sim=%s: %v", uc.UserID, simID, err)
+					sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", simID, "failed to verify simulation ownership")
+					return
+				}
+				ownsSim := false
+				for _, ownedSim := range sims {
+					if ownedSim == simID {
+						ownsSim = true
+						break
+					}
+				}
+				if !ownsSim {
+					log.Printf("GATEWAY: rejected cross-tenant binary broadcast user=%s sim=%s", uc.UserID, simID)
+					sendWSBinaryError(h, conn, sid, "forbidden", "simulation_not_owned", simID, "simulation is not owned by user")
+					return
+				}
+				wrapper.SimulationId = simID
+			}
+
+			targetAgentTypes := make([]string, 0, len(broadcastReq.TargetSessionIds))
+			seenAgents := make(map[string]bool)
+			commonTargetSim := ""
+			mixedTargetSim := false
+			for _, rawTargetSID := range broadcastReq.TargetSessionIds {
+				targetSID := strings.TrimSpace(rawTargetSID)
+				if targetSID == "" {
+					sendWSBinaryError(h, conn, sid, "bad_request", "invalid_target_session", simID, "target_session_ids must not contain empty session IDs")
+					return
+				}
+				agentType, found, err := reg.FindAgentType(lookupCtx, targetSID)
+				if err != nil {
+					log.Printf("GATEWAY: broadcast session lookup failed user=%s target=%s: %v", uc.UserID, targetSID, err)
+					sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", simID, "failed to verify target session ownership", targetSID)
+					return
+				}
+				if !found {
+					log.Printf("GATEWAY: rejected cross-tenant binary broadcast user=%s targetSession=%s", uc.UserID, targetSID)
+					sendWSBinaryError(h, conn, sid, "forbidden", "session_not_owned", simID, "target session is not owned by user", targetSID)
+					return
+				}
+				if !seenAgents[agentType] {
+					seenAgents[agentType] = true
+					targetAgentTypes = append(targetAgentTypes, agentType)
+				}
+				if simID == "" {
+					tSim, sErr := reg.FindSimulation(lookupCtx, targetSID)
+					if sErr != nil {
+						log.Printf("GATEWAY: broadcast simulation resolution failed user=%s target=%s: %v", uc.UserID, targetSID, sErr)
+						sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", "", "failed to verify target session simulation", targetSID)
+						return
+					}
+					if tSim != "" {
+						if commonTargetSim == "" {
+							commonTargetSim = tSim
+						} else if commonTargetSim != tSim {
+							mixedTargetSim = true
+						}
+					}
+				}
+			}
+
+			if len(wrapper.Destination) > 0 {
+				for _, rawDest := range wrapper.Destination {
+					destSID := strings.TrimSpace(rawDest)
+					if destSID == "" {
+						sendWSBinaryError(h, conn, sid, "bad_request", "invalid_destination", simID, "destination must not contain empty session IDs")
+						return
+					}
+					_, found, err := reg.FindAgentType(lookupCtx, destSID)
+					if err != nil {
+						sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", simID, "failed to verify destination ownership", destSID)
+						return
+					}
+					if !found {
+						log.Printf("GATEWAY: rejected cross-tenant binary broadcast destination user=%s dest=%s", uc.UserID, destSID)
+						sendWSBinaryError(h, conn, sid, "forbidden", "session_not_owned", simID, "destination session is not owned by user", destSID)
+						return
+					}
+				}
+			} else {
+				wrapper.Destination = append([]string(nil), broadcastReq.TargetSessionIds...)
+			}
+
+			if wrapperSimSession := strings.TrimSpace(wrapper.SessionId); wrapperSimSession != "" {
+				_, found, err := reg.FindAgentType(lookupCtx, wrapperSimSession)
+				if err != nil {
+					sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", simID, "failed to verify wrapper session ownership", wrapperSimSession)
+					return
+				}
+				if !found {
+					log.Printf("GATEWAY: rejected cross-tenant binary broadcast wrapper.SessionId user=%s session=%s", uc.UserID, wrapperSimSession)
+					sendWSBinaryError(h, conn, sid, "forbidden", "session_not_owned", simID, "wrapper session_id is not owned by user", wrapperSimSession)
+					return
+				}
+			}
+
+			if simID == "" && commonTargetSim != "" && !mixedTargetSim {
+				wrapper.SimulationId = commonTargetSim
+			}
+
 			// 1. Internal fan-out to other Gateway instances
 			if sb != nil {
 				if err := sb.Broadcast(ctx, &wrapper); err != nil {
@@ -376,129 +560,306 @@ func handleBinaryMessage(ctx context.Context, sid string, message []byte, sb hub
 				}
 			}
 
-			// 2. Orchestration fan-out to Python agents
-			var broadcastReq gateway.BroadcastRequest
-			if err := proto.Unmarshal(wrapper.Payload, &broadcastReq); err == nil {
-				log.Printf("GATEWAY: Successfully unmarshaled BroadcastRequest (targets: %v)", broadcastReq.TargetSessionIds)
-				event := map[string]interface{}{
-					"type":    "broadcast",
-					"eventId": wrapper.RequestId,
-					"payload": map[string]interface{}{
-						"data":    string(broadcastReq.Payload),
-						"targets": broadcastReq.TargetSessionIds,
-					},
-				}
+			// 2. Orchestration fan-out to Python agents (strictly to validated owned targets)
+			log.Printf("GATEWAY: Verified BroadcastRequest (targets: %v)", broadcastReq.TargetSessionIds)
+			event := map[string]interface{}{
+				"type":    "broadcast",
+				"eventId": wrapper.RequestId,
+				"payload": map[string]interface{}{
+					"data":    string(broadcastReq.Payload),
+					"targets": broadcastReq.TargetSessionIds,
+					"user_id": strings.TrimSpace(uc.UserID),
+				},
+			}
 
-				// Session-targeted dispatch: look up which agent types own the
-				// target sessions and dispatch only to those types. This prevents
-				// broadcasting to all active agents when only specific agents
-				// should receive the message.
-				if shuttingDown.Load() {
-					log.Printf("GATEWAY: Ignoring broadcast dispatch during shutdown")
-				} else {
-				dispatchWG.Add(1)
+			if !tryStartDispatch() {
+				log.Printf("GATEWAY: Ignoring broadcast dispatch during shutdown")
+			} else {
 				go func() {
 					defer dispatchWG.Done()
-					acc := account.FromContext(ctx)
 					bgCtxBase, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer bgCancel()
-					bgCtx := account.WithContext(bgCtxBase, acc)
-					if reg == nil || len(broadcastReq.TargetSessionIds) == 0 {
-						// Fallback: no registry or no targets → broadcast to all
-						dispatchEvent(bgCtx, sb, "", event)
-						return
-					}
-					dispatched := make(map[string]bool)
-					// B1: derive from `ctx` (carries the tenant from the
-					// WebSocket upgrade) rather than context.Background(),
-					// so reg.FindAgentType reads the org-prefixed Redis
-					// keys instead of the unscoped global namespace.
-					lookupCtx, cancel := context.WithTimeout(bgCtx, 5*time.Second)
-					defer cancel()
-					for _, targetSID := range broadcastReq.TargetSessionIds {
-						agentType, found, err := reg.FindAgentType(lookupCtx, targetSID)
-						if err != nil || !found {
-							log.Printf("GATEWAY: Session %s not found in registry, skipping", targetSID)
-							continue
-						}
-						if dispatched[agentType] {
-							continue // already dispatched to this agent type
-						}
-						dispatched[agentType] = true
-						log.Printf("GATEWAY: Targeted dispatch to %s for session %s", agentType, targetSID)
+					bgCtx := account.WithContext(bgCtxBase, uc)
+					for _, agentType := range targetAgentTypes {
+						log.Printf("GATEWAY: Targeted dispatch to %s for targets %v", agentType, broadcastReq.TargetSessionIds)
 						dispatchEvent(bgCtx, sb, agentType, event)
 					}
-					if len(dispatched) == 0 {
-						log.Printf("GATEWAY: No agent types found for targets, falling back to broadcast")
-						dispatchEvent(bgCtx, sb, "", event)
-					}
 				}()
-				}
-			} else {
-				log.Printf("GATEWAY: Failed to unmarshal BroadcastRequest: %v", err)
-				if h != nil {
-					h.SendMessage(sid, "error", "bad_request", map[string]string{"details": "Failed to unmarshal BroadcastRequest proto"})
-				}
 			}
 		}
 		if wrapper.Type == "a2ui_action" {
 			log.Printf("GATEWAY: Processing A2UI action")
+			uc, ok := account.FromContextOK(ctx)
+			if !ok || strings.TrimSpace(uc.UserID) == "" {
+				sendWSBinaryError(h, conn, sid, "unauthorized", "authentication_required", "", "authenticated user required for a2ui_action")
+				return
+			}
 			var action gateway.A2UIAction
 			if err := proto.Unmarshal(wrapper.Payload, &action); err == nil {
-				log.Printf("GATEWAY: A2UI action=%s for session=%s", action.ActionName, action.SessionId)
+				targetSessionID := strings.TrimSpace(action.SessionId)
+				if targetSessionID == "" {
+					log.Printf("GATEWAY: Ignoring A2UI action %s with empty session_id", action.ActionName)
+					sendWSBinaryError(h, conn, sid, "bad_request", "missing_session_id", "", "a2ui_action requires a non-empty sessionId")
+					return
+				}
+				if reg == nil {
+					log.Printf("GATEWAY: No registry, cannot route A2UI action")
+					sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", "", "session registry unavailable", targetSessionID)
+					return
+				}
+				log.Printf("GATEWAY: A2UI action=%s for session=%s", action.ActionName, targetSessionID)
 				event := map[string]interface{}{
 					"type":      "a2ui_action",
 					"eventId":   wrapper.RequestId,
-					"sessionId": action.SessionId,
+					"sessionId": targetSessionID,
 					"payload": map[string]interface{}{
 						"actionName": action.ActionName,
-						"sessionId":  action.SessionId,
+						"sessionId":  targetSessionID,
+						"user_id":    strings.TrimSpace(uc.UserID),
 					},
 				}
-				if shuttingDown.Load() {
+				if !tryStartDispatch() {
 					log.Printf("GATEWAY: Ignoring A2UI dispatch during shutdown")
 				} else {
-				dispatchWG.Add(1)
-				go func() {
-					defer dispatchWG.Done()
-					acc := account.FromContext(ctx)
-					bgCtxBase, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer bgCancel()
-					bgCtx := account.WithContext(bgCtxBase, acc)
-					if reg == nil {
-						log.Printf("GATEWAY: No registry, cannot route A2UI action")
-						return
-					}
-					// B1: same tenant-scoping fix as the broadcast branch.
-					lookupCtx, cancel := context.WithTimeout(bgCtx, 5*time.Second)
-					defer cancel()
-					agentType, found, err := reg.FindAgentType(lookupCtx, action.SessionId)
-					if err != nil || !found {
-						log.Printf("GATEWAY: Session %s not found in registry for A2UI action", action.SessionId)
-						return
-					}
-					log.Printf("GATEWAY: Dispatching A2UI action to %s", agentType)
-					dispatchEvent(bgCtx, sb, agentType, event)
-				}()
+					go func() {
+						defer dispatchWG.Done()
+						bgCtxBase, bgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						defer bgCancel()
+						bgCtx := account.WithContext(bgCtxBase, uc)
+						// B1: same tenant-scoping fix as the broadcast branch.
+						lookupCtx, cancel := context.WithTimeout(bgCtx, 5*time.Second)
+						defer cancel()
+						agentType, found, err := reg.FindAgentType(lookupCtx, targetSessionID)
+						if err != nil {
+							log.Printf("GATEWAY: Registry lookup error for session %s A2UI action: %v", targetSessionID, err)
+							sendWSBinaryError(h, conn, sid, "service_unavailable", "registry_unavailable", "", "failed to verify target session ownership", targetSessionID)
+							return
+						}
+						if !found {
+							log.Printf("GATEWAY: Session %s not found in registry for A2UI action", targetSessionID)
+							sendWSBinaryError(h, conn, sid, "forbidden", "session_not_owned", "", "target session is not owned by user", targetSessionID)
+							return
+						}
+						log.Printf("GATEWAY: Dispatching A2UI action to %s", agentType)
+						dispatchEvent(bgCtx, sb, agentType, event)
+					}()
 				}
 			} else {
 				log.Printf("GATEWAY: Failed to unmarshal A2UIAction: %v", err)
-				if h != nil {
-					h.SendMessage(sid, "error", "bad_request", map[string]string{"details": "Failed to unmarshal A2UIAction proto"})
-				}
+				sendWSBinaryError(h, conn, sid, "bad_request", "invalid_a2ui_action", "", "Failed to unmarshal A2UIAction proto")
 			}
 		}
 		// Future: Handle tool_call and narrative from here if needed
 	} else {
 		log.Printf("GATEWAY: Failed to unmarshal Wrapper proto: %v", err)
-		if h != nil {
-			h.SendMessage(sid, "error", "bad_request", map[string]string{"details": "Failed to unmarshal Wrapper proto"})
-		}
+		sendWSBinaryError(h, conn, sid, "bad_request", "invalid_wrapper_proto", "", "Failed to unmarshal Wrapper proto")
 	}
 }
 
+var errTrailingJSON = errors.New("unexpected trailing data after JSON value")
+
+// decodeStrictJSON decodes a single JSON value from c.Request.Body (capped at
+// maxBytes via http.MaxBytesReader), rejecting trailing non-whitespace tokens
+// or concatenated JSON values. When allowEmpty is true, a nil or io.EOF body
+// is treated as a valid empty payload; otherwise it returns an error.
+func decodeStrictJSON(c *gin.Context, dst any, maxBytes int64, allowEmpty bool) error {
+	if c.Request == nil || c.Request.Body == nil {
+		if allowEmpty {
+			return nil
+		}
+		return errors.New("request body is empty")
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	dec := json.NewDecoder(c.Request.Body)
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) && allowEmpty {
+			return nil
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errTrailingJSON
+		}
+		return err
+	}
+	if binding.Validator != nil {
+		if err := binding.Validator.ValidateStruct(dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newSimulationOwnershipValidator(reg session.DistributedRegistry) hub.SimulationOwnershipValidator {
+	return func(ctx context.Context, userID, simulationID string) (bool, error) {
+		if reg == nil {
+			return false, errors.New("session registry unavailable")
+		}
+		if strings.TrimSpace(userID) == "" || strings.TrimSpace(simulationID) == "" {
+			return false, nil
+		}
+		scopedCtx := account.WithContext(ctx, account.UserContext{UserID: userID})
+		sims, err := reg.ListSimulations(scopedCtx)
+		if err != nil {
+			return false, err
+		}
+		for _, s := range sims {
+			if s == simulationID {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+}
+
+func newSessionOwnershipValidator(reg session.DistributedRegistry) hub.SessionOwnershipValidator {
+	return func(ctx context.Context, userID, sessionID string) (bool, error) {
+		if reg == nil {
+			return false, errors.New("session registry unavailable")
+		}
+		if strings.TrimSpace(userID) == "" || strings.TrimSpace(sessionID) == "" {
+			return false, nil
+		}
+		scopedCtx := account.WithContext(ctx, account.UserContext{UserID: userID})
+		_, found, err := reg.FindAgentType(scopedCtx, sessionID)
+		if err != nil {
+			return false, err
+		}
+		return found, nil
+	}
+}
+
+func spawnUserBearer(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	if h := c.Request.Header.Get("X-User-Authorization"); h != "" {
+		if tok := bearerFromHeader(h); auth.IsCookieSafeToken(tok) {
+			return tok
+		}
+		return ""
+	}
+	if tok := bearerFromHeader(c.Request.Header.Get("Authorization")); auth.IsCookieSafeToken(tok) {
+		if account.IsGoogleOIDCToken(tok) {
+			if cookie, err := c.Cookie(sessionCookieName); err == nil {
+				ctok := strings.TrimSpace(cookie)
+				if auth.IsCookieSafeToken(ctok) {
+					return ctok
+				}
+			}
+			return ""
+		}
+		return tok
+	}
+	return rawUserBearer(c)
+}
+
+func configureTrustedProxies(r *gin.Engine) error {
+	raw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
+	if raw == "" {
+		return r.SetTrustedProxies(nil)
+	}
+	var proxies []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			proxies = append(proxies, trimmed)
+		}
+	}
+	if len(proxies) == 0 {
+		return r.SetTrustedProxies(nil)
+	}
+	return r.SetTrustedProxies(proxies)
+}
+
+func resolveBillingCreators(acctStore *account.Store, stripeKey, priceMapRaw, returnBaseURL string) (billing.UserLookup, billing.CheckoutCreator, billing.PortalCreator) {
+	var userLookup billing.UserLookup
+	var checkoutCreator billing.CheckoutCreator = billing.NewStubCheckoutCreator()
+	var portalCreator billing.PortalCreator = billing.NewStubPortalCreator()
+	if acctStore == nil {
+		return nil, checkoutCreator, portalCreator
+	}
+	userLookup = acctStore
+	stripeKey = strings.TrimSpace(stripeKey)
+	priceMapRaw = strings.TrimSpace(priceMapRaw)
+	returnBaseURL = strings.TrimSpace(returnBaseURL)
+	if stripeKey == "" || priceMapRaw == "" {
+		return userLookup, checkoutCreator, portalCreator
+	}
+	if err := billing.ValidateRedirectURL(returnBaseURL, returnBaseURL); err != nil {
+		log.Printf("GATEWAY: STRIPE_RETURN_BASE_URL invalid or empty; checkout/portal stay stubbed: %v", err)
+		return userLookup, checkoutCreator, portalCreator
+	}
+	pm, perr := billing.LoadPriceMapFromEnv(priceMapRaw)
+	if perr != nil {
+		log.Printf("GATEWAY: STRIPE_PRICE_MAP parse failed; checkout/portal stay stubbed: %v", perr)
+		return userLookup, checkoutCreator, portalCreator
+	}
+	if cc, cerr := billing.NewStripeCheckoutCreator(stripeKey, pm, acctStore); cerr != nil {
+		log.Printf("GATEWAY: Stripe checkout creator init failed: %v", cerr)
+	} else {
+		checkoutCreator = cc
+		log.Printf("GATEWAY: Stripe checkout creator armed")
+	}
+	if pc, perr := billing.NewStripePortalCreator(stripeKey); perr != nil {
+		log.Printf("GATEWAY: Stripe portal creator init failed: %v", perr)
+	} else {
+		portalCreator = pc
+		log.Printf("GATEWAY: Stripe portal creator armed")
+	}
+	return userLookup, checkoutCreator, portalCreator
+}
+
+func gatewayRateLimitKeyPrefix(redisPrefix, bucket string) string {
+	p := strings.TrimSpace(redisPrefix)
+	if p == "" {
+		return bucket
+	}
+	return p + ":" + bucket
+}
+
+func newAuthExchangeRateLimiter(rdb *redis.Client, redisPrefix string) gin.HandlerFunc {
+	return middleware.RateLimit(middleware.RateLimitOptions{
+		Client:          rdb,
+		Capacity:        10,
+		RefillPerSecond: 1.0 / 30.0,
+		KeyPrefix:       gatewayRateLimitKeyPrefix(redisPrefix, "ratelimit:authexchange:"),
+	})
+}
+
+func newMeInitRateLimiter(rdb *redis.Client, redisPrefix string) gin.HandlerFunc {
+	return middleware.RateLimit(middleware.RateLimitOptions{
+		Client:          rdb,
+		Capacity:        3,
+		RefillPerSecond: 1.0 / 60.0,
+		KeyPrefix:       gatewayRateLimitKeyPrefix(redisPrefix, "ratelimit:meinit:"),
+	})
+}
+
+func escapeRedisGlobGateway(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '*', '?', '[', ']':
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg session.DistributedRegistry, gatewayID string, rdb *redis.Client, drainer hub.PubSubDrainer) *gin.Engine {
+	if h != nil {
+		h.SetSimulationOwnershipValidator(newSimulationOwnershipValidator(reg))
+		h.SetSessionOwnershipValidator(newSessionOwnershipValidator(reg))
+	}
 	r := gin.Default()
+	if err := configureTrustedProxies(r); err != nil {
+		log.Printf("GATEWAY: invalid TRUSTED_PROXIES (%v); disabling trusted proxies", err)
+		_ = r.SetTrustedProxies(nil)
+	}
 
 	// G5a: structured request log + request_id propagation. Mounted
 	// FIRST so request_id is on ctx for everything downstream and the
@@ -527,7 +888,11 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 	// then flip to "enforce". Mounted before Account so a stolen
 	// Firebase ID token replayed via curl is rejected before it
 	// reaches user-resolution code paths.
-	r.Use(middleware.AppCheck(middleware.AppCheckFromEnv(os.Getenv)))
+	appCheckOpts, err := middleware.AppCheckFromEnvE(os.Getenv)
+	if err != nil {
+		log.Fatalf("GATEWAY: appcheck config: %v", err)
+	}
+	r.Use(middleware.AppCheck(appCheckOpts))
 
 	// Account middleware: every request that lands here has a
 	// UserContext on its ctx (resolved via Firebase or LocalResolver
@@ -572,10 +937,6 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			"/api/v1/me/init",
 			"/api/v1/auth/exchange",
 			"/api/v1/me/logout",
-			"/api/v1/settings/ai",
-			"/api/v1/settings/ai/test",
-			"/api/v1/settings/ai/start",
-			"/api/v1/settings/ai/pull",
 		},
 		// ApprovedPaths: routes reachable when the user has a row
 		// but is not yet StatusApproved (manual-approval flow,
@@ -592,10 +953,6 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			"/api/v1/me/init",
 			"/api/v1/auth/exchange",
 			"/api/v1/me/logout",
-			"/api/v1/settings/ai",
-			"/api/v1/settings/ai/test",
-			"/api/v1/settings/ai/start",
-			"/api/v1/settings/ai/pull",
 		},
 	}))
 
@@ -616,9 +973,13 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 	// could DoS Vertex AE budget via /api/v1/sessions. Defaults: 60-request
 	// burst, 1 req/sec steady-state — generous for a UI client, tight enough
 	// to stop scripted abuse. Operators can still tighten or loosen via env.
+	redisPrefix := config.Optional("REDIS_PREFIX", "leader")
 	rlOpts := middleware.RateLimitFromEnv(rdb, os.Getenv).WithSkips(
-		"/health", "/metrics", "/api/v1/usage", "/api/v1/plans", "/api/v1/settings/ai",
+		"/health", "/metrics", "/api/v1/usage", "/api/v1/plans",
 	)
+	if rlOpts.KeyPrefix == "" {
+		rlOpts.KeyPrefix = gatewayRateLimitKeyPrefix(redisPrefix, "ratelimit:user:")
+	}
 	if rlOpts.Capacity <= 0 {
 		rlOpts.Capacity = 60
 	}
@@ -650,13 +1011,13 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		Client:          rdb,
 		Capacity:        10,
 		RefillPerSecond: 0.2,
-		KeyPrefix:       "ratelimit:vertex:",
+		KeyPrefix:       gatewayRateLimitKeyPrefix(redisPrefix, "ratelimit:vertex:"),
 	})
 	destructiveLimiter := middleware.RateLimit(middleware.RateLimitOptions{
 		Client:          rdb,
 		Capacity:        3,
 		RefillPerSecond: 0.05,
-		KeyPrefix:       "ratelimit:destructive:",
+		KeyPrefix:       gatewayRateLimitKeyPrefix(redisPrefix, "ratelimit:destructive:"),
 	})
 	// NOTE: the /api/v1/auth/exchange limiter is constructed in
 	// main() instead of here, because that route is registered in
@@ -800,7 +1161,11 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 
 	// Agent Discovery API
 	r.GET("/api/v1/agent-types", func(c *gin.Context) {
-		agents, err := catalog.DiscoverAgents()
+		if catalog == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent catalog service not initialized"})
+			return
+		}
+		agents, err := catalog.DiscoverAgentsContext(c.Request.Context())
 		if err != nil {
 			log.Printf("AGENT_DISCOVERY_ERROR: %v", err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "failed to discover any agents. Check AGENT_URLS and ensure agents are running."})
@@ -811,6 +1176,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 
 	// Session Management API
 	r.GET("/api/v1/sessions", func(c *gin.Context) {
+		if reg == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session registry unavailable"})
+			return
+		}
 		sessions, err := reg.ListSessions(c.Request.Context())
 		if err != nil {
 			log.Printf("handler error: %v", err)
@@ -838,10 +1207,18 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			// actingUserID below.
 			IgnoredUserID string `json:"userId"`
 		}
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
-		if err := c.ShouldBindJSON(&req); err != nil {
-			log.Printf("ShouldBindJSON: %v", err)
+		if err := decodeStrictJSON(c, &req, 1<<20, false); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
+			log.Printf("decodeStrictJSON: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		if err := session.ValidateSimulationID(req.SimulationID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid simulation_id"})
 			return
 		}
 
@@ -871,7 +1248,12 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		// Phase 5b: also enforces the per-plan concurrency cap by
 		// counting currently-active simulations for this tenant via
 		// the (tenant-scoped) session registry.
-		if enforceQuotaGate(c, countActiveSimulationsFor(reg)) {
+		if enforceQuotaGate(c, countActiveSimulationsExcluding(reg, req.SimulationID)) {
+			return
+		}
+
+		if reg == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session registry unavailable"})
 			return
 		}
 
@@ -880,6 +1262,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 
 		// Track the session in the registry with its agent type and optional simulation
 		if err := reg.TrackSession(c.Request.Context(), sessionID, req.AgentType, req.SimulationID); err != nil {
+			if errors.Is(err, session.ErrInvalidSimulationID) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid simulation_id"})
+				return
+			}
 			log.Printf("handler error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 			return
@@ -904,9 +1290,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			"payload": map[string]string{
 				"agentType":       req.AgentType,
 				"userId":          actingUserID,
+				"user_id":         actingUserID,
 				"simulation_id":   req.SimulationID,
 				"acting_user_id":  actingUserID,
-				"user_auth_token": rawUserBearer(c),
+				"user_auth_token": spawnUserBearer(c),
 			},
 		}
 
@@ -952,6 +1339,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 	})
 
 	r.POST("/api/v1/sessions/flush", destructiveLimiter, func(c *gin.Context) {
+		if reg == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session registry unavailable"})
+			return
+		}
 		count, err := reg.Flush(c.Request.Context())
 		if err != nil {
 			log.Printf("handler error: %v", err)
@@ -967,8 +1358,12 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			Targets []string `json:"targets"`
 		}
 		// Parse optional JSON body; empty body or missing targets = flush all
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
-		if err := c.ShouldBindJSON(&req); err != nil && c.Request.ContentLength > 0 {
+		if err := decodeStrictJSON(c, &req, 1<<20, true); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
 			slog.Error("invalid JSON body in environment reset", "error", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 			return
@@ -999,30 +1394,47 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		}
 
 		ctx := c.Request.Context()
+		acc, hasAcc := account.FromContextOK(ctx)
+		saasOn := account.SaaSModeEnabled()
+		if saasOn && (!hasAcc || strings.TrimSpace(acc.UserID) == "") {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication_required"})
+			return
+		}
+		if saasOn && !acc.IsSuperadmin && !flushAll && targetSet["pubsub"] {
+			c.JSON(http.StatusForbidden, gin.H{"error": "superadmin_required"})
+			return
+		}
 
-		// Snapshot active agent types BEFORE flushing so we can notify them
-		// after the flush completes. Without this, PublishOrchestration queries
-		// the registry post-flush and gets an empty list, so callable agents
-		// (Agent Engine on GCP) never learn about the reset.
+		// Snapshot active agent types and owned sessions BEFORE flushing so we
+		// can notify them after the flush completes without losing ownership scope.
 		var preFlushAgents []string
+		var preFlushSessions []string
 		if reg != nil {
 			var err error
-			preFlushAgents, err = reg.ActiveAgentTypes(ctx)
+			preFlushSessions, err = reg.ListSessions(ctx)
 			if err != nil {
-				log.Printf("RESET: snapshot ActiveAgentTypes failed (agents may not be notified): %v", err)
+				log.Printf("RESET: snapshot ListSessions failed: %v", err)
+			}
+			if !saasOn {
+				preFlushAgents, err = reg.ActiveAgentTypes(ctx)
+				if err != nil {
+					log.Printf("RESET: snapshot ActiveAgentTypes failed (agents may not be notified): %v", err)
+				}
 			}
 		}
 
 		// Flush sessions
 		if flushAll || targetSet["sessions"] {
-			count, err := reg.Flush(ctx)
-			if err != nil {
-				log.Printf("handler error: %v", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-				return
+			if reg != nil {
+				count, err := reg.Flush(ctx)
+				if err != nil {
+					log.Printf("handler error: %v", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+					return
+				}
+				results["sessions"].Flushed = true
+				results["sessions"].Count = count
 			}
-			results["sessions"].Flushed = true
-			results["sessions"].Count = count
 		}
 
 		// Flush queues
@@ -1042,12 +1454,17 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			}
 		}
 
-		// Flush session maps (SCAN and DEL session_map:<account>:* keys)
+		// Flush session maps:
+		//   - SAAS_MODE=on  : SCAN and DEL only session_map:<account>:* (tenant-isolated)
+		//   - SAAS_MODE=off : SCAN and DEL all session_map:* keys (matches Python local SessionManager)
 		if flushAll || targetSet["maps"] {
 			mapCount := 0
 			if rdb != nil {
-				acc := account.FromContext(ctx)
-				pattern := fmt.Sprintf("session_map:%s:*", acc.UserID)
+				mapPrefix := "session_map:"
+				if saasOn {
+					mapPrefix = fmt.Sprintf("session_map:%s:", strings.TrimSpace(acc.UserID))
+				}
+				pattern := escapeRedisGlobGateway(mapPrefix) + "*"
 				var cursor uint64
 				for {
 					keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, 100).Result()
@@ -1056,13 +1473,19 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 						c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 						return
 					}
-					if len(keys) > 0 {
-						if err := rdb.Del(ctx, keys...).Err(); err != nil {
+					var owned []string
+					for _, k := range keys {
+						if strings.HasPrefix(k, mapPrefix) {
+							owned = append(owned, k)
+						}
+					}
+					if len(owned) > 0 {
+						if err := rdb.Del(ctx, owned...).Err(); err != nil {
 							log.Printf("handler error: %v", err)
 							c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 							return
 						}
-						mapCount += len(keys)
+						mapCount += len(owned)
 					}
 					cursor = nextCursor
 					if cursor == 0 {
@@ -1074,9 +1497,13 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			results["maps"].Count = mapCount
 		}
 
-		// Flush PubSub subscriptions (seek to now)
+		// Flush PubSub subscriptions (seek to now). Global PubSub drain is
+		// restricted to single-tenant local mode or superadmin callers.
 		if flushAll || targetSet["pubsub"] {
-			if drainer != nil {
+			if saasOn && !acc.IsSuperadmin {
+				results["pubsub"].Flushed = false
+				results["pubsub"].Count = 0
+			} else if drainer != nil {
 				count, err := drainer.Drain(ctx)
 				if err != nil {
 					log.Printf("RESET: pubsub drain error (non-fatal): %v", err)
@@ -1089,12 +1516,20 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			}
 		}
 
-		// Broadcast environment_reset event
+		// Broadcast environment_reset event scoped to the caller's owned sessions/user.
 		if sb != nil {
+			var resetMeta []byte
+			if hasAcc && strings.TrimSpace(acc.UserID) != "" {
+				if m, mErr := json.Marshal(map[string]string{"target_user_id": acc.UserID}); mErr == nil {
+					resetMeta = m
+				}
+			}
 			resetWrapper := &gateway.Wrapper{
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
-				Type:      "environment_reset",
-				Event:     "environment_reset",
+				Timestamp:   time.Now().UTC().Format(time.RFC3339),
+				Type:        "environment_reset",
+				Event:       "environment_reset",
+				Destination: preFlushSessions,
+				Metadata:    resetMeta,
 				Origin: &gateway.Origin{
 					Type: "system",
 					Id:   gatewayID,
@@ -1105,24 +1540,38 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			}
 
 			// Publish to simulation:broadcast via Redis Pub/Sub for subscriber-mode
-			// agents listening on the channel. Callable agents get explicit pokes below.
+			// agents listening on the channel.
 			// account.Key namespaces the channel per-user so users don't see each
-			// other's resets.
+			// other's resets. In SAAS_MODE=on, skip global HTTP pokes (which clear
+			// shared agent dispatcher active_sessions across all tenants).
 			simNotification := map[string]interface{}{
 				"type":    "environment_reset",
 				"eventId": fmt.Sprintf("reset-%d", time.Now().UnixNano()),
 			}
-			resetChannel := account.Key(ctx, "simulation", "broadcast")
-			if err := sb.PublishOrchestration(ctx, resetChannel, simNotification); err != nil {
-				log.Printf("RESET: simulation broadcast error: %v", err)
+			if hasAcc && strings.TrimSpace(acc.UserID) != "" {
+				simNotification["user_id"] = strings.TrimSpace(acc.UserID)
 			}
+			resetChannel := account.Key(ctx, "simulation", "broadcast")
+			if saasOn {
+				if rdb != nil {
+					if simBytes, mErr := json.Marshal(simNotification); mErr == nil {
+						if err := rdb.Publish(ctx, resetChannel, simBytes).Err(); err != nil {
+							log.Printf("RESET: tenant simulation broadcast error: %v", err)
+						}
+					}
+				}
+			} else {
+				if err := sb.PublishOrchestration(ctx, resetChannel, simNotification); err != nil {
+					log.Printf("RESET: simulation broadcast error: %v", err)
+				}
 
-			// Explicitly poke each agent that was active before the flush.
-			// PublishOrchestration's session-aware routing returns empty post-flush,
-			// so this ensures callable agents (Agent Engine) receive the reset.
-			for _, agentType := range preFlushAgents {
-				if err := sb.PokeAgent(ctx, agentType, simNotification); err != nil {
-					log.Printf("RESET: poke %s failed: %v", agentType, err)
+				// Explicitly poke each agent that was active before the flush.
+				// PublishOrchestration's session-aware routing returns empty post-flush,
+				// so this ensures callable agents (Agent Engine) receive the reset.
+				for _, agentType := range preFlushAgents {
+					if err := sb.PokeAgent(ctx, agentType, simNotification); err != nil {
+						log.Printf("RESET: poke %s failed: %v", agentType, err)
+					}
 				}
 			}
 		}
@@ -1156,13 +1605,21 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			Agents []struct {
 				AgentType string `json:"agentType" binding:"required"`
 				Count     int    `json:"count" binding:"required"`
-			} `json:"agents" binding:"required,dive"`
+			} `json:"agents" binding:"required,min=1,dive"`
 			SimulationID string `json:"simulation_id"`
 		}
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
-		if err := c.ShouldBindJSON(&req); err != nil {
-			log.Printf("ShouldBindJSON: %v", err)
+		if err := decodeStrictJSON(c, &req, 1<<20, false); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request_body_too_large"})
+				return
+			}
+			log.Printf("decodeStrictJSON: %v", err)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+			return
+		}
+		if err := session.ValidateSimulationID(req.SimulationID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid simulation_id"})
 			return
 		}
 
@@ -1188,7 +1645,22 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		// the discovery latency just to be rejected.
 		// Phase 5b: also enforces the concurrency cap via the
 		// tenant-scoped session registry's ListSimulations.
-		if enforceQuotaGate(c, countActiveSimulationsFor(reg)) {
+		if enforceQuotaGate(c, countActiveSimulationsExcluding(reg, req.SimulationID)) {
+			return
+		}
+
+		if reg == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session registry unavailable"})
+			return
+		}
+
+		const (
+			maxSpawnAgentEntries  = 1000
+			maxSpawnCountPerEntry = int64(1_000_000_000)
+			maxSafeRunnersCeiling = 100_000
+		)
+		if len(req.Agents) > maxSpawnAgentEntries {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("too many agent entries (max %d)", maxSpawnAgentEntries)})
 			return
 		}
 
@@ -1198,7 +1670,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			return
 		}
 
-		agents, err := catalog.DiscoverAgents()
+		agents, err := catalog.DiscoverAgentsContext(c.Request.Context())
 		if err != nil {
 			slog.Error("SPAWN: discovery failed", "error", err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -1228,54 +1700,63 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		// was already checked by enforceQuotaGate above; whichever cap
 		// is lower for this request wins. See the precedence comment
 		// at the MAX_RUNNERS definition (search for "audit P3 #8").
-		totalRequested := 0
-		for _, a := range req.Agents {
-			totalRequested += a.Count
+		// Accumulate in clamped int64 so extreme caller counts (e.g. 5e18)
+		// cannot wrap signed int to negative and bypass the cap.
+		effectiveMaxRunners := maxRunners
+		if effectiveMaxRunners < 1 {
+			effectiveMaxRunners = 1
 		}
-		if totalRequested > maxRunners {
-			log.Printf("Spawn request for %d runners exceeds MAX_RUNNERS=%d, capping", totalRequested, maxRunners)
+		if effectiveMaxRunners > maxSafeRunnersCeiling {
+			effectiveMaxRunners = maxSafeRunnersCeiling
+		}
+		originalCounts := make([]int64, len(req.Agents))
+		var totalRequested int64
+		for i, a := range req.Agents {
+			cnt := int64(a.Count)
+			if cnt > maxSpawnCountPerEntry {
+				cnt = maxSpawnCountPerEntry
+			}
+			originalCounts[i] = cnt
+			totalRequested += cnt
+		}
+		if totalRequested > int64(effectiveMaxRunners) {
+			log.Printf("Spawn request for %d runners exceeds MAX_RUNNERS=%d, capping", totalRequested, effectiveMaxRunners)
 			nTypes := len(req.Agents)
-			if nTypes > maxRunners {
-				// More agent types than max runners — only keep the first maxRunners types
+			if nTypes > effectiveMaxRunners {
+				// More agent types than max runners — only keep the first effectiveMaxRunners types
 				for i := range req.Agents {
-					if i < maxRunners {
+					if i < effectiveMaxRunners {
 						req.Agents[i].Count = 1
 					} else {
 						req.Agents[i].Count = 0
 					}
 				}
 			} else {
-				// Save original counts BEFORE resetting to 1
-				originalCounts := make([]int, len(req.Agents))
-				for i, a := range req.Agents {
-					originalCounts[i] = a.Count
-				}
-
 				// Give each type at least 1, then distribute remaining proportionally
-				remaining := maxRunners - nTypes // slots after giving 1 to each
+				remaining := int64(effectiveMaxRunners - nTypes) // slots after giving 1 to each
 				for i := range req.Agents {
 					req.Agents[i].Count = 1
 				}
 				// Distribute remaining slots proportionally to original counts
 				if remaining > 0 {
-					extraTotal := totalRequested - nTypes // original excess beyond 1-per-type
+					extraTotal := totalRequested - int64(nTypes) // original excess beyond 1-per-type
 					if extraTotal <= 0 {
 						extraTotal = 1
 					}
 					for i := range req.Agents {
-						extra := (originalCounts[i] - 1) * remaining / extraTotal
+						extra := int(((originalCounts[i] - 1) * remaining) / extraTotal)
 						if extra < 0 {
 							extra = 0
 						}
 						req.Agents[i].Count = 1 + extra
 					}
 				}
-				// Final safety: ensure total doesn't exceed maxRunners due to rounding
+				// Final safety: ensure total doesn't exceed effectiveMaxRunners due to rounding
 				actualTotal := 0
 				for _, a := range req.Agents {
 					actualTotal += a.Count
 				}
-				for actualTotal > maxRunners {
+				for actualTotal > effectiveMaxRunners {
 					// Trim from the last agent type with count > 1
 					for i := len(req.Agents) - 1; i >= 0; i-- {
 						if req.Agents[i].Count > 1 {
@@ -1284,7 +1765,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 							break
 						}
 					}
-					if actualTotal <= maxRunners {
+					if actualTotal <= effectiveMaxRunners {
 						break
 					}
 				}
@@ -1307,10 +1788,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		// so each spawned agent can call the memory API as *this*
 		// user. See the single-session handler above for the full
 		// contract.
-		batchUserAuthToken := rawUserBearer(c)
+		batchUserAuthToken := spawnUserBearer(c)
 
 		// Phase 1: Collect all sessions and events up front.
-		var sessions []spawnedSession
+		sessions := make([]spawnedSession, 0, len(req.Agents))
 		var trackEntries []session.SessionTrackingEntry
 		var queueItems []hub.QueueItem
 
@@ -1336,6 +1817,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 					"payload": map[string]string{
 						"agentType":       a.AgentType,
 						"userId":          batchUserID,
+						"user_id":         batchUserID,
 						"simulation_id":   req.SimulationID,
 						"acting_user_id":  batchUserID,
 						"user_auth_token": batchUserAuthToken,
@@ -1350,6 +1832,10 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 
 		// Phase 2: Batch-track all sessions in one Redis pipeline (was N round-trips).
 		if err := reg.BatchTrackSessions(c.Request.Context(), trackEntries); err != nil {
+			if errors.Is(err, session.ErrInvalidSimulationID) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid simulation_id"})
+				return
+			}
 			log.Printf("SPAWN: batch track failed: %v", err)
 			log.Printf("handler error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
@@ -1380,6 +1866,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			// Callable agents have no Redis queue listener — they receive
 			// events solely via HTTP. Each spawn event must be delivered
 			// individually (one poke per session).
+			spawnBaseCtx := context.WithoutCancel(c.Request.Context())
 			poked := make(map[string]bool)
 			for i, s := range sessions {
 				card := agents[s.AgentType]
@@ -1390,16 +1877,15 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 				}
 				poked[s.AgentType] = true
 
-				if !shuttingDown.Load() {
-				dispatchWG.Add(1)
-				go func(evt map[string]interface{}, agentType string) {
-					defer dispatchWG.Done()
-					pokeCtx, pokeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-					defer pokeCancel()
-					if err := sb.PokeAgent(pokeCtx, agentType, evt); err != nil {
-						log.Printf("SPAWN: poke error for %s: %v", agentType, err)
-					}
-				}(queueItems[i].Data.(map[string]interface{}), s.AgentType)
+				if tryStartDispatch() {
+					go func(evt map[string]interface{}, agentType string) {
+						defer dispatchWG.Done()
+						pokeCtx, pokeCancel := context.WithTimeout(spawnBaseCtx, 10*time.Second)
+						defer pokeCancel()
+						if err := sb.PokeAgent(pokeCtx, agentType, evt); err != nil {
+							log.Printf("SPAWN: poke error for %s: %v", agentType, err)
+						}
+					}(queueItems[i].Data.(map[string]interface{}), s.AgentType)
 				}
 			}
 		}
@@ -1478,7 +1964,13 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 		// listing simulations in the user's namespace. If neither is
 		// supplied we permit the upgrade for system-broadcast-only
 		// streams (no per-user data).
-		if reg != nil {
+		if sessionID != "" || simulationID != "" {
+			if reg == nil {
+				log.Printf("WebSocket: session registry unavailable for sessionId=%q simulationId=%q user=%s", sessionID, simulationID, uc.UserID)
+				wsCancel()
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "registry_unavailable"})
+				return
+			}
 			lookupCtx, lookupCancel := context.WithTimeout(wsCtx, 3*time.Second)
 			defer lookupCancel()
 
@@ -1496,7 +1988,8 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "session_not_owned"})
 					return
 				}
-			} else if simulationID != "" {
+			}
+			if simulationID != "" {
 				sims, err := reg.ListSimulations(lookupCtx)
 				if err != nil {
 					log.Printf("WebSocket: registry list-simulations failed user=%s: %v", uc.UserID, err)
@@ -1544,7 +2037,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 			return nil
 		})
 
-		h.Register(sessionID, conn, simulationID)
+		h.RegisterWithUser(sessionID, conn, uc.UserID, simulationID)
 
 		// Note: keepalive pings are handled by writePump (hub.go) which
 		// sends PingMessage every 54 seconds. A separate ping goroutine
@@ -1577,7 +2070,7 @@ func setupRouter(h *hub.Hub, sb hub.Switchboard, catalog *agent.Catalog, reg ses
 					break
 				}
 				if messageType == websocket.BinaryMessage {
-					handleBinaryMessage(ctx, sid, message, sb, reg, h)
+					handleBinaryMessage(ctx, conn, sid, message, sb, reg, h)
 				}
 				if messageType == websocket.TextMessage {
 					// Route text messages through Hub for simulation subscription handling.
@@ -1652,7 +2145,7 @@ func main() {
 	}
 	defer func() { _ = tracingShutdown(context.Background()) }()
 
-	port := config.Optional("PORT", config.Optional("GATEWAY_PORT", "8101"))
+	port := config.Optional("PORT", config.Optional("GATEWAY_PORT", config.DefaultGatewayPort))
 	if err := config.ValidatePort(port); err != nil {
 		log.Fatalf("❌ Invalid PORT: %v", err)
 	}
@@ -1778,16 +2271,22 @@ func main() {
 		accountResolverForRouter = resolver
 	}
 
-	// Initialize core services with Redis-backed subscription store.
-	// RemoteWorkers=16 provides 4x throughput over the default (4) for
-	// processing inbound Redis pub/sub messages during 1000-runner simulations.
-	subStore := hub.NewRedisSubscriptionStore(rdb)
-	h := hub.NewHub(hub.WithSubscriptionStore(subStore), hub.WithRemoteWorkers(16))
-
 	gatewayID := config.Optional("HOSTNAME", "local-gw")
 	redisPrefix := config.Optional("REDIS_PREFIX", "leader")
 
 	reg := session.NewRedisSessionRegistry(rdb, redisPrefix, 2*time.Hour)
+
+	// Initialize core services with Redis-backed subscription store.
+	// RemoteWorkers=16 provides 4x throughput over the default (4) for
+	// processing inbound Redis pub/sub messages during 1000-runner simulations.
+	subStore := hub.NewRedisSubscriptionStore(rdb)
+	h := hub.NewHub(
+		hub.WithSubscriptionStore(subStore),
+		hub.WithRemoteWorkers(16),
+		hub.WithSimulationOwnershipValidator(newSimulationOwnershipValidator(reg)),
+		hub.WithSessionOwnershipValidator(newSessionOwnershipValidator(reg)),
+		hub.WithRequireSimulationOwnership(true),
+	)
 
 	agentURLsRaw := config.Optional("AGENT_URLS", "")
 	var agentURLs []string
@@ -1830,9 +2329,12 @@ func main() {
 	// can accept traffic on /healthz, /me, etc. while discovery is
 	// in flight; the Catalog's internal fetchMu serializes any
 	// concurrent /spawn requests onto the in-flight warm-up.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	go func() {
 		warmStart := time.Now()
-		discovered, err := catalog.DiscoverAgents()
+		discovered, err := catalog.DiscoverAgentsContext(ctx)
 		if err != nil {
 			log.Printf("GATEWAY: catalog warm-up failed after %s: %v (lazy discovery will retry on first spawn)",
 				time.Since(warmStart), err)
@@ -1842,9 +2344,6 @@ func main() {
 			time.Since(warmStart), len(discovered), len(agentURLs))
 	}()
 	sb := hub.NewSwitchboardWithRegistry(rdb, gatewayID, h, catalog, reg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start background workers
 	go h.Run(ctx)
@@ -1900,8 +2399,8 @@ func main() {
 		// Python side: METERING_SQLITE_PATH env wins, otherwise
 		// the repo default `data/metering.db`.
 		var usageDrainer billing.OnDemandDrainer
-		if strings.EqualFold(os.Getenv("METERING_SINK"), "sqlite") {
-			drainerPath := os.Getenv("METERING_SQLITE_PATH")
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("METERING_SINK")), "sqlite") {
+			drainerPath := strings.TrimSpace(os.Getenv("METERING_SQLITE_PATH"))
 			if drainerPath == "" {
 				drainerPath = "data/metering.db"
 			}
@@ -1926,40 +2425,14 @@ func main() {
 		// CustomerIDPersister). Any missing piece falls back to
 		// the stub so /api/v1/billing/{checkout,portal} return
 		// 503 instead of 500-ing on a half-configured deploy.
-		var checkoutCreator billing.CheckoutCreator = billing.NewStubCheckoutCreator()
-		var portalCreator billing.PortalCreator = billing.NewStubPortalCreator()
-		var userLookup billing.UserLookup = stubUserLookup{}
-		// stripeAllowedBaseURL anchors the open-redirect guard on
-		// /api/v1/billing/{checkout,portal}. We read the env once
-		// at boot — when STRIPE_RETURN_BASE_URL is the empty
-		// string the real Stripe creator never arms (so the stub
-		// creator is in use, which doesn't actually redirect
-		// users), and ValidateRedirectURL turns into a no-op.
 		stripeAllowedBaseURL := strings.TrimSpace(os.Getenv("STRIPE_RETURN_BASE_URL"))
-		if acctStore, ok := accountStoreForMe.(*account.Store); ok && acctStore != nil {
-			userLookup = acctStore
-			stripeKey := strings.TrimSpace(os.Getenv("STRIPE_API_KEY"))
-			priceMapRaw := strings.TrimSpace(os.Getenv("STRIPE_PRICE_MAP"))
-			if stripeKey != "" && priceMapRaw != "" {
-				pm, perr := billing.LoadPriceMapFromEnv(priceMapRaw)
-				if perr != nil {
-					log.Printf("GATEWAY: STRIPE_PRICE_MAP parse failed; checkout/portal stay stubbed: %v", perr)
-				} else {
-					if cc, cerr := billing.NewStripeCheckoutCreator(stripeKey, pm, acctStore); cerr != nil {
-						log.Printf("GATEWAY: Stripe checkout creator init failed: %v", cerr)
-					} else {
-						checkoutCreator = cc
-						log.Printf("GATEWAY: Stripe checkout creator armed")
-					}
-					if pc, perr := billing.NewStripePortalCreator(stripeKey); perr != nil {
-						log.Printf("GATEWAY: Stripe portal creator init failed: %v", perr)
-					} else {
-						portalCreator = pc
-						log.Printf("GATEWAY: Stripe portal creator armed")
-					}
-				}
-			}
-		}
+		acctStore, _ := accountStoreForMe.(*account.Store)
+		userLookup, checkoutCreator, portalCreator := resolveBillingCreators(
+			acctStore,
+			os.Getenv("STRIPE_API_KEY"),
+			os.Getenv("STRIPE_PRICE_MAP"),
+			stripeAllowedBaseURL,
+		)
 
 		r.POST(
 			"/api/v1/billing/checkout",
@@ -2048,12 +2521,7 @@ func main() {
 	// login/auth token exchange succeeds even if the DB is down.
 	// 10 burst / 1 req per 30s steady, keyed on Firebase UID;
 	// nil rdb → noop (matches RateLimit's guard).
-	authExchangeLimiter := middleware.RateLimit(middleware.RateLimitOptions{
-		Client:          rdb,
-		Capacity:        10,
-		RefillPerSecond: 1.0 / 30.0,
-		KeyPrefix:       "ratelimit:authexchange:",
-	})
+	authExchangeLimiter := newAuthExchangeRateLimiter(rdb, redisPrefix)
 	r.POST("/api/v1/auth/exchange", authExchangeLimiter, authExchangeHandler())
 
 	if accountStoreForMe != nil {
@@ -2068,12 +2536,7 @@ func main() {
 		// 1 req per 60s keyed on Firebase UID is plenty for
 		// legitimate signup retries (the SPA only calls it on a
 		// fresh login when /me 404s) while shutting down abuse.
-		meInitLimiter := middleware.RateLimit(middleware.RateLimitOptions{
-			Client:          rdb,
-			Capacity:        3,
-			RefillPerSecond: 1.0 / 60.0,
-			KeyPrefix:       "ratelimit:meinit:",
-		})
+		meInitLimiter := newMeInitRateLimiter(rdb, redisPrefix)
 		r.POST("/api/v1/me/init", meInitLimiter, initMeHandler(accountStoreForMe))
 		r.POST("/api/v1/me/logout", logoutHandler(accountStoreForMe))
 		r.DELETE("/api/v1/me", deleteAccountHandler(accountStoreForMe))
@@ -2119,7 +2582,6 @@ func main() {
 		log.Printf("GATEWAY: /api/v1/memory/* registered")
 	}
 
-
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           r,
@@ -2152,11 +2614,13 @@ func main() {
 	}
 	log.Println("HTTP server drained")
 
+	// Signal dispatch goroutines to stop spawning before cancelling hub/workers
+	// or calling dispatchWG.Wait().
+	markShuttingDown()
+
 	// Cancel background workers only after HTTP traffic has stopped
 	cancel()
-
-	// Signal dispatch goroutines to stop spawning before waiting.
-	shuttingDown.Store(true)
+	closeAiSettingsManager()
 
 	// H8 fix: Wait for in-flight dispatch goroutines (with timeout).
 	wgDone := make(chan struct{})

@@ -286,3 +286,136 @@ class TestRetrievePassagesLimits:
         )
         # 0 is falsy, so `int(0 or 5)` = 5 (default), clamped to [1,20].
         assert captured_bodies[-1]["limit"] == 5
+
+
+class TestGatewayUrlAndAutoDiscover:
+    def test_gateway_url_precedence_and_default(self, monkeypatch):
+        """_gateway_url follows MEMORY_GATEWAY_URL > GATEWAY_INTERNAL_URL > GATEWAY_URL > GATEWAY_ADDR > 9101."""
+        for var in ("MEMORY_GATEWAY_URL", "GATEWAY_INTERNAL_URL", "GATEWAY_URL", "GATEWAY_ADDR"):
+            monkeypatch.delenv(var, raising=False)
+        assert retrieval_tools._gateway_url() == "http://127.0.0.1:9101"
+
+        monkeypatch.setenv("GATEWAY_ADDR", "10.0.0.5:9101")
+        assert retrieval_tools._gateway_url() == "http://10.0.0.5:9101"
+
+        monkeypatch.setenv("GATEWAY_URL", "https://gw.example.com/")
+        assert retrieval_tools._gateway_url() == "https://gw.example.com"
+
+        monkeypatch.setenv("GATEWAY_INTERNAL_URL", "http://internal-gw:9101/")
+        assert retrieval_tools._gateway_url() == "http://internal-gw:9101"
+
+        monkeypatch.setenv("MEMORY_GATEWAY_URL", "   ")
+        assert retrieval_tools._gateway_url() == "http://internal-gw:9101"
+
+        monkeypatch.setenv("MEMORY_GATEWAY_URL", "http://memory-gw:9101/")
+        assert retrieval_tools._gateway_url() == "http://memory-gw:9101"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_auto_discover_analysis_id_picks_latest_dict_row(self, _fake_ctx):
+        respx.get("http://gateway.test/api/v1/memory/analyses").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "analyses": [
+                        {"id": "older", "created_at": "2026-01-01T00:00:00Z"},
+                        {"id": "newest", "created_at": "2026-06-01T00:00:00Z"},
+                        "non-dict-ignored",
+                    ]
+                },
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            aid, err = await retrieval_tools._auto_discover_analysis_id(client, _fake_ctx)
+        assert err is None
+        assert aid == "newest"
+        assert _fake_ctx.state["memory_analysis_id"] == "newest"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    @pytest.mark.parametrize("bad_id", [".", "..", "../../admin", "a/b?x=1", "bad#frag", "id\\slash"])
+    async def test_auto_discover_rejects_unsafe_path_traversal_id(self, _fake_ctx, bad_id):
+        """Regression: unsafe gateway analysis id must be rejected with gateway_error."""
+        respx.get("http://gateway.test/api/v1/memory/analyses").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "analyses": [
+                        {"id": bad_id, "created_at": "2026-06-01T00:00:00Z"},
+                    ]
+                },
+            )
+        )
+        async with httpx.AsyncClient() as client:
+            aid, err = await retrieval_tools._auto_discover_analysis_id(client, _fake_ctx)
+        assert aid is None
+        assert err == "gateway_error"
+        assert "memory_analysis_id" not in _fake_ctx.state
+
+
+class TestRetrievePassagesOverflowAndNonFinite:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_non_finite_and_bool_limits_fail_soft(self, _fake_ctx):
+        """Regression: limit=float('inf'), float('nan'), and bool must not raise OverflowError."""
+        _fake_ctx.state["memory_analysis_id"] = "analysis-abc"
+        captured_limits: list[int] = []
+
+        def capture_request(request):
+            import json
+
+            captured_limits.append(json.loads(request.content)["limit"])
+            return httpx.Response(200, json={"passages": []})
+
+        respx.post(
+            "http://gateway.test/api/v1/memory/analyses/analysis-abc/retrieve-passages"
+        ).mock(side_effect=capture_request)
+
+        for bad_limit in (float("inf"), float("nan"), True):
+            res = await retrieval_tools.retrieve_document_passages(
+                query="test", tool_context=_fake_ctx, limit=bad_limit  # type: ignore[arg-type]
+            )
+            assert res["status"] == "success"
+            assert res["passages"] == []
+            assert captured_limits[-1] == 5
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_overflow_score_and_chunk_index_in_gateway_payload_never_raise(self, _fake_ctx):
+        """Regression: score=10**400 and chunk_index=10**400/inf must normalize cleanly without OverflowError."""
+        _fake_ctx.state["memory_analysis_id"] = "analysis-abc"
+
+        respx.post(
+            "http://gateway.test/api/v1/memory/analyses/analysis-abc/retrieve-passages"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "passages": [
+                        {
+                            "text": "Valid passage with overflow telemetry.",
+                            "score": 10**400,
+                            "document_id": "doc-ovf",
+                            "chunk_index": 10**400,
+                        },
+                        {
+                            "text": "Valid passage with string infinity.",
+                            "score": "inf",
+                            "document_id": "doc-inf",
+                            "chunk_index": "inf",
+                        },
+                    ]
+                },
+            )
+        )
+
+        res = await retrieval_tools.retrieve_document_passages(
+            query="test", tool_context=_fake_ctx
+        )
+        assert res["status"] == "success"
+        assert res["passage_count"] == 2
+        assert res["passages"][0]["score"] == 0.0
+        assert res["passages"][0]["chunk_index"] == 10**400
+        assert res["passages"][1]["score"] == 0.0
+        assert res["passages"][1]["chunk_index"] == 0
+

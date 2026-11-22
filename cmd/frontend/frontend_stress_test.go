@@ -334,15 +334,49 @@ func TestFrontendSafeLocalLoginRedirect(t *testing.T) {
 		}
 	}
 
-	// Vulnerability reproducer:
-	t.Run("Reproducer_EncodedHostTrickBypassesSanitizer", func(t *testing.T) {
-		input := "/%2f%2fevil.com"
-		actual := safeLocalLoginRedirect(input)
-		t.Logf("Observed: safeLocalLoginRedirect(%q) returned %q (expected '/' per comment on line 564)", input, actual)
-		if actual == "/%2f%2fevil.com" {
-			t.Logf("CONFIRMED: /%%2f%%2fevil.com bypasses sanitizer due to missing strings.HasPrefix(u.Path, '//') check")
+	for _, encodedTrick := range []string{"/%2f%2fevil.com", "/%2F%2Fevil.com", "/%5cevil.com"} {
+		if actual := safeLocalLoginRedirect(encodedTrick); actual != "/" {
+			t.Errorf("safeLocalLoginRedirect(%q): expected \"/\", got %q", encodedTrick, actual)
 		}
-	})
+	}
+}
+
+func TestR2_FrontendProxyPreservesEscapedPathAndStripsHopByHopHeaders(t *testing.T) {
+	var seenRawURI, seenEvilHop, seenServerlessAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenRawURI = r.URL.RequestURI()
+		seenEvilHop = r.Header.Get("X-Evil-Hop")
+		seenServerlessAuth = r.Header.Get("X-Serverless-Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer backend.Close()
+
+	t.Setenv("GATEWAY_INTERNAL_URL", backend.URL)
+	r := setupRouter("", account.NewLocalResolver())
+
+	req := httptest.NewRequest(http.MethodGet, "/frontend/api/v1/items/a%23b%3Fc%25d?q=1", nil)
+	req.RemoteAddr = "127.0.0.1:4321"
+	req.Header.Set("Connection", "X-Evil-Hop, X-Serverless-Authorization")
+	req.Header.Set("X-Evil-Hop", "smuggled")
+	req.Header.Set("X-Serverless-Authorization", "Bearer attacker-forged")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (%s)", w.Code, w.Body.String())
+	}
+	if seenRawURI != "/api/v1/items/a%23b%3Fc%25d?q=1" {
+		t.Fatalf("expected escaped path preserved as /api/v1/items/a%%23b%%3Fc%%25d?q=1, got %q", seenRawURI)
+	}
+	if seenEvilHop != "" {
+		t.Fatalf("expected Connection-listed X-Evil-Hop stripped, got %q", seenEvilHop)
+	}
+	if seenServerlessAuth != "" {
+		t.Fatalf("expected forged X-Serverless-Authorization stripped when oidcAudience is empty, got %q", seenServerlessAuth)
+	}
 }
 
 func min(a, b int) int {

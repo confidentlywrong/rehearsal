@@ -35,9 +35,9 @@ Design choices (locked 2026-06-28 by the operator):
   the tool. The agent reads `state["stakeholder_personas"]` (and the
   graph, and the user's plan) and supplies the timeline as one JSON
   payload. The tool only validates + stashes.
-* **No persistence yet.** Timeline lives in `tool_context.state`. No
-  Neo4j, no Postgres rows. Persistence comes when Artifact 3 (report)
-  starts needing to look back across past simulations.
+* **Persisted via artifact bundle.** Timeline lives in `tool_context.state`
+  during the run and is persisted to Postgres/AlloyDB via
+  `store_stakeholder_artifacts()` / `store_scenario()`. No Neo4j required.
 * **Invented data is allowed here** — simulation layer. Every state row
   defaults to `inferred: true`. The UI tags the entire timeline as a
   synthetic projection.
@@ -56,11 +56,17 @@ Downstream consumers:
 
 from __future__ import annotations
 
-import json
 import logging
+import math
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_optional_rationale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +119,15 @@ def _validate_float_range(
     if isinstance(value, str):
         try:
             value = float(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             pass
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, (f"ticks[{tick_idx}].states[{state_idx}].{field} must be a number in [{lo}, {hi}]")
-    v = float(value)
-    if v < lo or v > hi:
+    try:
+        v = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None, (f"ticks[{tick_idx}].states[{state_idx}].{field} must be a finite number in [{lo}, {hi}]")
+    if not math.isfinite(v) or v < lo or v > hi:
         return None, (f"ticks[{tick_idx}].states[{state_idx}].{field}={v} outside [{lo}, {hi}]")
     return v, None
 
@@ -245,9 +254,8 @@ def _validate_tick(
             sprint_label_clean = s
 
     events, err = _validate_events(tick_idx, raw.get("events"))
-    if err:
-        return None, err
-    assert events is not None
+    if err or events is None:
+        return None, err or "invalid tick events"
 
     states_raw = raw.get("states")
     if not isinstance(states_raw, list) or not states_raw:
@@ -257,9 +265,8 @@ def _validate_tick(
     seen_sids: set[str] = set()
     for j, sraw in enumerate(states_raw):
         normalized, err = _validate_state(tick_idx, j, sraw, known_ids)
-        if err:
-            return None, err
-        assert normalized is not None
+        if err or normalized is None:
+            return None, err or "invalid tick state"
         sid = normalized["stakeholder_id"]
         if sid in seen_sids:
             return None, (
@@ -336,15 +343,9 @@ async def emit_simulation_timeline(
         On failure: ``{"status": "error", "field": "...", "message": "..."}``.
     """
     # 1. Parse the JSON envelope (lenient: accept a dict directly).
-    if isinstance(timeline_json, dict):
-        data = timeline_json
-    else:
-        try:
-            data = json.loads(timeline_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(timeline_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Validate top-level shape.
     ticks_raw = data.get("ticks")
@@ -373,20 +374,26 @@ async def emit_simulation_timeline(
     ticks: list[dict[str, Any]] = []
     for i, raw in enumerate(ticks_raw):
         normalized, err = _validate_tick(i, i + 1, raw, known_ids)
-        if err:
-            return _err(err, field="ticks")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid tick", field="ticks")
         ticks.append(normalized)
 
     # 5. Optional rationale.
-    rationale = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale, str) and rationale.strip():
-        rationale_clean = rationale.strip()[:MAX_RATIONALE_CHARS]
+    rationale_clean, rationale_err = validate_optional_rationale(
+        data.get("rationale"),
+        max_chars=MAX_RATIONALE_CHARS,
+    )
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
     payload: dict[str, Any] = {"ticks": ticks}
     if rationale_clean:
         payload["rationale"] = rationale_clean
+
+    clean_payload, json_err = sanitize_json_value(payload, path=STATE_KEY)
+    if json_err or not isinstance(clean_payload, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    payload = clean_payload
 
     # 6. Stash for downstream report / interview tools.
     try:

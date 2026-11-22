@@ -69,7 +69,7 @@ All 7 tools (`accelerate`, `brake`, `get_vitals`, `process_tick`,
 unchanged. Tests verify the tools are identity-same objects as the base
 runner's implementations.
 
-The only unique code is `autopilot.py` (279 lines): event dispatch, 5
+The only unique code is `autopilot.py`: event dispatch, 5
 handlers, phase detection, and summary building.
 
 ## Differences from the LLM runner
@@ -82,20 +82,20 @@ handlers, phase detection, and summary building.
 | Inner thoughts | LLM generates 5-word monologue | None |
 | Cost per runner | LLM API cost per tick | Zero |
 | Determinism | Non-deterministic (LLM varies) | Deterministic per session ID |
-| Port | 8207 | 8210 |
+| Port | 9108 | 9110 |
 
 ## Configuration
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `RUNNER_AUTOPILOT_PORT` | `8210` | HTTP listen port |
+| `PORT` / `RUNNER_AUTOPILOT_PORT` | `9110` | HTTP listen port |
 
 ## File layout
 
 ```
 agents/runner_autopilot/
 ├── agent.py           # get_base_agent() + callback override + A2A deployment
-├── autopilot.py       # Event dispatch, 5 handlers, phase detection (279 lines)
+├── autopilot.py       # Event dispatch, 5 handlers, phase detection
 └── tests/
     ├── test_agent.py         # Wiring, tool identity, callback presence
     ├── test_autopilot.py     # Handler logic, phase detection, dispatch

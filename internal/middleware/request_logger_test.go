@@ -220,3 +220,27 @@ func lines(t *testing.T, buf *bytes.Buffer) []map[string]any {
 	t.Helper()
 	return decodeLines(t, buf)
 }
+
+func TestRequestLogger_LogsOnHandlerPanic(t *testing.T) {
+	buf := withCapturedLogger(t)
+	r := gin.New()
+	r.Use(gin.CustomRecovery(func(c *gin.Context, _ any) {
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
+	r.Use(RequestLogger())
+	r.GET("/panic", func(c *gin.Context) {
+		panic("boom")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	got := lines(t, buf)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 deferred log line on panic, got %d (%s)", len(got), buf.String())
+	}
+	if got[0]["path"] != "/panic" {
+		t.Errorf("path = %v, want /panic", got[0]["path"])
+	}
+}

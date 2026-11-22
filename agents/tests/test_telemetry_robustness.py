@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -107,11 +109,6 @@ async def test_a2ui_extraction_from_dict(mock_pubsub):
     """Verify that A2UI is correctly extracted when the tool returns a dict."""
     plugin = RedisDashLogPlugin()
     plugin.publisher = MagicMock()
-    # Mock emit_telemetry_pulse
-    import agents.utils.pulses
-
-    agents.utils.pulses.emit_telemetry_pulse = AsyncMock()
-    agents.utils.pulses.emit_gateway_message = AsyncMock()
 
     mock_context = MagicMock()
     mock_context.session.id = "s1"
@@ -124,16 +121,20 @@ async def test_a2ui_extraction_from_dict(mock_pubsub):
 
     # Case: Tool returns a dict with 'a2ui' key (standardized)
     result = {"status": "success", "a2ui": '{"id": "c1"}'}
-    await plugin.after_tool_callback(tool=mock_tool, tool_args={}, tool_context=mock_context, result=result)
+    with (
+        patch("agents.utils.pulses.emit_telemetry_pulse", new_callable=AsyncMock),
+        patch("agents.utils.pulses.emit_gateway_message", new_callable=AsyncMock) as mock_gateway,
+    ):
+        await plugin.after_tool_callback(tool=mock_tool, tool_args={}, tool_context=mock_context, result=result)
 
-    # Extract the a2ui call to emit_gateway_message
-    gateway_calls = agents.utils.pulses.emit_gateway_message.call_args_list
-    # The first call should be text, the second a2ui if we split them
-    a2ui_call = next((call for call in gateway_calls if call.kwargs.get("msg_type") == "a2ui"), None)
-    assert a2ui_call is not None
+        # Extract the a2ui call to emit_gateway_message
+        gateway_calls = mock_gateway.call_args_list
+        # The first call should be text, the second a2ui if we split them
+        a2ui_call = next((call for call in gateway_calls if call.kwargs.get("msg_type") == "a2ui"), None)
+        assert a2ui_call is not None
 
-    a2ui_payload = a2ui_call.kwargs["data"]
-    assert "c1" in str(a2ui_payload)
+        a2ui_payload = a2ui_call.kwargs["data"]
+        assert "c1" in str(a2ui_payload)
 
 
 class AnyIntOrFloat:

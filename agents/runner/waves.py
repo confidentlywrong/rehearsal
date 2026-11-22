@@ -50,6 +50,15 @@ def compute_wave(runner_index: int, runner_count: int) -> tuple[int, float]:
     Returns:
         Tuple of (wave_number, start_delay_minutes) in simulated race time.
     """
+    if (
+        isinstance(runner_count, bool)
+        or not isinstance(runner_count, int)
+        or runner_count <= 0
+    ):
+        return 0, 0.0
+    if isinstance(runner_index, bool) or not isinstance(runner_index, int):
+        runner_index = 0
+
     if runner_count <= 50:
         return 0, 0.0
 
@@ -60,9 +69,8 @@ def compute_wave(runner_index: int, runner_count: int) -> tuple[int, float]:
     else:
         thresholds, gap = _WAVE_CONFIG[2]
 
-    if runner_count > 0:
-        runner_index = max(0, min(runner_index, runner_count - 1))
-    pct = runner_index / max(runner_count, 1)
+    runner_index = max(0, min(runner_index, runner_count - 1))
+    pct = runner_index / runner_count
     wave = len(thresholds)  # default: last wave
     for i, t in enumerate(thresholds):
         if pct < t:
@@ -81,5 +89,11 @@ def compute_runner_wave(session_id: str, runner_count: int) -> tuple[int, float]
     target_finish = rng.lognormvariate(LOGNORMAL_MU, LOGNORMAL_SIGMA)
     target_finish = max(MIN_FINISH_MIN, min(MAX_FINISH_MIN, target_finish))
     ability_pct = (target_finish - MIN_FINISH_MIN) / (MAX_FINISH_MIN - MIN_FINISH_MIN)
+    if (
+        isinstance(runner_count, bool)
+        or not isinstance(runner_count, int)
+        or runner_count <= 0
+    ):
+        return 0, 0.0
     runner_index = int(ability_pct * max(runner_count - 1, 0))
     return compute_wave(runner_index, runner_count)

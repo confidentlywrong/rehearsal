@@ -44,11 +44,16 @@ the live simulation demo with backstage state.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
+
+from agents.leadership_planner_with_memory._validation import (
+    parse_json_envelope,
+    sanitize_json_value,
+    validate_optional_rationale,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +113,11 @@ def _validate_node(idx: int, node: Any) -> tuple[dict[str, Any] | None, str | No
         "kind": kind,
     }
     note = node.get("note")
-    if isinstance(note, str) and note.strip():
-        normalized["note"] = note.strip()
+    if note is not None:
+        if not isinstance(note, str):
+            return None, f"nodes[{idx}].note must be a string when present"
+        if note.strip():
+            normalized["note"] = note.strip()
     if kind == "Belief" and node.get("governing") is True:
         normalized["governing"] = True
     return normalized, None
@@ -121,10 +129,10 @@ def _validate_edge(idx: int, edge: Any, node_ids: set[str]) -> tuple[dict[str, A
         return None, f"edges[{idx}] must be an object"
     src = edge.get("from")
     if isinstance(src, str):
-        src = src.lower()
+        src = src.strip().lower()
     dst = edge.get("to")
     if isinstance(dst, str):
-        dst = dst.lower()
+        dst = dst.strip().lower()
     label = edge.get("label")
     if not isinstance(src, str) or src not in node_ids:
         return None, f"edges[{idx}].from={src!r} does not reference a known node id"
@@ -171,15 +179,9 @@ async def emit_stakeholder_graph(
     # 1. Parse the JSON envelope. Allow a model slip where the agent
     #    passes a dict-like value instead of a string by being lenient
     #    here (mirrors validate_and_emit_a2ui).
-    if isinstance(graph_json, dict):
-        data = graph_json
-    else:
-        try:
-            data = json.loads(graph_json)
-        except (TypeError, ValueError) as exc:
-            return _err(f"invalid JSON: {exc}")
-    if not isinstance(data, dict):
-        return _err("payload must be a JSON object")
+    data, parse_err = parse_json_envelope(graph_json)
+    if parse_err or data is None:
+        return _err(parse_err or "invalid JSON")
 
     # 2. Validate top-level shape.
     nodes_raw = data.get("nodes")
@@ -199,9 +201,8 @@ async def emit_stakeholder_graph(
     seen_ids: set[str] = set()
     for i, raw in enumerate(nodes_raw):
         normalized, err = _validate_node(i, raw)
-        if err:
-            return _err(err, field="nodes")
-        assert normalized is not None  # type narrowing for mypy
+        if err or normalized is None:
+            return _err(err or "invalid node", field="nodes")
         if normalized["id"] in seen_ids:
             return _err(f"nodes[{i}].id={normalized['id']!r} duplicates an earlier node id", field="nodes")
         seen_ids.add(normalized["id"])
@@ -211,20 +212,23 @@ async def emit_stakeholder_graph(
     edges: list[dict[str, Any]] = []
     for i, raw in enumerate(edges_raw):
         normalized, err = _validate_edge(i, raw, seen_ids)
-        if err:
-            return _err(err, field="edges")
-        assert normalized is not None
+        if err or normalized is None:
+            return _err(err or "invalid edge", field="edges")
         edges.append(normalized)
 
     # 5. Optional rationale (sub-text under the graph).
-    rationale = data.get("rationale")
-    rationale_clean: str | None = None
-    if isinstance(rationale, str) and rationale.strip():
-        rationale_clean = rationale.strip()[:500]
+    rationale_clean, rationale_err = validate_optional_rationale(data.get("rationale"), max_chars=500)
+    if rationale_err:
+        return _err(rationale_err, field="rationale")
 
     graph: dict[str, Any] = {"nodes": nodes, "edges": edges}
     if rationale_clean:
         graph["rationale"] = rationale_clean
+
+    clean_graph, json_err = sanitize_json_value(graph, path=STATE_KEY)
+    if json_err or not isinstance(clean_graph, dict):
+        return _err(json_err or "payload is not JSON-safe")
+    graph = clean_graph
 
     # 6. Stash for downstream tools (optional consumers).
     try:

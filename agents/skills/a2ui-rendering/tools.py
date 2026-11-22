@@ -23,6 +23,8 @@ resolution.
 
 import json
 import logging
+import math
+import os
 from typing import Any
 
 from google.adk.tools.tool_context import ToolContext
@@ -206,6 +208,67 @@ def _validate_children_format(
             )
 
 
+def _validate_reference_props(
+    component_id: str,
+    comp_type: str,
+    props: dict[str, Any],
+    violations: list[dict[str, str]],
+) -> None:
+    """Validate that component-ID reference fields have valid string/list shapes."""
+    if comp_type in ("Card", "Button") and "child" in props:
+        val = props.get("child")
+        if not isinstance(val, str) or not val.strip():
+            violations.append(
+                _violation(
+                    component_id,
+                    "child",
+                    f"Component '{comp_type}' property 'child' must be a non-empty string component ID.",
+                )
+            )
+    if comp_type == "Modal":
+        for field in ("entryPointChild", "contentChild"):
+            if field in props:
+                val = props.get(field)
+                if not isinstance(val, str) or not val.strip():
+                    violations.append(
+                        _violation(
+                            component_id,
+                            field,
+                            f"Component 'Modal' property '{field}' must be a non-empty string component ID.",
+                        )
+                    )
+    if comp_type == "Tabs" and "tabItems" in props:
+        tab_items = props.get("tabItems")
+        if not isinstance(tab_items, list):
+            violations.append(
+                _violation(
+                    component_id,
+                    "tabItems",
+                    "Component 'Tabs' property 'tabItems' must be an array of tab item objects.",
+                )
+            )
+        else:
+            for i, item in enumerate(tab_items):
+                if not isinstance(item, dict):
+                    violations.append(
+                        _violation(
+                            component_id,
+                            f"tabItems[{i}]",
+                            "Each item in 'tabItems' must be an object.",
+                        )
+                    )
+                else:
+                    child_ref = item.get("child")
+                    if not isinstance(child_ref, str) or not child_ref.strip():
+                        violations.append(
+                            _violation(
+                                component_id,
+                                f"tabItems[{i}].child",
+                                "Each tab item must include a non-empty string 'child' component ID.",
+                            )
+                        )
+
+
 def _collect_referenced_ids(
     component_id: str,
     comp_type: str,
@@ -253,6 +316,9 @@ def _validate_component(
         return
 
     comp_id = entry.get("id", "")
+    if not isinstance(comp_id, str):
+        violations.append(_violation(str(comp_id), "id", "Component 'id' must be a string."))
+        return
     component_def = entry.get("component", {})
 
     if not isinstance(component_def, dict) or not component_def:
@@ -298,6 +364,7 @@ def _validate_component(
         _validate_typed_wrapper(comp_id, prop_name, prop_value, violations, comp_type)
 
     _validate_children_format(comp_id, comp_type, props, violations)
+    _validate_reference_props(comp_id, comp_type, props, violations)
     _collect_referenced_ids(comp_id, comp_type, props, refs)
 
 
@@ -307,6 +374,9 @@ def _validate_surface_update(data: dict[str, Any]) -> list[dict[str, str]]:
     violations: list[dict[str, str]] = []
 
     surface_update = data.get("surfaceUpdate", {})
+    if not isinstance(surface_update, dict):
+        violations.append(_violation("", "surfaceUpdate", "surfaceUpdate must be an object."))
+        return violations
     components = surface_update.get("components", [])
 
     if not isinstance(components, list):
@@ -342,25 +412,111 @@ def _validate_surface_update(data: dict[str, Any]) -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_valid_score(val: Any) -> int | None:
+    """Parse a finite numeric score clamped to [0, 100], or None if missing/invalid."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return max(0, min(100, int(round(f))))
+
+
+def _clamp_score(val: Any, default: int = 0) -> int:
+    parsed = _parse_valid_score(val)
+    return parsed if parsed is not None else default
+
+
+def _is_error_evaluation(evaluation: dict[str, Any]) -> bool:
+    """Return True when an evaluation dict represents a failed or error evaluation."""
+    raw_status = evaluation.get("status")
+    if isinstance(raw_status, str) and raw_status.strip().lower() == "error":
+        return True
+    raw_method = evaluation.get("eval_method")
+    if isinstance(raw_method, str):
+        method = raw_method.strip().lower()
+        if method in ("error", "empty_llm_response", "invalid_llm_json") or method.endswith("_error"):
+            return True
+    return False
+
+
 def _has_leadership_state(tool_context: Any) -> bool:
-    """Return True when tool_context.state holds real dict scenario/evaluation data."""
+    """Return True when tool_context.state holds a valid positive-scored evaluation."""
     state = getattr(tool_context, "state", None)
     if state is None or not hasattr(state, "get"):
         return False
     try:
-        scenario = state.get("leadership_scenario")
         evaluation = state.get("leadership_evaluation") or state.get("evaluation_result")
     except Exception:
         return False
-    return isinstance(scenario, dict) or isinstance(evaluation, dict)
+    if not isinstance(evaluation, dict) or _is_error_evaluation(evaluation):
+        return False
+    overall_score = _parse_valid_score(evaluation.get("overall_score"))
+    return overall_score is not None and overall_score > 0
 
 
-def _clamp_score(val: Any, default: int = 75) -> int:
+def _is_memory_persistence_configured() -> bool:
+    """Return True when AlloyDB env vars are set or a non-AlloyDB test store is active."""
+    if os.environ.get("ALLOYDB_HOST", "").strip() or os.environ.get("ALLOYDB_INSTANCE_CONNECTION_NAME", "").strip():
+        return True
     try:
-        n = int(round(float(val)))
-        return max(0, min(100, n))
-    except (TypeError, ValueError):
-        return default
+        from agents.leadership_planner_with_memory.memory import tools as mem_tools
+        from agents.leadership_planner_with_memory.memory.store_alloydb import AlloyDBScenarioStore
+
+        return not isinstance(mem_tools._store, AlloyDBScenarioStore)
+    except ImportError:
+        return False
+
+
+def _extract_emit_context(tool_context: Any) -> tuple[str | None, str | None]:
+    """Safely extract (session_id, normalized_simulation_id) from tool_context."""
+    if tool_context is None:
+        return None, None
+    session_obj = getattr(tool_context, "session", None)
+    raw_sid = getattr(session_obj, "id", None)
+    session_id = raw_sid if isinstance(raw_sid, str) and raw_sid.strip() else None
+    state = getattr(tool_context, "state", None)
+    raw_sim_id = state.get("simulation_id") if state is not None and hasattr(state, "get") else None
+    if isinstance(raw_sim_id, str):
+        cleaned = raw_sim_id.strip()
+        simulation_id = cleaned if cleaned and cleaned != "\u2014" else None
+    else:
+        simulation_id = None
+    return session_id, simulation_id
+
+
+async def _resolve_emit_context(tool_context: Any) -> tuple[str | None, str | None, str | None]:
+    """Resolve (mapped_session_id, simulation_id, user_id) for A2UI gateway emission."""
+    raw_session_id, simulation_id = _extract_emit_context(tool_context)
+    if tool_context is None:
+        return raw_session_id, simulation_id, None
+
+    from agents.utils import simulation_registry
+    from agents.utils.communication import resolve_tool_context_user_id
+
+    try:
+        uid = resolve_tool_context_user_id(tool_context, require_when_saas=False)
+    except ValueError as exc:
+        logger.warning("validate_and_emit_a2ui: invalid user_id context: %s", exc)
+        uid = None
+
+    mapped_session_id = raw_session_id
+    if raw_session_id is not None and raw_session_id != "default":
+        try:
+            ctx_id = (
+                await simulation_registry.get_context_id(raw_session_id, user_id=uid)
+                if uid is not None
+                else await simulation_registry.get_context_id(raw_session_id)
+            )
+            if ctx_id:
+                mapped_session_id = ctx_id
+        except ValueError as exc:
+            logger.debug("validate_and_emit_a2ui: skipped context_id lookup (%s)", exc)
+
+    return mapped_session_id, simulation_id, uid
 
 
 def _build_dashboard_from_state(tool_context: Any) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -372,25 +528,30 @@ def _build_dashboard_from_state(tool_context: Any) -> tuple[dict[str, Any], dict
     raw_scenario = state.get("leadership_scenario")
     scenario: dict[str, Any] = raw_scenario if isinstance(raw_scenario, dict) else {}
     raw_eval = state.get("leadership_evaluation") or state.get("evaluation_result")
-    evaluation: dict[str, Any] = raw_eval if isinstance(raw_eval, dict) else {}
+    if not isinstance(raw_eval, dict) or _is_error_evaluation(raw_eval):
+        return None
+    evaluation: dict[str, Any] = raw_eval
+
+    overall_score = _parse_valid_score(evaluation.get("overall_score"))
+    if overall_score is None or overall_score <= 0:
+        return None
 
     active_id = state.get("active_scenario_id")
     plan_meta = f"#{str(active_id)[:6]}" if isinstance(active_id, str) and active_id.strip() else "#PLAN"
-    overall_score = _clamp_score(evaluation.get("overall_score"), default=75)
     title_str = str(
         scenario.get("name")
         or scenario.get("title")
-        or "Enterprise AI Transformation Scenario"
+        or "—"
     )
 
     raw_scores = evaluation.get("scores")
     scores: dict[str, Any] = raw_scores if isinstance(raw_scores, dict) else {}
-    sa_val = _clamp_score(scores.get("stakeholder_alignment"), default=overall_score)
-    dq_val = _clamp_score(scores.get("decision_quality"), default=overall_score)
-    rs_val = _clamp_score(scores.get("resource_stewardship"), default=overall_score)
-    cr_val = _clamp_score(scores.get("crisis_readiness"), default=overall_score)
-    sc_val = _clamp_score(scores.get("strategic_coherence"), default=overall_score)
-    ea_val = _clamp_score(scores.get("ethical_alignment"), default=overall_score)
+    sa_val = _clamp_score(scores.get("stakeholder_alignment"), default=0)
+    dq_val = _clamp_score(scores.get("decision_quality"), default=0)
+    rs_val = _clamp_score(scores.get("resource_stewardship"), default=0)
+    cr_val = _clamp_score(scores.get("crisis_readiness"), default=0)
+    sc_val = _clamp_score(scores.get("strategic_coherence"), default=0)
+    ea_val = _clamp_score(scores.get("ethical_alignment"), default=0)
 
     raw_findings = evaluation.get("findings")
     findings_list = [f for f in raw_findings if isinstance(f, dict)] if isinstance(raw_findings, list) else []
@@ -398,7 +559,7 @@ def _build_dashboard_from_state(tool_context: Any) -> tuple[dict[str, Any], dict
         fallback_desc = str(
             evaluation.get("summary")
             or scenario.get("summary")
-            or "Consensus pathway and stakeholder alignment evaluated across 6 leadership pillars."
+            or "—"
         )
         findings_list = [
             {
@@ -506,18 +667,37 @@ def _build_dashboard_from_state(tool_context: Any) -> tuple[dict[str, Any], dict
 
 
 async def _emit_dashboard_from_state(tool_context: Any) -> dict[str, Any] | None:
-    """Auto-persist scenario if needed, build dashboard A2UI from state, and emit it."""
+    """Auto-persist scenario if configured, build dashboard A2UI from state, and emit it."""
     if not _has_leadership_state(tool_context):
         return None
 
     state = tool_context.state
-    if not isinstance(state.get("active_scenario_id"), str) and isinstance(state.get("leadership_scenario"), dict):
+    if (
+        not isinstance(state.get("active_scenario_id"), str)
+        and isinstance(state.get("leadership_scenario"), dict)
+        and _is_memory_persistence_configured()
+    ):
         try:
             from agents.leadership_planner_with_memory.memory.tools import store_scenario
 
-            await store_scenario(tool_context)
-        except Exception:
-            logger.debug("validate_and_emit_a2ui: auto store_scenario skipped/failed", exc_info=True)
+            store_res = await store_scenario(tool_context)
+            if isinstance(store_res, dict):
+                if store_res.get("status") == "error":
+                    logger.error(
+                        "validate_and_emit_a2ui: auto store_scenario returned error: %s",
+                        store_res.get("message") or store_res,
+                    )
+                elif store_res.get("artifacts_autoflush_error"):
+                    logger.warning(
+                        "validate_and_emit_a2ui: auto store_scenario artifacts autoflush error: %s",
+                        store_res.get("artifacts_autoflush_error"),
+                    )
+        except Exception as exc:
+            logger.error(
+                "validate_and_emit_a2ui: auto store_scenario failed: %s",
+                exc,
+                exc_info=True,
+            )
 
     built = _build_dashboard_from_state(tool_context)
     if built is None:
@@ -525,47 +705,62 @@ async def _emit_dashboard_from_state(tool_context: Any) -> dict[str, Any] | None
     surface_update, begin_rendering = built
 
     emitted_directly = False
-    try:
-        from agents.utils.pulses import emit_gateway_message
+    emit_step = "surfaceUpdate"
+    session_id, simulation_id, uid = await _resolve_emit_context(tool_context)
+    if session_id is not None:
+        try:
+            from agents.utils.pulses import emit_gateway_message
 
-        session_id = tool_context.session.id
-        simulation_id = state.get("simulation_id")
-        origin = {"type": "agent", "id": "planner", "session_id": session_id}
-        destination = [session_id]
+            origin = {"type": "agent", "id": "planner", "session_id": session_id}
+            destination = [session_id]
+            emit_kwargs: dict[str, Any] = {"user_id": uid} if uid is not None else {}
 
-        await emit_gateway_message(
-            origin=origin,
-            destination=destination,
-            status="success",
-            msg_type="a2ui",
-            event="a2ui",
-            data=surface_update,
-            simulation_id=simulation_id,
-        )
-        await emit_gateway_message(
-            origin=origin,
-            destination=destination,
-            status="success",
-            msg_type="a2ui",
-            event="a2ui",
-            data=begin_rendering,
-            simulation_id=simulation_id,
-        )
-        emitted_directly = True
-    except Exception:
-        logger.debug(
-            "validate_and_emit_a2ui: direct gateway emit for state dashboard unavailable; using tool result fallback",
-            exc_info=True,
-        )
+            await emit_gateway_message(
+                origin=origin,
+                destination=destination,
+                status="success",
+                msg_type="a2ui",
+                event="a2ui",
+                data=surface_update,
+                simulation_id=simulation_id,
+                **emit_kwargs,
+            )
+            emit_step = "beginRendering"
+            await emit_gateway_message(
+                origin=origin,
+                destination=destination,
+                status="success",
+                msg_type="a2ui",
+                event="a2ui",
+                data=begin_rendering,
+                simulation_id=simulation_id,
+                **emit_kwargs,
+            )
+            emitted_directly = True
+        except Exception:
+            logger.error(
+                "validate_and_emit_a2ui: direct gateway emit failed at %s for session %s; falling back to tool result",
+                emit_step,
+                session_id,
+                exc_info=True,
+            )
 
     if emitted_directly:
         return {
             "status": "success",
             "message": "A2UI dashboard emitted successfully. Planning workflow complete — write your concise executive summary for the user now.",
         }
+    if emit_step == "beginRendering":
+        return {
+            "status": "success",
+            "a2ui": begin_rendering,
+            "begin_rendering": begin_rendering,
+            "message": "A2UI dashboard emitted successfully. Planning workflow complete — write your concise executive summary for the user now.",
+        }
     return {
         "status": "success",
         "a2ui": surface_update,
+        "begin_rendering": begin_rendering,
         "message": "A2UI dashboard emitted successfully. Planning workflow complete — write your concise executive summary for the user now.",
     }
 
@@ -597,10 +792,21 @@ async def validate_and_emit_a2ui(
         payload = json.dumps(payload)
 
     stripped_input = payload.strip() if isinstance(payload, str) else ""
-    if stripped_input.lower() in ("dashboard", "auto", "{}") and _has_leadership_state(tool_context):
+    if stripped_input.lower() in ("dashboard", "auto"):
         state_res = await _emit_dashboard_from_state(tool_context)
         if state_res is not None:
             return state_res
+        return {
+            "status": "error",
+            "violations": [
+                _violation(
+                    "",
+                    "payload",
+                    "Cannot build dashboard from session state: no valid scored leadership_evaluation found.",
+                ),
+            ],
+            "suggestion": "Run evaluate_leadership_plan first or provide a valid A2UI v0.8.0 JSON payload.",
+        }
 
     # 1. JSON parsing — detect concatenated objects and unwrap {"a2ui": ...}
     try:
@@ -645,11 +851,6 @@ async def validate_and_emit_a2ui(
                     ),
                 }
     except (json.JSONDecodeError, TypeError, AttributeError) as exc:
-        if _has_leadership_state(tool_context):
-            state_res = await _emit_dashboard_from_state(tool_context)
-            if state_res is not None:
-                logger.info("validate_and_emit_a2ui: recovered from invalid JSON using session state dashboard")
-                return state_res
         return {
             "status": "error",
             "violations": [
@@ -659,10 +860,6 @@ async def validate_and_emit_a2ui(
         }
 
     if not isinstance(data, dict):
-        if _has_leadership_state(tool_context):
-            state_res = await _emit_dashboard_from_state(tool_context)
-            if state_res is not None:
-                return state_res
         return {
             "status": "error",
             "violations": [
@@ -684,11 +881,6 @@ async def validate_and_emit_a2ui(
             break
 
     if detected_type is None:
-        if _has_leadership_state(tool_context):
-            state_res = await _emit_dashboard_from_state(tool_context)
-            if state_res is not None:
-                logger.info("validate_and_emit_a2ui: recovered from missing message_type using session state dashboard")
-                return state_res
         return {
             "status": "error",
             "violations": [
@@ -718,14 +910,6 @@ async def validate_and_emit_a2ui(
 
     # [START a2ui_validation_result]
     if violations:
-        if _has_leadership_state(tool_context):
-            state_res = await _emit_dashboard_from_state(tool_context)
-            if state_res is not None:
-                logger.info(
-                    "validate_and_emit_a2ui: repaired %d A2UI violation(s) using deterministic dashboard from session state",
-                    len(violations),
-                )
-                return state_res
         return {
             "status": "error",
             "violations": violations,
@@ -738,37 +922,38 @@ async def validate_and_emit_a2ui(
     # This ensures reliable delivery instead of depending on the ADK
     # response pipeline to incidentally forward the tool result.
     emitted_directly = False
-    try:
-        from agents.utils.pulses import emit_gateway_message
+    session_id, simulation_id, uid = await _resolve_emit_context(tool_context)
+    if session_id is not None:
+        try:
+            from agents.utils.pulses import emit_gateway_message
 
-        session_id = tool_context.session.id
-        simulation_id = tool_context.state.get("simulation_id")
+            origin = {"type": "agent", "id": "planner", "session_id": session_id}
+            destination = [session_id]
+            emit_kwargs: dict[str, Any] = {"user_id": uid} if uid is not None else {}
 
-        origin = {"type": "agent", "id": "planner", "session_id": session_id}
-        destination = [session_id]
-
-        await emit_gateway_message(
-            origin=origin,
-            destination=destination,
-            status="success",
-            msg_type="a2ui",
-            event="a2ui",
-            data=data,
-            simulation_id=simulation_id,
-        )
-        emitted_directly = True
-    except Exception:
-        # Redis emit failed. We still return success because the plugin
-        # pipeline (_emit_narrative) will re-extract the embedded "a2ui"
-        # key from this tool's result and deliver it via the indirect path.
-        # Logged at ERROR (not WARNING) because if BOTH paths fail the
-        # frontend never sees the update and we'd otherwise miss it.
-        logger.error(
-            "validate_and_emit_a2ui: Redis emission failed; falling back to "
-            "plugin-based delivery via tool result. If frontend renders nothing, "
-            "the plugin pipeline also failed \u2014 check _emit_narrative logs.",
-            exc_info=True,
-        )
+            await emit_gateway_message(
+                origin=origin,
+                destination=destination,
+                status="success",
+                msg_type="a2ui",
+                event="a2ui",
+                data=data,
+                simulation_id=simulation_id,
+                **emit_kwargs,
+            )
+            emitted_directly = True
+        except Exception:
+            # Redis emit failed. We still return success because the plugin
+            # pipeline (_emit_narrative) will re-extract the embedded "a2ui"
+            # key from this tool's result and deliver it via the indirect path.
+            # Logged at ERROR (not WARNING) because if BOTH paths fail the
+            # frontend never sees the update and we'd otherwise miss it.
+            logger.error(
+                "validate_and_emit_a2ui: Redis emission failed; falling back to "
+                "plugin-based delivery via tool result. If frontend renders nothing, "
+                "the plugin pipeline also failed \u2014 check _emit_narrative logs.",
+                exc_info=True,
+            )
 
     if emitted_directly:
         # Omit "a2ui" key to prevent double-delivery — the plugin's

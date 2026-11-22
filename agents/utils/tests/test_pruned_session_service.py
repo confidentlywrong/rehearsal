@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -128,3 +130,44 @@ async def test_default_max_events():
     ):
         svc = PrunedRedisSessionService(host="localhost", port=6379)
         assert svc.max_events == 2
+
+
+@pytest.mark.asyncio
+async def test_non_positive_max_events_clears_prior_events():
+    """When max_events <= 0, all prior events are pruned before parent append."""
+    seen_lengths: list[int] = []
+
+    async def mock_parent_append(self, session, event):
+        seen_lengths.append(len(session.events))
+        session.events.append(event)
+        return event
+
+    with patch(
+        "agents.utils.pruned_session_service.RedisSessionService.append_event",
+        mock_parent_append,
+    ):
+        svc = PrunedRedisSessionService.__new__(PrunedRedisSessionService)
+        svc.max_events = 0
+        session = _make_session(num_events=5)
+        await svc.append_event(session, _make_event("new"))
+        assert seen_lengths == [0]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_replaced_pool_logs_async_exception(caplog):
+    """_disconnect_replaced_pool schedules async disconnect and logs exceptions."""
+    import asyncio
+    import logging
+    from agents.utils.pruned_session_service import _disconnect_replaced_pool
+
+    pool = MagicMock()
+
+    async def _boom(inuse_connections=False):
+        raise RuntimeError("disconnect failed")
+
+    pool.disconnect = _boom
+    with caplog.at_level(logging.WARNING, logger="agents.utils.pruned_session_service"):
+        _disconnect_replaced_pool(pool)
+        await asyncio.sleep(0.05)
+
+    assert any("pool disconnect failed" in r.message for r in caplog.records)

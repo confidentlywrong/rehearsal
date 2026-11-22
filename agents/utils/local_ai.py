@@ -89,33 +89,48 @@ def _strip_ollama_prefix(model: str) -> str:
 
 
 def _validate_text_model(raw: str) -> str:
-    """Validate a configured text model tag, falling back to DEFAULT_TEXT_MODEL."""
-    cleaned = _strip_ollama_prefix(raw)
-    if not cleaned or len(cleaned) > 128 or ".." in cleaned:
+    """Validate a configured text model tag; return DEFAULT_TEXT_MODEL only when unset/empty."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
         return DEFAULT_TEXT_MODEL
-    if not _SAFE_MODEL_NAME_RE.match(cleaned):
-        return DEFAULT_TEXT_MODEL
+    cleaned = _strip_ollama_prefix(trimmed)
+    if not cleaned:
+        raise ValueError(f"Invalid local text model tag: {raw!r}")
     lower = cleaned.lower()
-    if lower == "bundle" or lower.startswith("bundle:") or "embed" in lower:
-        return DEFAULT_TEXT_MODEL
+    if (
+        len(cleaned) > 128
+        or ".." in cleaned
+        or not _SAFE_MODEL_NAME_RE.match(cleaned)
+        or lower == "bundle"
+        or lower.startswith("bundle:")
+        or "embed" in lower
+    ):
+        raise ValueError(f"Invalid local text model tag: {raw!r}")
     return cleaned
 
 
 def _validate_embed_model(raw: str) -> str:
-    """Validate a configured embedding model tag, falling back to DEFAULT_EMBED_MODEL."""
-    cleaned = _strip_ollama_prefix(raw)
-    if not cleaned or len(cleaned) > 128 or ".." in cleaned:
+    """Validate a configured embedding model tag; return DEFAULT_EMBED_MODEL only when unset/empty."""
+    trimmed = (raw or "").strip()
+    if not trimmed:
         return DEFAULT_EMBED_MODEL
-    if not _SAFE_MODEL_NAME_RE.match(cleaned):
-        return DEFAULT_EMBED_MODEL
+    cleaned = _strip_ollama_prefix(trimmed)
+    if not cleaned:
+        raise ValueError(f"Invalid local embedding model tag: {raw!r}")
     lower = cleaned.lower()
-    if lower == "bundle" or lower.startswith("bundle:"):
-        return DEFAULT_EMBED_MODEL
+    if (
+        len(cleaned) > 128
+        or ".." in cleaned
+        or not _SAFE_MODEL_NAME_RE.match(cleaned)
+        or lower == "bundle"
+        or lower.startswith("bundle:")
+    ):
+        raise ValueError(f"Invalid local embedding model tag: {raw!r}")
     return cleaned
 
 
 def _validate_local_endpoint(raw: str) -> str:
-    """Validate that `raw` is an http/https loopback URL, falling back to DEFAULT_ENDPOINT."""
+    """Validate that `raw` is an http/https loopback URL; return DEFAULT_ENDPOINT only when unset/empty."""
     trimmed = (raw or "").strip().rstrip("/")
     if not trimmed:
         return DEFAULT_ENDPOINT
@@ -145,18 +160,14 @@ def _validate_local_endpoint(raw: str) -> str:
         if not is_allowed_host:
             ip = ipaddress.ip_address(host)
             is_allowed_host = ip.is_loopback
-        if is_allowed_host:
-            fmt_host = f"[{host}]" if ":" in host else host
-            netloc = f"{fmt_host}:{port}" if port is not None else fmt_host
-            return f"{parsed.scheme}://{netloc}"
-    except ValueError:
-        pass
-    logger.warning(
-        "LOCAL_AI: Rejecting non-loopback endpoint %r; falling back to %s",
-        raw,
-        DEFAULT_ENDPOINT,
-    )
-    return DEFAULT_ENDPOINT
+        if not is_allowed_host:
+            raise ValueError(f"non-loopback host {host!r}")
+        fmt_host = f"[{host}]" if ":" in host else host
+        netloc = f"{fmt_host}:{port}" if port is not None else fmt_host
+        return f"{parsed.scheme}://{netloc}"
+    except ValueError as exc:
+        logger.warning("LOCAL_AI: Rejecting invalid/non-loopback endpoint %r: %s", raw, exc)
+        raise ValueError(f"Invalid or non-loopback local AI endpoint {raw!r}: {exc}") from exc
 
 
 def _resolve_settings_path() -> Path:
@@ -172,11 +183,10 @@ def _default_settings_from_env() -> AiSettings:
         (os.environ.get("AI_PROVIDER") or PROVIDER_CLOUD_GEMINI).strip().lower()
     )
     if provider not in (PROVIDER_CLOUD_GEMINI, PROVIDER_LOCAL_GEMMA):
-        provider = PROVIDER_CLOUD_GEMINI
+        raise ValueError(f"Invalid AI_PROVIDER {provider!r}")
     raw_endpoint = (
-        os.environ.get("OLLAMA_API_BASE")
-        or os.environ.get("OLLAMA_ENDPOINT")
-        or DEFAULT_ENDPOINT
+        (os.environ.get("OLLAMA_API_BASE") or "").strip()
+        or (os.environ.get("OLLAMA_ENDPOINT") or "").strip()
     )
     endpoint = _validate_local_endpoint(raw_endpoint)
     text_model = _validate_text_model(os.environ.get("GEMMA_TEXT_MODEL") or "")
@@ -208,18 +218,18 @@ def get_ai_settings() -> AiSettings:
             return _cached_settings
 
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("settings JSON must be an object")
+        raw_provider = raw.get("provider")
         provider = (
-            str(raw.get("provider") or PROVIDER_CLOUD_GEMINI).strip().lower()
+            str(raw_provider).strip().lower()
+            if raw_provider is not None and str(raw_provider).strip()
+            else PROVIDER_CLOUD_GEMINI
         )
         if provider not in (PROVIDER_CLOUD_GEMINI, PROVIDER_LOCAL_GEMMA):
-            provider = PROVIDER_CLOUD_GEMINI
-        endpoint = _validate_local_endpoint(
-            str(
-                raw.get("endpoint")
-                or raw.get("ollama_endpoint")
-                or DEFAULT_ENDPOINT
-            )
-        )
+            raise ValueError(f"invalid provider {provider!r}")
+        raw_ep = raw.get("endpoint") or raw.get("ollama_endpoint") or ""
+        endpoint = _validate_local_endpoint(str(raw_ep))
         text_model = _validate_text_model(str(raw.get("text_model") or ""))
         embed_model = _validate_embed_model(str(raw.get("embed_model") or ""))
 
@@ -238,9 +248,12 @@ def get_ai_settings() -> AiSettings:
         _cached_mtime = None
         _cached_settings = None
         return _default_settings_from_env()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("LOCAL_AI: Failed reading %s (%s); using env defaults", path, exc)
-        return _default_settings_from_env()
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        _cached_path = path_str
+        _cached_mtime = None
+        _cached_settings = None
+        logger.error("LOCAL_AI: Invalid settings file %s: %s", path, exc)
+        raise ValueError(f"Invalid AI settings file {path}: {exc}") from exc
 
 
 def is_local_gemma_active() -> bool:
@@ -346,17 +359,32 @@ def _is_simulation_execution_request(llm_request: LlmRequest) -> bool:
     return False
 
 
+def _resolve_local_gemma_instruction(override: str | None = None) -> str | None:
+    """Resolve optional condensed local-Gemma system prompt without hard package coupling."""
+    if override is not None:
+        return override
+    try:
+        from agents.leadership_planner_with_memory.prompts import (
+            LOCAL_GEMMA_INSTRUCTION,
+        )
+
+        return LOCAL_GEMMA_INSTRUCTION
+    except ImportError:
+        return None
+
+
 def sanitize_request_for_local_gemma(
     llm_request: LlmRequest,
     target_model: str,
+    *,
+    condensed_instruction: str | None = None,
 ) -> LlmRequest:
     """Clone `llm_request`, overwrite `req.model`, and strip Gemini-only config fields.
 
     Why `req.model` MUST be overwritten:
     `LiteLlm.generate_content_async` computes `effective_model = llm_request.model or self.model`.
-    Because ADK pre-populates `llm_request.model = "gemini-3-flash-preview"` from
-    `GlobalGemini.model`, leaving `req.model` untouched causes LiteLLM to call
-    Vertex AI Gemini instead of Ollama.
+    Because ADK pre-populates `llm_request.model` from `GlobalGemini.model`,
+    leaving `req.model` untouched causes LiteLLM to call Vertex AI Gemini instead of Ollama.
     """
     req = llm_request.model_copy(deep=True)
     req.model = target_model
@@ -372,7 +400,7 @@ def sanitize_request_for_local_gemma(
     # Ensure Ollama 8K context allocation
     extra_options = {"options": {"num_ctx": 8192}, "num_ctx": 8192}
     try:
-        req.config.extra_body = extra_options
+        setattr(req.config, "extra_body", extra_options)
     except (AttributeError, ValueError):
         object.__setattr__(req.config, "extra_body", extra_options)
 
@@ -381,18 +409,23 @@ def sanitize_request_for_local_gemma(
     # Condense system instruction if long leadership prompt is detected
     if req.config.system_instruction:
         if isinstance(req.config.system_instruction, types.Content):
-            raw_sys = "\n".join(p.text for p in req.config.system_instruction.parts if p.text)
+            raw_sys = "\n".join(
+                p.text for p in (req.config.system_instruction.parts or []) if p.text
+            )
         elif isinstance(req.config.system_instruction, str):
             raw_sys = req.config.system_instruction
         else:
             raw_sys = str(req.config.system_instruction)
 
-        from agents.leadership_planner_with_memory.prompts import LOCAL_GEMMA_INSTRUCTION
-
-        if raw_sys != LOCAL_GEMMA_INSTRUCTION and len(raw_sys) > 3000:
+        resolved_instruction = _resolve_local_gemma_instruction(condensed_instruction)
+        if (
+            resolved_instruction is not None
+            and raw_sys != resolved_instruction
+            and len(raw_sys) > 3000
+        ):
             lower_sys = raw_sys.lower()
             if "leadership" in lower_sys or "scenario" in lower_sys or "planner" in lower_sys:
-                req.config.system_instruction = LOCAL_GEMMA_INSTRUCTION
+                req.config.system_instruction = resolved_instruction
 
     if req.config.tools:
         # If this is the leadership planner agent, curate tools for local Gemma
@@ -510,10 +543,8 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
     ) -> tuple[str, dict[str, Any]] | None:
         """Recover tool calls when local Gemma emits unescaped nested quotes or truncated JSON.
 
-        For example, when `gemma2:9b` emits:
-        `{"name": "validate_and_emit_a2ui", "parameters": {"payload": "{"surfaceUpdate": {"card": ...`
-        standard `json.loads` fails due to unescaped inner double quotes, which would
-        otherwise cause ADK to leak the raw JSON tool-call text to the chat UI and stall.
+        Only extracts parameters genuinely present in the response text; returns ``None``
+        when parameters are missing or unrecoverable instead of fabricating arguments.
         """
         matches = list(
             re.finditer(
@@ -527,11 +558,7 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
             if allowed_tool_names and fn_name not in allowed_tool_names:
                 continue
 
-            # Unconditionally return valid dashboard payload for validate_and_emit_a2ui
-            if fn_name == "validate_and_emit_a2ui":
-                return ("validate_and_emit_a2ui", {"payload": "dashboard"})
-
-            if not allowed_tool_names and not re.search(
+            if not re.search(
                 r'["\']?(?:parameters|args|arguments)["\']?\s*:', tail
             ):
                 continue
@@ -553,25 +580,49 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     except Exception:  # noqa: BLE001
                         pass
 
-            # 2. Tool-specific recovery when nested JSON is truncated or invalid
+            # 2. Tool-specific genuine scalar/string parameter extraction
+            if fn_name == "validate_and_emit_a2ui":
+                p_m = re.search(r'["\']payload["\']\s*:\s*["\']([^"\'{}\s][^"\']*)["\']', tail)
+                if p_m:
+                    return ("validate_and_emit_a2ui", {"payload": p_m.group(1).strip()})
+                continue
             if fn_name == "evaluate_leadership_plan":
-                return (
-                    "evaluate_leadership_plan",
-                    {"evaluation_request": "Enterprise transformation plan"},
+                req_m = re.search(r'["\']evaluation_request["\']\s*:\s*["\']([^"\']+)["\']', tail)
+                if req_m:
+                    return (
+                        "evaluate_leadership_plan",
+                        {"evaluation_request": req_m.group(1).strip()},
+                    )
+                continue
+            if fn_name == "emit_action_plan_a2ui":
+                pm_m = re.search(
+                    r'["\']plan_markdown["\']\s*:\s*"([\s\S]*?)"\s*(?:,\s*"[a-zA-Z0-9_]+"\s*:|\}\s*\}|\}$|$)',
+                    tail,
                 )
+                if pm_m:
+                    md_val = pm_m.group(1).replace("\\n", "\n").replace('\\"', '"').strip()
+                    if md_val:
+                        return ("emit_action_plan_a2ui", {"plan_markdown": md_val})
+                continue
             if fn_name in ("start_simulation", "submit_plan_to_simulator"):
-                res_args: dict[str, Any] = {
-                    "action": "execute",
-                    "message": "Execute simulation",
-                }
+                res_args: dict[str, Any] = {}
+                act_m = re.search(r'["\']action["\']\s*:\s*["\']([^"\']+)["\']', tail)
+                if act_m:
+                    res_args["action"] = act_m.group(1).strip()
+                msg_m = re.search(r'["\']message["\']\s*:\s*["\']([^"\']+)["\']', tail)
+                if msg_m:
+                    res_args["message"] = msg_m.group(1).strip()
                 sc_m = re.search(r'"(?:stakeholder|runner)_count"\s*:\s*(\d+)', tail)
                 if sc_m:
                     try:
                         cnt = int(sc_m.group(1))
-                        res_args["simulation_config"] = {"stakeholder_count": cnt, "runner_count": cnt}
-                    except ValueError:
+                        if 1 <= cnt <= 100000:
+                            res_args["simulation_config"] = {"stakeholder_count": cnt, "runner_count": cnt}
+                    except (ValueError, OverflowError):
                         pass
-                return (fn_name, res_args)
+                if res_args:
+                    return (fn_name, res_args)
+                continue
             if fn_name in (
                 "report_leadership_scenario",
                 "map_stakeholders",
@@ -580,7 +631,6 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                 "store_stakeholder_artifacts",
                 "record_scenario_outcome",
                 "emit_sim_results_a2ui",
-                "emit_action_plan_a2ui",
                 "emit_translation_diagnostic",
                 "emit_stakeholder_psychology",
                 "compile_results",
@@ -599,14 +649,28 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                         recovered[str_field] = m.group(1).strip()
                 sc_m = re.search(r'"stakeholder_count"\s*:\s*(\d+)', tail)
                 if sc_m:
-                    recovered["stakeholder_count"] = int(sc_m.group(1))
-                return (fn_name, recovered)
+                    try:
+                        cnt = int(sc_m.group(1))
+                        if 1 <= cnt <= 100000:
+                            recovered["stakeholder_count"] = cnt
+                    except (ValueError, OverflowError):
+                        pass
+                if recovered:
+                    return (fn_name, recovered)
+                continue
             if fn_name == "emit_scenario_list_a2ui":
                 lim_m = re.search(r'"limit"\s*:\s*(\d+)', tail)
-                return (
-                    "emit_scenario_list_a2ui",
-                    {"limit": int(lim_m.group(1)) if lim_m else 3},
-                )
+                if lim_m:
+                    try:
+                        lim_val = int(lim_m.group(1))
+                        if 1 <= lim_val <= 100000:
+                            return (
+                                "emit_scenario_list_a2ui",
+                                {"limit": lim_val},
+                            )
+                    except (ValueError, OverflowError):
+                        pass
+                continue
             if fn_name == "emit_scenario_detail_a2ui":
                 sid_m = re.search(r'"scenario_id"\s*:\s*"([^"]+)"', tail)
                 if sid_m:
@@ -614,12 +678,6 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                         "emit_scenario_detail_a2ui",
                         {"scenario_id": sid_m.group(1).strip()},
                     )
-        if not allowed_tool_names or "validate_and_emit_a2ui" in allowed_tool_names:
-            if re.search(
-                r'["\']?(?:name|function)["\']?\s*:\s*["\']?validate_and_emit_a2ui\b',
-                response_text,
-            ):
-                return ("validate_and_emit_a2ui", {"payload": "dashboard"})
         return None
 
     @staticmethod
@@ -729,8 +787,11 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                 if fr_resp.get("status") == "empty":
                     text = "You have no stored scenarios yet — design one first."
                 else:
-                    count = fr_resp.get("count", 3)
-                    text = f"Here are your top {count} scenarios."
+                    count = fr_resp.get("count")
+                    if count is not None:
+                        text = f"Here are your top {count} scenarios."
+                    else:
+                        text = "Here are your scenarios."
                 return LlmResponse(
                     content=types.Content(
                         role="model",
@@ -767,26 +828,30 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                 design_args = cls._last_call_args_in_current_turn(
                     llm_request, "design_leadership_scenario"
                 )
-                pathway_args: dict[str, Any] = {
-                    "scenario_type": str(
-                        design_args.get("scenario_type")
-                        or fr_resp.get("scenario_type")
-                        or "transformation"
-                    ),
-                    "budget_allocation": str(
-                        design_args.get("budget_allocation") or "balanced"
-                    ),
-                    "complexity": str(
-                        design_args.get("complexity")
-                        or fr_resp.get("complexity")
-                        or "high"
-                    ),
-                    "stakeholder_count": int(
-                        design_args.get("stakeholder_count")
-                        or fr_resp.get("stakeholder_count")
-                        or 1000
-                    ),
-                }
+                pathway_args: dict[str, Any] = {}
+                s_type = design_args.get("scenario_type") or fr_resp.get("scenario_type")
+                if s_type:
+                    pathway_args["scenario_type"] = str(s_type)
+                b_alloc = design_args.get("budget_allocation") or fr_resp.get("budget_allocation")
+                if b_alloc:
+                    pathway_args["budget_allocation"] = str(b_alloc)
+                comp = design_args.get("complexity") or fr_resp.get("complexity")
+                if comp:
+                    pathway_args["complexity"] = str(comp)
+                raw_sc = (
+                    design_args.get("stakeholder_count")
+                    if design_args.get("stakeholder_count") is not None
+                    else fr_resp.get("stakeholder_count")
+                )
+                if raw_sc is not None and not isinstance(raw_sc, bool):
+                    try:
+                        sc_float = float(str(raw_sc).strip().replace(",", ""))
+                        if math.isfinite(sc_float) and sc_float > 0:
+                            sc_val = int(round(sc_float))
+                            if sc_val > 0:
+                                pathway_args["stakeholder_count"] = sc_val
+                    except (TypeError, ValueError, OverflowError):
+                        pass
                 return _make_fc_response("plan_consensus_pathway", pathway_args)
 
             # Step 2 -> Step 3: plan_consensus_pathway -> report_leadership_scenario
@@ -826,14 +891,12 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                         llm_request, "evaluate_leadership_plan"
                     )
                 ):
-                    user_prompt = (
-                        cls._latest_user_prompt(llm_request)
-                        or "Enterprise transformation plan"
-                    )
-                    return _make_fc_response(
-                        "evaluate_leadership_plan",
-                        {"evaluation_request": user_prompt},
-                    )
+                    user_prompt = cls._latest_user_prompt(llm_request)
+                    if user_prompt:
+                        return _make_fc_response(
+                            "evaluate_leadership_plan",
+                            {"evaluation_request": user_prompt},
+                        )
                 if "validate_and_emit_a2ui" in allowed_tool_names:
                     return _make_fc_response(
                         "validate_and_emit_a2ui",
@@ -841,12 +904,20 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     )
 
             # Step 5 -> Step 6: evaluate_leadership_plan -> validate_and_emit_a2ui
+            raw_overall = fr_resp.get("overall_score")
+            has_positive_score = False
+            if raw_overall is not None and not isinstance(raw_overall, bool):
+                try:
+                    ov_f = float(raw_overall)
+                    has_positive_score = math.isfinite(ov_f) and ov_f > 0
+                except (TypeError, ValueError, OverflowError):
+                    has_positive_score = False
             if (
                 fr_name == "evaluate_leadership_plan"
                 and (
                     fr_resp.get("status") in ("ready", "success")
                     or fr_resp.get("passed") is True
-                    or fr_resp.get("overall_score", 0) > 0
+                    or has_positive_score
                 )
                 and "error" not in fr_resp
                 and "validate_and_emit_a2ui" in allowed_tool_names
@@ -887,31 +958,35 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
             ):
                 return _make_fc_response("emit_sim_results_a2ui", {})
 
-            # 3. emit_sim_results_a2ui -> emit_action_plan_a2ui
-            if (
-                fr_name == "emit_sim_results_a2ui"
-                and (
-                    fr_resp.get("status") in ("ready", "success")
-                    or fr_resp.get("result") in ("SUCCESS", "success")
-                    or "SUCCESS" in str(fr.response)
-                )
-                and "error" not in fr_resp
-                and "emit_action_plan_a2ui" in allowed_tool_names
-            ):
-                return _make_fc_response("emit_action_plan_a2ui", {})
+            # 3. emit_sim_results_a2ui delegates to the model to author genuine plan_markdown
+            # for emit_action_plan_a2ui (no empty-arg fast-path or synthetic 90-day plan).
 
-            # 4. emit_action_plan_a2ui -> emit_translation_diagnostic
+            # 4. emit_action_plan_a2ui -> emit_translation_diagnostic (or emit_stakeholder_psychology)
             if (
                 fr_name == "emit_action_plan_a2ui"
                 and (
                     fr_resp.get("status") in ("ready", "success")
                     or fr_resp.get("result") in ("SUCCESS", "success")
+                    or str(fr_resp.get("result") or "").strip().startswith("SUCCESS")
                     or "SUCCESS" in str(fr.response)
                 )
                 and "error" not in fr_resp
-                and "emit_translation_diagnostic" in allowed_tool_names
+                and not str(fr.response or "").strip().upper().startswith("ERROR")
             ):
-                return _make_fc_response("emit_translation_diagnostic", {})
+                if (
+                    "emit_translation_diagnostic" in allowed_tool_names
+                    and not cls._called_in_current_turn(
+                        llm_request, "emit_translation_diagnostic"
+                    )
+                ):
+                    return _make_fc_response("emit_translation_diagnostic", {})
+                if (
+                    "emit_stakeholder_psychology" in allowed_tool_names
+                    and not cls._called_in_current_turn(
+                        llm_request, "emit_stakeholder_psychology"
+                    )
+                ):
+                    return _make_fc_response("emit_stakeholder_psychology", {})
 
             # 5. emit_translation_diagnostic -> emit_stakeholder_psychology
             if (
@@ -922,7 +997,11 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     or "SUCCESS" in str(fr.response)
                 )
                 and "error" not in fr_resp
+                and not str(fr.response or "").strip().upper().startswith("ERROR")
                 and "emit_stakeholder_psychology" in allowed_tool_names
+                and not cls._called_in_current_turn(
+                    llm_request, "emit_stakeholder_psychology"
+                )
             ):
                 return _make_fc_response("emit_stakeholder_psychology", {})
 
@@ -934,6 +1013,15 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
             ):
                 return _make_fc_response("stop_race_collector", {})
 
+            # Tick-level Echo & Runner completion turns:
+            if fr_name in ("process_decision_round_tool", "process_leadership_tick"):
+                return LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=f"Processed {fr_name}.")],
+                    )
+                )
+
             return None
 
         if last_content.role == "user" and not fn_responses:
@@ -941,6 +1029,94 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                 p.text for p in last_content.parts if p.text
             ).strip()
             lower_user = user_text.lower()
+
+            # Real-time simulation Echo tick fast-path (avoids 60s+ CPU Ollama queue stalls
+            # per echo inside advance_tick's 10-20s window while preserving full simulation physics).
+            if allowed_tool_names == {"process_decision_round_tool"}:
+                try:
+                    ev = json.loads(user_text) if user_text.startswith("{") else {}
+                except Exception:
+                    ev = {}
+                if isinstance(ev, dict):
+                    ev_type = str(ev.get("event") or "").strip()
+                    if ev_type == "simulation_start":
+                        return LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[types.Part.from_text(text="Ready.")],
+                            )
+                        )
+                    if ev_type not in ("decision_round", "tick"):
+                        return LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[types.Part.from_text(text="ack")],
+                            )
+                        )
+                    sys_raw = llm_request.config.system_instruction if llm_request.config else ""
+                    if isinstance(sys_raw, types.Content):
+                        sys_txt = " ".join(p.text for p in (sys_raw.parts or []) if p.text)
+                    else:
+                        sys_txt = str(sys_raw or "")
+                    sent_m = re.search(r"Your sentiment:\s*([-+]?\d+(?:\.\d+)?)", sys_txt)
+                    stance_m = re.search(r"Your stance:\s*([A-Za-z_]+)", sys_txt)
+                    sentiment_val = float(sent_m.group(1)) if sent_m else 0.0
+                    stance_val = stance_m.group(1).lower() if stance_m else "neutral"
+                    from agents.ai_echo.initialization import compute_wall_severity
+                    from agents.ai_echo_autopilot.autopilot import _pick_inner_thought
+
+                    tick_val = int(ev.get("tick") or 0)
+                    thought = _pick_inner_thought({"stance": stance_val, "sentiment": sentiment_val}, tick_val)
+                    wall_sev = compute_wall_severity(stance_val, sentiment_val)
+                    return _make_fc_response(
+                        "process_decision_round_tool",
+                        {
+                            "tick": tick_val,
+                            "decision_text": str(ev.get("decision_text") or ""),
+                            "decision_tags": json.dumps(ev.get("decision_tags") or {}, default=str),
+                            "resource_state": json.dumps(ev.get("resource_state") or {}, default=str),
+                            "contradiction_alert": json.dumps(ev.get("contradiction_alert"), default=str),
+                            "inner_thought": thought,
+                            "wall_severity": float(wall_sev),
+                            "collector_buffer_key": str(ev.get("collector_buffer_key") or ""),
+                            "influence_deltas": json.dumps(ev.get("influence_deltas") or {}, default=str),
+                        },
+                    )
+
+            # Real-time simulation Leadership Runner tick fast-path
+            if "process_leadership_tick" in allowed_tool_names:
+                try:
+                    ev = json.loads(user_text) if user_text.startswith("{") else {}
+                except Exception:
+                    ev = {}
+                if isinstance(ev, dict):
+                    ev_type = str(ev.get("event") or "").strip()
+                    if ev_type == "start_gun":
+                        return LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[types.Part.from_text(text="Ready.")],
+                            )
+                        )
+                    if ev_type != "tick":
+                        return LlmResponse(
+                            content=types.Content(
+                                role="model",
+                                parts=[types.Part.from_text(text="ack")],
+                            )
+                        )
+                    tick_val = int(ev.get("tick") or 0)
+                    return _make_fc_response(
+                        "process_leadership_tick",
+                        {
+                            "tick": tick_val,
+                            "minutes_per_tick": float(ev.get("minutes_per_tick") or 0.0),
+                            "elapsed_minutes": float(ev.get("elapsed_minutes") or 0.0),
+                            "race_distance_mi": float(ev.get("race_distance_mi") or 0.0),
+                            "collector_buffer_key": str(ev.get("collector_buffer_key") or ""),
+                            "inner_thought": "Evaluating alignment path.",
+                        },
+                    )
             if "emit_scenario_list_a2ui" in allowed_tool_names and lower_user in {
                 "list the top 3 best scenarios",
                 "list scenarios",
@@ -975,7 +1151,7 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     llm_request, "start_simulation"
                 )
             ):
-                count = 1000
+                count: int | None = None
                 found_count = False
 
                 # First, check the active user text directly
@@ -1056,17 +1232,20 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                         if found_count:
                             break
 
-                return _make_fc_response(
-                    "start_simulation",
-                    {
-                        "action": "execute",
-                        "message": f"Run leadership simulation for {count} stakeholders",
-                        "simulation_config": {
-                            "stakeholder_count": count,
-                            "runner_count": count,
-                        },
-                    },
-                )
+                start_args: dict[str, Any] = {
+                    "action": "execute",
+                    "message": (
+                        f"Run leadership simulation for {count} stakeholders"
+                        if count is not None
+                        else "Run leadership simulation"
+                    ),
+                }
+                if count is not None:
+                    start_args["simulation_config"] = {
+                        "stakeholder_count": count,
+                        "runner_count": count,
+                    }
+                return _make_fc_response("start_simulation", start_args)
 
             # Step 1 (design_leadership_scenario) deterministic user trigger
             if (
@@ -1142,7 +1321,11 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
 
     @staticmethod
     def _extract_scenario_design_args(user_text: str) -> dict[str, Any] | None:
-        """Deterministically extract `design_leadership_scenario` args when `user_text` requests scenario design."""
+        """Deterministically extract `design_leadership_scenario` args when `user_text` requests scenario design.
+
+        Only includes fields genuinely observed in ``user_text``; never fabricates
+        default scenario types, complexity, budget allocation, or stakeholder counts.
+        """
         lower_user = (user_text or "").strip().lower()
         if not lower_user:
             return None
@@ -1189,34 +1372,36 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
         if not (has_explicit_tool or has_metadata or has_design_verb):
             return None
 
+        extracted: dict[str, Any] = {}
+
         type_m = re.search(
             r"scenario[\s_]*type\s*\*?\*?\s*:\s*`?\*?\*?\s*(transformation|crisis|merger)",
             lower_user,
         )
         if type_m:
-            scenario_type = type_m.group(1)
+            extracted["scenario_type"] = type_m.group(1)
         elif "crisis" in lower_user and "transformation" not in lower_user:
-            scenario_type = "crisis"
+            extracted["scenario_type"] = "crisis"
         elif (
             re.search(r"\b(?:merger|acquisition|m&a)\b", lower_user)
             and "transformation" not in lower_user
         ):
-            scenario_type = "merger"
-        else:
-            scenario_type = "transformation"
+            extracted["scenario_type"] = "merger"
+        elif "transformation" in lower_user:
+            extracted["scenario_type"] = "transformation"
 
         budget_m = re.search(
             r"budget(?:[\s_]*allocation)?\s*\*?\*?\s*:\s*`?\*?\*?\s*(balanced|aggressive|conservative)",
             lower_user,
         )
         if budget_m:
-            budget_allocation = budget_m.group(1)
+            extracted["budget_allocation"] = budget_m.group(1)
         elif "aggressive" in lower_user and "balanced" not in lower_user:
-            budget_allocation = "aggressive"
+            extracted["budget_allocation"] = "aggressive"
         elif "conservative" in lower_user and "balanced" not in lower_user:
-            budget_allocation = "conservative"
-        else:
-            budget_allocation = "balanced"
+            extracted["budget_allocation"] = "conservative"
+        elif "balanced" in lower_user:
+            extracted["budget_allocation"] = "balanced"
 
         comp_m = re.search(
             r"complexity\s*\*?\*?\s*:\s*`?\*?\*?\s*(simple|moderate|complex|high)",
@@ -1224,19 +1409,18 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
         )
         if comp_m:
             raw_comp = comp_m.group(1)
-            complexity = "complex" if raw_comp == "high" else raw_comp
+            extracted["complexity"] = "complex" if raw_comp == "high" else raw_comp
         elif (
             "complex" in lower_user
             or "advanced" in lower_user
             or "45 ticks" in lower_user
         ):
-            complexity = "complex"
+            extracted["complexity"] = "complex"
         elif "simple" in lower_user or "beginner" in lower_user:
-            complexity = "simple"
-        else:
-            complexity = "moderate"
+            extracted["complexity"] = "simple"
+        elif "moderate" in lower_user:
+            extracted["complexity"] = "moderate"
 
-        stakeholder_count = 1000
         sc_m = re.search(
             r"stakeholder[\s_]*count\s*\*?\*?\s*:\s*`?\*?\*?\s*([\d,]+)",
             lower_user,
@@ -1248,28 +1432,25 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
             try:
                 parsed_sc = int(sc_m.group(1).replace(",", ""))
                 if 1 <= parsed_sc <= 100000:
-                    stakeholder_count = parsed_sc
+                    extracted["stakeholder_count"] = parsed_sc
             except ValueError:
                 pass
 
-        return {
-            "scenario_type": scenario_type,
-            "budget_allocation": budget_allocation,
-            "complexity": complexity,
-            "stakeholder_count": stakeholder_count,
-        }
+        return extracted if extracted else None
 
     @classmethod
     def _build_closing_fallback_summary(cls, llm_request: LlmRequest) -> str:
-        """Build a deterministic 2-3 paragraph plain-Markdown executive summary from `llm_request.contents`."""
-        scenario_name = "Enterprise Leadership Transformation"
-        scenario_type = "transformation"
-        complexity = "complex"
-        stakeholder_count = 1000
+        """Build a deterministic plain-Markdown executive summary from observed `llm_request.contents`."""
+        scenario_name: str | None = None
+        scenario_type: str | None = None
+        complexity: str | None = None
+        stakeholder_count: int | None = None
         overall_score: int | float | None = None
         eval_summary = ""
         findings: list[dict[str, Any]] = []
         suggestions: list[str] = []
+        td_summary = ""
+        sp_summary = ""
         is_sim_close = False
 
         for content in llm_request.contents or []:
@@ -1303,16 +1484,13 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     )
                     if fc_name == "design_leadership_scenario":
                         is_sim_close = False
-                        scenario_type = str(
-                            fc_args.get("scenario_type") or scenario_type
-                        )
-                        complexity = str(
-                            fc_args.get("complexity") or complexity
-                        )
-                        if isinstance(fc_args.get("stakeholder_count"), int):
-                            stakeholder_count = int(
-                                fc_args["stakeholder_count"]
-                            )
+                        if fc_args.get("scenario_type"):
+                            scenario_type = str(fc_args["scenario_type"])
+                        if fc_args.get("complexity"):
+                            complexity = str(fc_args["complexity"])
+                        raw_fc_sc = fc_args.get("stakeholder_count")
+                        if isinstance(raw_fc_sc, int) and not isinstance(raw_fc_sc, bool) and raw_fc_sc > 0:
+                            stakeholder_count = raw_fc_sc
                 elif part.function_response is not None:
                     fr_name = part.function_response.name or ""
                     fr_raw = part.function_response.response
@@ -1332,16 +1510,27 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                             scenario_name = str(fr_resp["name"])
                         if fr_resp.get("scenario_type"):
                             scenario_type = str(fr_resp["scenario_type"])
+                        if fr_resp.get("complexity"):
+                            complexity = str(fr_resp["complexity"])
+                        raw_fr_sc = fr_resp.get("stakeholder_count")
+                        if isinstance(raw_fr_sc, int) and not isinstance(raw_fr_sc, bool) and raw_fr_sc > 0:
+                            stakeholder_count = raw_fr_sc
                     elif fr_name == "report_leadership_scenario":
                         s_sum = fr_resp.get("scenario_summary")
-                        if isinstance(s_sum, dict) and s_sum.get(
-                            "scenario_name"
-                        ):
-                            scenario_name = str(s_sum["scenario_name"])
+                        if isinstance(s_sum, dict):
+                            if s_sum.get("scenario_name"):
+                                scenario_name = str(s_sum["scenario_name"])
+                            if s_sum.get("scenario_type") and not scenario_type:
+                                scenario_type = str(s_sum["scenario_type"])
+                            if s_sum.get("complexity") and not complexity:
+                                complexity = str(s_sum["complexity"])
+                            raw_sum_sc = s_sum.get("stakeholder_count")
+                            if isinstance(raw_sum_sc, int) and not isinstance(raw_sum_sc, bool) and raw_sum_sc > 0 and stakeholder_count is None:
+                                stakeholder_count = raw_sum_sc
                     elif fr_name == "evaluate_leadership_plan":
                         if isinstance(
                             fr_resp.get("overall_score"), (int, float)
-                        ):
+                        ) and not isinstance(fr_resp.get("overall_score"), bool):
                             overall_score = fr_resp["overall_score"]
                         if fr_resp.get("summary"):
                             eval_summary = str(fr_resp["summary"]).strip()
@@ -1379,12 +1568,31 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     }:
                         is_sim_close = True
 
+        def _observed_scope_phrase() -> str:
+            parts: list[str] = []
+            if stakeholder_count is not None:
+                parts.append(f"**{stakeholder_count:,} stakeholders**")
+            details: list[str] = []
+            if scenario_type:
+                details.append(f"`{scenario_type}` scenario")
+            if complexity:
+                details.append(f"**{complexity}** complexity")
+            if details:
+                parts.append(f"({', '.join(details)})" if stakeholder_count is not None else ", ".join(details))
+            return " ".join(parts)
+
         if is_sim_close:
+            heading = (
+                f"### Executive Simulation Debrief: {scenario_name}"
+                if scenario_name
+                else "### Executive Simulation Debrief"
+            )
+            scope = _observed_scope_phrase()
+            scope_clause = f" across {scope}" if scope else ""
             p1 = (
-                f"### Executive Simulation Debrief: {scenario_name}\n\n"
-                f"The multi-agent leadership simulation across **{stakeholder_count:,} stakeholders** "
-                f"({scenario_type} scenario, {complexity} complexity) has completed execution, and all "
-                "telemetry, translation diagnostics, and stakeholder psychology artifacts have been "
+                f"{heading}\n\n"
+                f"The multi-agent leadership simulation{scope_clause} has completed execution, and all "
+                "observed telemetry, translation diagnostics, and stakeholder psychology artifacts have been "
                 "rendered to the dashboard."
             )
             p_insights = []
@@ -1401,28 +1609,47 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
             )
             return f"{p1}\n\n{p2}\n\n{p3}" if p2 else f"{p1}\n\n{p3}"
 
+        heading = (
+            f"### Executive Summary: {scenario_name}"
+            if scenario_name
+            else "### Executive Summary"
+        )
+        subject = f"The **{scenario_name}** rehearsal architecture" if scenario_name else "The leadership rehearsal architecture"
+        scope_details: list[str] = []
+        if complexity:
+            scope_details.append(f"**{complexity}**")
+        if scenario_type:
+            scope_details.append(f"`{scenario_type}`")
+        kind_clause = f" as a {' '.join(scope_details)} scenario" if scope_details else ""
+        stakeholder_clause = (
+            f" modeling **{stakeholder_count:,} stakeholders**"
+            if stakeholder_count is not None
+            else ""
+        )
         p1 = (
-            f"### Executive Summary: {scenario_name}\n\n"
-            f"The **{scenario_name}** rehearsal architecture has been configured as a **{complexity}** "
-            f"`{scenario_type}` scenario modeling **{stakeholder_count:,} stakeholders**, complete with "
+            f"{heading}\n\n"
+            f"{subject} has been configured{kind_clause}{stakeholder_clause}, complete with "
             "a Dynamic Consensus Network (DCNS) pathway and enriched stakeholder persona topology."
         )
         if overall_score is not None:
-            p2 = (
-                f"**Readiness Evaluation ({overall_score}/100):** "
-                f"{eval_summary or 'The leadership plan demonstrates structured governance milestones across key stakeholder tiers.'}"
-            )
+            p2 = f"**Readiness Evaluation ({overall_score}/100):**"
+            if eval_summary:
+                p2 += f" {eval_summary}"
             if findings:
-                finding_items = "; ".join(
-                    f"**{f.get('title', 'Risk Finding')}** ({f.get('severity', 'MODERATE')})"
-                    for f in findings[:3]
-                )
-                p2 += f" Key diagnostic areas identified: {finding_items}."
+                formatted_findings = []
+                for f in findings[:3]:
+                    title = str(f.get("title") or "").strip()
+                    severity = str(f.get("severity") or "").strip()
+                    if title and severity:
+                        formatted_findings.append(f"**{title}** ({severity})")
+                    elif title:
+                        formatted_findings.append(f"**{title}**")
+                if formatted_findings:
+                    p2 += f" Key diagnostic areas identified: {'; '.join(formatted_findings)}."
         else:
             p2 = (
                 "The consensus pathway and stakeholder influence topology have been mapped across "
-                "executive decision-makers, operational champions, and technical gatekeepers to "
-                "surface potential friction points before execution."
+                "participating stakeholder tiers to surface potential friction points before execution."
             )
 
         if suggestions:
@@ -1434,8 +1661,7 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
         else:
             p3 = (
                 "**Next Steps:** Review the interactive A2UI dashboard for detailed criterion scores "
-                "and stakeholder alignment metrics, or launch the simulation to stress-test the plan "
-                "against Black Swan disruptions."
+                "and stakeholder alignment metrics, or launch the simulation to stress-test the plan."
             )
         return f"{p1}\n\n{p2}\n\n{p3}"
 
@@ -1887,6 +2113,53 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     )
                     return
 
+        # Detect the 90-day action plan authoring turn (right after emit_sim_results_a2ui).
+        is_action_plan_turn = False
+        if last_effective and last_effective.parts:
+            ap_frs = [p.function_response for p in last_effective.parts if p.function_response is not None]
+            if ap_frs:
+                ap_fr = ap_frs[-1]
+                ap_name = (ap_fr.name or "").strip()
+                ap_resp_str = str(ap_fr.response or "")
+                if (
+                    ap_name == "emit_sim_results_a2ui"
+                    and "emit_action_plan_a2ui" in allowed_tool_names
+                    and "ERROR:" not in ap_resp_str
+                ):
+                    is_action_plan_turn = True
+                    # Narrow declared tools strictly to emit_action_plan_a2ui and compact the
+                    # prompt context so local Gemma stays responsive on CPU-bound Ollama.
+                    if req.config and req.config.tools:
+                        pruned_tools = []
+                        for t in req.config.tools:
+                            if isinstance(t, types.Tool) and t.function_declarations:
+                                kept = [fd for fd in t.function_declarations if fd and fd.name == "emit_action_plan_a2ui"]
+                                if kept:
+                                    pruned_tools.append(types.Tool(function_declarations=kept))
+                        if pruned_tools:
+                            req.config.tools = pruned_tools
+                            allowed_tool_names = {"emit_action_plan_a2ui"}
+                    summary_hint = self._build_closing_fallback_summary(req)
+                    if req.config is not None:
+                        req.config.system_instruction = (
+                            "Author a concise 90-Day Action Plan and call emit_action_plan_a2ui."
+                        )
+                        req.config.max_output_tokens = min(req.config.max_output_tokens or 200, 200)
+                    req.contents = [
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(
+                                    text=(
+                                        f"Context:\n{summary_hint}\n\n"
+                                        "Call `emit_action_plan_a2ui(plan_markdown=...)` with a brief 90-Day Action Plan "
+                                        "(sections: ## Days 1-30, ## Days 31-60, ## Days 61-90; 1 short bullet <= 8 words each)."
+                                    )
+                                )
+                            ],
+                        )
+                    ]
+
         had_tools = bool(req.config and req.config.tools)
         # Always run _move_function_calls_into_system_instruction so multi-turn
         # function_call / function_response parts in req.contents are converted to
@@ -1907,6 +2180,22 @@ class LocalGemmaOllama(GemmaFunctionCallingMixin, LiteLlm):
                     resp,
                     allowed_tool_names=allowed_tool_names or None,
                 )
+                if is_action_plan_turn and resp.content and resp.content.parts:
+                    has_fc = any(p.function_call is not None for p in resp.content.parts)
+                    if not has_fc:
+                        raw_md = "\n".join(p.text for p in resp.content.parts if p.text and not getattr(p, "thought", False)).strip()
+                        if len(raw_md) >= 20 and not raw_md.startswith("{"):
+                            thought_parts = [p for p in resp.content.parts if getattr(p, "thought", False)]
+                            resp.content.parts = [
+                                *thought_parts,
+                                types.Part(
+                                    function_call=types.FunctionCall(
+                                        id=f"call_{uuid.uuid4().hex[:8]}",
+                                        name="emit_action_plan_a2ui",
+                                        args={"plan_markdown": raw_md},
+                                    )
+                                ),
+                            ]
             if is_closing_step:
                 self._sanitize_closing_response(
                     resp,
@@ -2027,14 +2316,33 @@ async def generate_local_json_async(
     Used by direct `genai.Client` callers (such as the post-conversation evaluator
     and translation-diagnostic skill) when `local_gemma` is active.
     """
-    if timeout <= 0:
-        timeout = 20.0
-    env_to = os.environ.get("LOCAL_AI_TIMEOUT") or os.environ.get("LOCAL_GEMMA_TIMEOUT")
+    env_to = (
+        (os.environ.get("LOCAL_AI_TIMEOUT") or "").strip()
+        or (os.environ.get("LOCAL_GEMMA_TIMEOUT") or "").strip()
+    )
     if env_to:
         try:
             timeout = float(env_to)
-        except ValueError:
-            pass
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid LOCAL_AI_TIMEOUT value {env_to!r}") from exc
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+    ):
+        timeout_val: float | None = None
+    else:
+        try:
+            timeout_val = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            timeout_val = None
+    if timeout_val is None or not math.isfinite(timeout_val) or timeout_val <= 0:
+        logger.warning(
+            "LOCAL_AI: Non-positive or non-finite timeout %r; resetting to 20.0s",
+            timeout,
+        )
+        timeout = 20.0
+    else:
+        timeout = timeout_val
 
     settings = get_ai_settings()
     endpoint = _ipv4_endpoint(settings.endpoint)
@@ -2044,6 +2352,8 @@ async def generate_local_json_async(
         messages.append({"role": "system", "content": system_instruction})
     messages.append({"role": "user", "content": prompt})
 
+    # Match LiteLLM's num_ctx=8192 so Ollama keeps the model slot hot instead of
+    # unloading/reloading llama-server (~19s penalty per ctx mismatch).
     payload = {
         "model": model_name,
         "messages": messages,
@@ -2059,7 +2369,10 @@ async def generate_local_json_async(
         resp = await client.post(f"{endpoint}/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        msg = data.get("message") or {}
+        if not isinstance(data, dict):
+            raise ValueError("Non-object JSON response from local Gemma model")
+        raw_msg = data.get("message")
+        msg = raw_msg if isinstance(raw_msg, dict) else {}
         content = msg.get("content")
         if isinstance(content, str) and content.strip():
             return _strip_markdown_json_fence(content)
@@ -2079,9 +2392,12 @@ def _has_valid_embedding_norm(
     limit = min(len(vec), target_dim)
     sum_sq = 0.0
     for i in range(limit):
+        raw_val = vec[i]
+        if isinstance(raw_val, bool):
+            return False
         try:
-            v = float(vec[i])
-        except (TypeError, ValueError):
+            v = float(raw_val)
+        except (TypeError, ValueError, OverflowError):
             return False
         if not math.isfinite(v):
             return False
@@ -2106,18 +2422,26 @@ def normalize_and_pad_embedding(
 
     limit = min(len(vec), target_dim)
     out = [0.0] * target_dim
+    floats: list[float] = []
     sum_sq = 0.0
     for i in range(limit):
-        v = float(vec[i])
+        raw_val = vec[i]
+        if isinstance(raw_val, bool):
+            return [0.0] * target_dim
+        try:
+            v = float(raw_val)
+        except (TypeError, ValueError, OverflowError):
+            return [0.0] * target_dim
         if not math.isfinite(v):
             return [0.0] * target_dim
+        floats.append(v)
         sum_sq += v * v
     if not math.isfinite(sum_sq):
         return [0.0] * target_dim
     norm = math.sqrt(sum_sq)
     if norm > 1e-12:
         for i in range(limit):
-            out[i] = float(vec[i]) / norm
+            out[i] = floats[i] / norm
     return out
 
 
@@ -2144,8 +2468,9 @@ async def compute_local_embedding_async(
                     json={"model": model, "prompt": text},
                 )
                 legacy.raise_for_status()
-                raw_vec = legacy.json().get("embedding") or []
-                if not _has_valid_embedding_norm(raw_vec, dimension):
+                legacy_json = legacy.json()
+                raw_vec = (legacy_json.get("embedding") if isinstance(legacy_json, dict) else None) or []
+                if not isinstance(raw_vec, list) or not _has_valid_embedding_norm(raw_vec, dimension):
                     logger.warning(
                         "LOCAL_AI: Rejecting empty or zero-norm legacy embedding from %s",
                         model,
@@ -2154,9 +2479,13 @@ async def compute_local_embedding_async(
                 return normalize_and_pad_embedding(raw_vec, dimension)
 
             resp.raise_for_status()
-            embeddings = resp.json().get("embeddings") or []
-            if not embeddings or not _has_valid_embedding_norm(
-                embeddings[0], dimension
+            resp_json = resp.json()
+            embeddings = (resp_json.get("embeddings") if isinstance(resp_json, dict) else None) or []
+            if (
+                not isinstance(embeddings, list)
+                or not embeddings
+                or not isinstance(embeddings[0], list)
+                or not _has_valid_embedding_norm(embeddings[0], dimension)
             ):
                 logger.warning(
                     "LOCAL_AI: Rejecting empty or zero-norm embedding from %s",

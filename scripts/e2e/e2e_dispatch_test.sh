@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: fix multi-file gateway invocation, update default ports to 9101/9102, pass REDIS_PASSWORD, and isolate temp logs.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,17 +18,22 @@
 # E2E Dispatch Mode Validation
 # Validates subscriber vs callable routing with live gateway + mock agents.
 #
-# Prerequisites: docker-compose up -d (Redis on port 8102)
+# Prerequisites: docker-compose up -d (Redis on port 9102)
 # Usage: bash scripts/e2e/e2e_dispatch_test.sh
 
 set -euo pipefail
 
-GATEWAY_PORT="${GATEWAY_PORT:-8101}"
+GATEWAY_PORT="${GATEWAY_PORT:-9101}"
+REDIS_PORT="${REDIS_PORT:-9102}"
 MOCK_SUBSCRIBER_PORT=9901
 MOCK_CALLABLE_PORT=9902
 GATEWAY_PID=""
 SUBSCRIBER_PID=""
 CALLABLE_PID=""
+WORK_DIR="$(mktemp -d)"
+SUBSCRIBER_LOG="${WORK_DIR}/subscriber_request.log"
+CALLABLE_LOG="${WORK_DIR}/callable_request.log"
+GATEWAY_LOG="${WORK_DIR}/gateway_e2e.log"
 PASS=0
 FAIL=0
 
@@ -36,7 +43,7 @@ cleanup() {
   [[ -n "$GATEWAY_PID" ]] && kill "$GATEWAY_PID" 2>/dev/null || true
   [[ -n "$SUBSCRIBER_PID" ]] && kill "$SUBSCRIBER_PID" 2>/dev/null || true
   [[ -n "$CALLABLE_PID" ]] && kill "$CALLABLE_PID" 2>/dev/null || true
-  rm -f /tmp/subscriber_request.log /tmp/callable_request.log /tmp/gateway_e2e.log
+  rm -rf "$WORK_DIR"
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "  Results: ✅ $PASS passed, ❌ $FAIL failed"
@@ -81,37 +88,43 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # --- Step 1: Start mock subscriber agent (expects /a2a/runner/orchestration) ---
 echo ""
 echo "🏃 Step 1: Starting mock subscriber agent on :$MOCK_SUBSCRIBER_PORT..."
-rm -f /tmp/subscriber_request.log
-python3 -c "
-import http.server, json, sys
+rm -f "$SUBSCRIBER_LOG"
+python3 - "$SUBSCRIBER_LOG" "$MOCK_SUBSCRIBER_PORT" <<'PY' &
+import http.server, sys
+
+log_path = sys.argv[1]
+port = int(sys.argv[2])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length).decode()
-        with open('/tmp/subscriber_request.log', 'a') as f:
+        with open(log_path, 'a') as f:
             f.write(f'PATH={self.path}\n')
             f.write(f'BODY={body}\n')
         self.send_response(200)
         self.end_headers()
     def log_message(self, *args): pass
 
-http.server.HTTPServer(('127.0.0.1', $MOCK_SUBSCRIBER_PORT), Handler).serve_forever()
-" &
+http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+PY
 SUBSCRIBER_PID=$!
 sleep 1
 
 # --- Step 2: Start mock callable agent (expects A2A message/send) ---
 echo "🤖 Step 2: Starting mock callable agent on :$MOCK_CALLABLE_PORT..."
-rm -f /tmp/callable_request.log
-python3 -c "
+rm -f "$CALLABLE_LOG"
+python3 - "$CALLABLE_LOG" "$MOCK_CALLABLE_PORT" <<'PY' &
 import http.server, json, sys
+
+log_path = sys.argv[1]
+port = int(sys.argv[2])
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length).decode()
-        with open('/tmp/callable_request.log', 'a') as f:
+        with open(log_path, 'a') as f:
             f.write(f'PATH={self.path}\n')
             f.write(f'BODY={body}\n')
         self.send_response(200)
@@ -121,8 +134,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(resp.encode())
     def log_message(self, *args): pass
 
-http.server.HTTPServer(('127.0.0.1', $MOCK_CALLABLE_PORT), Handler).serve_forever()
-" &
+http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+PY
 CALLABLE_PID=$!
 sleep 1
 
@@ -135,18 +148,19 @@ echo "🌐 Step 3: Starting gateway on :$GATEWAY_PORT..."
 export RUNNER_INTERNAL_URL="http://127.0.0.1:$MOCK_SUBSCRIBER_PORT"
 export SIMULATOR_INTERNAL_URL="http://127.0.0.1:$MOCK_CALLABLE_PORT"
 export PLANNER_URL="http://127.0.0.1:19999"  # Not running, will fail silently
-export REDIS_ADDR="localhost:8102"
+export REDIS_ADDR="${REDIS_ADDR:-localhost:${REDIS_PORT}}"
+export REDIS_PASSWORD="${REDIS_PASSWORD:-localdev}"
 export PORT=$GATEWAY_PORT
 
-go run cmd/gateway/main.go > /tmp/gateway_e2e.log 2>&1 &
+go run ./cmd/gateway > "$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 echo "   Waiting for gateway to start..."
 sleep 4
 
 # Verify gateway started
 if ! curl -s "http://127.0.0.1:$GATEWAY_PORT/healthz" > /dev/null 2>&1; then
-  echo "  ❌ Gateway failed to start! Check /tmp/gateway_e2e.log"
-  cat /tmp/gateway_e2e.log | head -20
+  echo "  ❌ Gateway failed to start! Check $GATEWAY_LOG"
+  cat "$GATEWAY_LOG" | head -20
   exit 1
 fi
 echo "   Gateway is running ✓"
@@ -161,9 +175,9 @@ curl -s -X POST "http://127.0.0.1:$GATEWAY_PORT/api/v1/orchestration/push" \
   > /dev/null 2>&1
 sleep 3
 
-assert_contains "Subscriber received request" /tmp/subscriber_request.log "PATH=/a2a/runner/orchestration"
-assert_contains "Subscriber received raw JSON body" /tmp/subscriber_request.log "agentType"
-assert_not_contains "Subscriber did NOT receive JSON-RPC" /tmp/subscriber_request.log "message/send"
+assert_contains "Subscriber received request" "$SUBSCRIBER_LOG" "PATH=/a2a/runner/orchestration"
+assert_contains "Subscriber received raw JSON body" "$SUBSCRIBER_LOG" "agentType"
+assert_not_contains "Subscriber did NOT receive JSON-RPC" "$SUBSCRIBER_LOG" "message/send"
 
 # --- Step 5: Send push event for callable agent (simulator) ---
 echo ""
@@ -175,14 +189,14 @@ curl -s -X POST "http://127.0.0.1:$GATEWAY_PORT/api/v1/orchestration/push" \
   > /dev/null 2>&1
 sleep 3
 
-assert_contains "Callable received request" /tmp/callable_request.log "PATH=/"
-assert_contains "Callable received JSON-RPC 2.0" /tmp/callable_request.log "jsonrpc"
-assert_contains "Callable received message/send method" /tmp/callable_request.log "message/send"
-assert_not_contains "Callable did NOT receive /orchestration path" /tmp/callable_request.log "/orchestration"
+assert_contains "Callable received request" "$CALLABLE_LOG" "PATH=/"
+assert_contains "Callable received JSON-RPC 2.0" "$CALLABLE_LOG" "jsonrpc"
+assert_contains "Callable received message/send method" "$CALLABLE_LOG" "message/send"
+assert_not_contains "Callable did NOT receive /orchestration path" "$CALLABLE_LOG" "/orchestration"
 
 echo ""
 echo "📋 Gateway dispatch log:"
-grep -E "Switchboard:|ORCHESTRATION_PUSH:" /tmp/gateway_e2e.log | head -15
+grep -E "Switchboard:|ORCHESTRATION_PUSH:" "$GATEWAY_LOG" | head -15 || true
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

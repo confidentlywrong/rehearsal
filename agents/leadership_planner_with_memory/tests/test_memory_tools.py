@@ -532,3 +532,47 @@ class TestStakeholderArtifacts:
             scenario_id=sid, tool_context=alice_ctx
         )
         assert result["status"] == "not_found"
+
+
+def test_memory_planner_and_embeddings_use_canonical_model_defaults(monkeypatch):
+    """leadership_planner_with_memory.agent and memory/embeddings use canonical model defaults."""
+    import importlib
+    import agents.leadership_planner_with_memory.agent as mem_agent
+    from agents.utils.models import DEFAULT_EMBEDDING_MODEL, DEFAULT_PLANNER_MODEL, get_model
+
+    try:
+        monkeypatch.setenv("PLANNER_MODEL", "   ")
+        importlib.reload(mem_agent)
+        assert mem_agent.MODEL == DEFAULT_PLANNER_MODEL
+
+        monkeypatch.setenv("EMBEDDING_MODEL", "   ")
+        assert get_model("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL) == DEFAULT_EMBEDDING_MODEL
+    finally:
+        monkeypatch.delenv("PLANNER_MODEL", raising=False)
+        importlib.reload(mem_agent)
+
+
+def test_embeddings_get_genai_client_strips_whitespace_project_and_keys(monkeypatch):
+    """Regression: whitespace-only GOOGLE_CLOUD_PROJECT must not activate Vertex AI."""
+    from unittest.mock import MagicMock
+
+    import agents.leadership_planner_with_memory.memory.embeddings as emb
+
+    emb._clear_genai_client_cache()
+    mock_client_cls = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(emb.genai, "Client", mock_client_cls)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "   ")
+    monkeypatch.setenv("PROJECT_ID", " \t ")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "1")
+    monkeypatch.setenv("GEMINI_API_KEY", "  test-api-key  ")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    try:
+        emb._get_genai_client()
+        mock_client_cls.assert_called_once()
+        _, kwargs = mock_client_cls.call_args
+        assert kwargs["vertexai"] is False
+        assert kwargs["api_key"] == "test-api-key"
+        assert "project" not in kwargs
+    finally:
+        emb._clear_genai_client_cache()

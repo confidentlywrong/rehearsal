@@ -81,6 +81,11 @@ _lock = threading.Lock()
 _tokens: OrderedDict[str, str] = OrderedDict()
 
 
+def _is_valid_bearer_token(token: str) -> bool:
+    """Reject whitespace, CR/LF, NUL, DEL, and non-ASCII characters (mirrors Go ParseBearerHeader)."""
+    return bool(token) and not any(ord(ch) <= 0x20 or ord(ch) >= 0x7F for ch in token)
+
+
 def set_session_token(session_id: str, token: str | None) -> None:
     """Bind ``token`` to ``session_id`` for the rest of the session.
 
@@ -90,10 +95,18 @@ def set_session_token(session_id: str, token: str | None) -> None:
     (no user bearer) simply leaves the mapping unset and the
     retrieval tool falls back to the shared env-var path.
     """
-    if not session_id:
+    if not isinstance(session_id, str) or not session_id:
         return
-    tok = (token or "").strip()
+    if not isinstance(token, str):
+        return
+    tok = token.strip()
     if not tok:
+        return
+    if not _is_valid_bearer_token(tok):
+        logger.warning(
+            "user_auth_context: rejected malformed bearer token for session=%s",
+            session_id,
+        )
         return
     with _lock:
         _tokens[session_id] = tok
@@ -116,16 +129,15 @@ def get_session_token(session_id: str) -> str | None:
     token available — fall back to the env-var path or send no
     auth header at all".
     """
-    if not session_id:
+    if not isinstance(session_id, str) or not session_id:
         return None
-    # dict.get is atomic under the GIL — no lock needed on the read
-    # path, which is called from every retrieval tool invocation.
-    return _tokens.get(session_id)
+    with _lock:
+        return _tokens.get(session_id)
 
 
 def clear_session_token(session_id: str) -> None:
     """Forget the token for ``session_id``. Idempotent."""
-    if not session_id:
+    if not isinstance(session_id, str) or not session_id:
         return
     with _lock:
         _tokens.pop(session_id, None)

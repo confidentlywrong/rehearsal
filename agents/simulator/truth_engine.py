@@ -19,12 +19,13 @@ to detect integrity gaps.  Implemented as a stateful accumulator inside the
 simulator's session state, evaluated per-tick.
 
 Follows the ``finished_runner_ids`` / ``collapsed_runner_ids`` accumulator
-pattern in ``agents/simulator/skills/advancing-race-ticks/tools.py:258-265``.
+pattern in ``agents/simulator/skills/advancing-race-ticks/tools.py:681-696``.
 
 No additional LLM calls — reuses the Decision Classification Engine output.
 """
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -152,6 +153,23 @@ class Contradiction:
         }
 
 
+def _safe_tick(value: Any, default: int = 0) -> int:
+    """Coerce a tick value to a finite int, rejecting booleans and NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return int(num) if math.isfinite(num) else default
+
+
 def extract_commitments(
     text: str,
     current_tick: int,
@@ -170,7 +188,11 @@ def extract_commitments(
     Returns:
         List of detected Commitment instances.
     """
-    commitments = []
+    if not text or not isinstance(text, str):
+        return []
+    safe_principles = principles if isinstance(principles, list) else []
+    safe_tick = _safe_tick(current_tick, 0)
+    commitments: list[Commitment] = []
 
     for pattern in _COMMITMENT_PATTERNS:
         match = pattern.search(text)
@@ -183,8 +205,12 @@ def extract_commitments(
                     Commitment(
                         text=commitment_text,
                         principle_index=principle_idx,
-                        principle_name=principles[principle_idx] if principle_idx < len(principles) else "Unknown",
-                        tick_declared=current_tick,
+                        principle_name=(
+                            safe_principles[principle_idx]
+                            if 0 <= principle_idx < len(safe_principles)
+                            else "Unknown"
+                        ),
+                        tick_declared=safe_tick,
                     )
                 )
 
@@ -192,7 +218,7 @@ def extract_commitments(
         logger.info(
             "Truth Engine: Extracted %d commitments from tick %d: %s",
             len(commitments),
-            current_tick,
+            safe_tick,
             ", ".join(f"'{c.text}' → {c.principle_name}" for c in commitments),
         )
 
@@ -211,7 +237,7 @@ def _map_text_to_principle(text: str) -> int | None:
     if not scores:
         return None
 
-    return max(scores, key=scores.get)
+    return max(scores, key=lambda idx: scores[idx])
 
 
 def detect_contradictions(
@@ -236,35 +262,42 @@ def detect_contradictions(
     Returns:
         List of Contradiction instances (may be empty).
     """
-    neglected = set(decision_tags.get("principles_neglected", []))
+    if not commitments or not isinstance(decision_tags, dict):
+        return []
+
+    raw_neglected = decision_tags.get("principles_neglected") or []
+    neglected = {p for p in raw_neglected if isinstance(p, str)} if isinstance(raw_neglected, (list, tuple, set)) else set()
     if not neglected:
         return []
 
-    contradictions = []
+    safe_principles = principles if isinstance(principles, list) else []
+    safe_tick = _safe_tick(current_tick, 0)
+    contradictions: list[Contradiction] = []
 
     for commitment in commitments:
-        if not commitment.get("active", True):
+        if not isinstance(commitment, dict) or not commitment.get("active", True):
             continue
 
-        principle_name = commitment.get("principle_name", "")
-        principle_idx = commitment.get("principle_index", -1)
+        principle_name = str(commitment.get("principle_name") or "")
+        raw_idx = commitment.get("principle_index", -1)
+        principle_idx = int(raw_idx) if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) else -1
 
         # Check if the committed principle is being neglected
         if principle_name in neglected or (
-            principle_idx >= 0 and principle_idx < len(principles) and principles[principle_idx] in neglected
+            0 <= principle_idx < len(safe_principles) and safe_principles[principle_idx] in neglected
         ):
             # Compute severity based on commitment age and repeat violations
-            tick_declared = commitment.get("tick_declared", 0)
-            commitment_age = current_tick - tick_declared
+            tick_declared = _safe_tick(commitment.get("tick_declared"), 0)
+            commitment_age = max(0, safe_tick - tick_declared)
             severity = _compute_severity(commitment_age)
 
             contradictions.append(
                 Contradiction(
-                    commitment_text=commitment.get("text", ""),
+                    commitment_text=str(commitment.get("text") or ""),
                     violated_principle=principle_name,
                     violated_principle_index=principle_idx,
-                    evidence=decision_tags.get("raw_decision", ""),
-                    tick_detected=current_tick,
+                    evidence=str(decision_tags.get("raw_decision") or ""),
+                    tick_detected=safe_tick,
                     tick_declared=tick_declared,
                     severity=severity,
                 )
@@ -274,7 +307,7 @@ def detect_contradictions(
         logger.info(
             "Truth Engine: %d contradictions detected at tick %d — %s",
             len(contradictions),
-            current_tick,
+            safe_tick,
             ", ".join(f"'{c.violated_principle}' (severity={c.severity})" for c in contradictions),
         )
 
@@ -312,18 +345,32 @@ def find_best_responder(
     if not contradictions or not echo_configs:
         return None
 
-    # Use the first (most severe) contradiction
-    target_idx = contradictions[0].violated_principle_index
-    if target_idx < 0:
+    # Use the highest-severity contradiction (critical before warning)
+    primary = min(contradictions, key=lambda c: 0 if c.severity == "critical" else 1)
+    target_idx = primary.violated_principle_index
+    if not isinstance(target_idx, int) or target_idx < 0:
         return None
 
     best_role = None
     best_affinity = -1.0
 
     for config in echo_configs:
-        affinity = config.get("affinity", [])
-        if target_idx < len(affinity) and affinity[target_idx] > best_affinity:
-            best_affinity = affinity[target_idx]
+        if not isinstance(config, dict):
+            continue
+        affinity = config.get("affinity") or []
+        if not isinstance(affinity, (list, tuple)) or target_idx >= len(affinity):
+            continue
+        val = affinity[target_idx]
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        try:
+            val_f = float(val)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(val_f):
+            continue
+        if val_f > best_affinity:
+            best_affinity = val_f
             best_role = config.get("role")
 
     return best_role
@@ -334,8 +381,9 @@ def update_state_with_commitments(
     new_commitments: list[Commitment],
 ) -> None:
     """Append new commitments to the session state accumulator."""
-    existing = state.get("declared_commitments", [])
-    for c in new_commitments:
+    raw = state.get("declared_commitments")
+    existing = list(raw) if isinstance(raw, list) else []
+    for c in new_commitments or ():
         existing.append(
             {
                 "text": c.text,
@@ -353,7 +401,8 @@ def update_state_with_contradictions(
     new_contradictions: list[Contradiction],
 ) -> None:
     """Append contradictions to the session state log."""
-    existing = state.get("contradiction_log", [])
-    for c in new_contradictions:
+    raw = state.get("contradiction_log")
+    existing = list(raw) if isinstance(raw, list) else []
+    for c in new_contradictions or ():
         existing.append(c.to_dict())
     state["contradiction_log"] = existing

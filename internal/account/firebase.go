@@ -11,11 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/race-condition/internal/auth"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -79,7 +82,8 @@ type FirebaseConfig struct {
 }
 
 // FirebaseResolver is a Resolver that verifies Firebase ID tokens
-// supplied via Authorization: Bearer ... or the __session cookie.
+// supplied via X-User-Authorization: Bearer ..., Authorization: Bearer ...,
+// or the __session cookie.
 // On success it looks up the users row and returns a populated
 // UserContext; on ErrNotFound from Lookup it returns
 // UserContext{NeedsInit:true}.
@@ -91,18 +95,23 @@ type FirebaseResolver struct {
 
 // NewFirebaseResolver constructs a FirebaseResolver.
 func NewFirebaseResolver(cfg FirebaseConfig) (*FirebaseResolver, error) {
+	cfg.ProjectID = strings.TrimSpace(cfg.ProjectID)
+	cfg.EmulatorHost = strings.TrimSpace(cfg.EmulatorHost)
 	if cfg.ProjectID == "" {
 		return nil, errors.New("account: FirebaseConfig.ProjectID required")
 	}
+	if cfg.EmulatorHost != "" && isGCPRuntime() {
+		return nil, errors.New("account: FirebaseConfig.EmulatorHost is forbidden in GCP runtime")
+	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	r := &FirebaseResolver{cfg: cfg, allow: cfg.EmulatorHost != ""}
 	if !r.allow {
-		r.keys = newJWKSCache(firebaseProductionCertsURL, cfg.HTTPClient)
+		r.keys = newJWKSCache(firebaseProductionCertsURL, cfg.HTTPClient, cfg.Now)
 	}
 	return r, nil
 }
@@ -111,21 +120,45 @@ func NewFirebaseResolver(cfg FirebaseConfig) (*FirebaseResolver, error) {
 // the *Store is built after the resolver (typical gateway startup
 // order). Returns the receiver so callers can chain.
 func (f *FirebaseResolver) WithLookup(fn UserLookup) *FirebaseResolver {
+	if f == nil {
+		return nil
+	}
 	f.cfg.Lookup = fn
 	return f
 }
 
 // Resolve implements Resolver.
 func (f *FirebaseResolver) Resolve(r *http.Request) (UserContext, error) {
+	if f == nil {
+		return UserContext{}, errors.New("account: nil FirebaseResolver")
+	}
+	if r == nil {
+		return UserContext{}, ErrNoIdentity
+	}
 	raw := extractBearer(r)
 	if raw == "" {
 		return UserContext{}, ErrNoIdentity
+	}
+	// Cloud Run IAM coexistence: when X-User-Authorization is absent and
+	// Authorization carries an ingress Google OIDC token (not a Firebase ID
+	// token), verify the __session cookie if present.
+	if r.Header.Get("X-User-Authorization") == "" && r.Header.Get("Authorization") != "" && IsGoogleOIDCToken(raw) {
+		if cookieTok := extractSessionCookie(r); cookieTok != "" {
+			raw = cookieTok
+		}
 	}
 	claims, err := f.verify(r.Context(), raw)
 	if err != nil {
 		return UserContext{}, fmt.Errorf("account: verify firebase id token: %w", err)
 	}
 	return f.claimsToUser(r.Context(), claims)
+}
+
+func (f *FirebaseResolver) now() time.Time {
+	if f != nil && f.cfg.Now != nil {
+		return f.cfg.Now()
+	}
+	return time.Now()
 }
 
 // claimsToUser converts verified Firebase claims into a UserContext.
@@ -139,10 +172,10 @@ func (f *FirebaseResolver) Resolve(r *http.Request) (UserContext, error) {
 //   - Lookup returns User (active)      -> populate from row, prefer DB email over token
 func (f *FirebaseResolver) claimsToUser(ctx context.Context, c jwt.MapClaims) (UserContext, error) {
 	uid, _ := c["sub"].(string)
-	if uid == "" {
+	if strings.TrimSpace(uid) == "" {
 		uid, _ = c["user_id"].(string)
 	}
-	if uid == "" {
+	if strings.TrimSpace(uid) == "" {
 		return UserContext{}, errors.New("account: token missing subject")
 	}
 	email, _ := c["email"].(string)
@@ -215,31 +248,83 @@ func (f *FirebaseResolver) claimsToUser(ctx context.Context, c jwt.MapClaims) (U
 // says iat is a NumericDate (seconds since epoch); the jwt library
 // hands it back as float64 when going through MapClaims. Returns
 // (zero, false) when iat is missing or has the wrong type.
+const unixToInternalSeconds int64 = 62135596800
+
+func validUnixSeconds(sec int64) bool {
+	return sec >= math.MinInt64+unixToInternalSeconds && sec <= math.MaxInt64-unixToInternalSeconds
+}
+
 func tokenIssuedAt(c jwt.MapClaims) (time.Time, bool) {
 	switch v := c["iat"].(type) {
 	case float64:
-		return time.Unix(int64(v), 0).UTC(), true
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < -float64(unixToInternalSeconds) || v > 1e15 {
+			return time.Time{}, false
+		}
+		sec := int64(v)
+		if !validUnixSeconds(sec) {
+			return time.Time{}, false
+		}
+		return time.Unix(sec, 0).UTC(), true
 	case int64:
+		if !validUnixSeconds(v) {
+			return time.Time{}, false
+		}
 		return time.Unix(v, 0).UTC(), true
 	case json.Number:
-		if n, err := v.Int64(); err == nil {
+		if n, err := v.Int64(); err == nil && validUnixSeconds(n) {
 			return time.Unix(n, 0).UTC(), true
 		}
 	}
 	return time.Time{}, false
 }
 
-// extractBearer pulls the JWT out of Authorization: Bearer ... or
-// the __session cookie (used for WebSocket connections, which can't
-// carry custom headers in browsers). Returns "" if neither present.
+// IsGoogleOIDCToken reports whether raw is a syntactically valid JWT whose
+// unverified issuer is Google Accounts OIDC ("https://accounts.google.com" or
+// "accounts.google.com"), such as a Cloud Run IAM service-to-service ID token.
+func IsGoogleOIDCToken(raw string) bool {
+	parser := jwt.NewParser()
+	tok, _, err := parser.ParseUnverified(raw, jwt.MapClaims{})
+	if err != nil {
+		return false
+	}
+	claims, ok := tok.Claims.(jwt.MapClaims)
+	if !ok {
+		return false
+	}
+	iss, _ := claims["iss"].(string)
+	return iss == "https://accounts.google.com" || iss == "accounts.google.com"
+}
+
+// extractBearer pulls the JWT out of X-User-Authorization: Bearer ...
+// (used when Cloud Run IAM OIDC occupies Authorization),
+// Authorization: Bearer ..., or the __session cookie (used for WebSocket
+// connections, which can't carry custom headers in browsers). Returns "" if
+// none present or if an explicit header is malformed.
 func extractBearer(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		if strings.HasPrefix(h, "Bearer ") {
-			return strings.TrimSpace(h[len("Bearer "):])
+	if h := r.Header.Get("X-User-Authorization"); h != "" {
+		if tok := auth.ParseBearerHeader(h); auth.IsCookieSafeToken(tok) {
+			return tok
 		}
+		return ""
+	}
+	if h := r.Header.Get("Authorization"); h != "" {
+		if tok := auth.ParseBearerHeader(h); auth.IsCookieSafeToken(tok) {
+			return tok
+		}
+		return ""
+	}
+	return extractSessionCookie(r)
+}
+
+func extractSessionCookie(r *http.Request) string {
+	if r == nil {
+		return ""
 	}
 	if c, err := r.Cookie("__session"); err == nil && c.Value != "" {
-		return c.Value
+		tok := strings.TrimSpace(c.Value)
+		if auth.IsCookieSafeToken(tok) {
+			return tok
+		}
 	}
 	return ""
 }
@@ -254,7 +339,7 @@ func (f *FirebaseResolver) verify(ctx context.Context, raw string) (jwt.MapClaim
 		jwt.WithExpirationRequired(),
 		jwt.WithAudience(f.cfg.ProjectID),
 		jwt.WithIssuer(firebaseSecureTokenIssuer+f.cfg.ProjectID),
-		jwt.WithTimeFunc(f.cfg.Now),
+		jwt.WithTimeFunc(f.now),
 	)
 
 	if f.allow {
@@ -270,23 +355,52 @@ func (f *FirebaseResolver) verify(ctx context.Context, raw string) (jwt.MapClaim
 		if !ok {
 			return nil, errors.New("account: emulator token has unexpected claim shape")
 		}
+		now := f.now()
 		exp, err := claims.GetExpirationTime()
 		if err != nil {
 			return nil, fmt.Errorf("account: emulator token exp: %w", err)
 		}
-		if exp == nil || f.cfg.Now().After(exp.Time) {
+		if exp == nil || !exp.Time.After(now) {
 			return nil, errors.New("account: emulator token expired")
+		}
+		nbf, err := claims.GetNotBefore()
+		if err != nil {
+			return nil, fmt.Errorf("account: emulator token nbf: %w", err)
+		}
+		if nbf != nil && now.Before(nbf.Time) {
+			return nil, errors.New("account: emulator token not valid yet")
+		}
+		iat, err := claims.GetIssuedAt()
+		if err != nil {
+			return nil, fmt.Errorf("account: emulator token iat: %w", err)
+		}
+		if iat != nil && iat.Time.After(now) {
+			return nil, errors.New("account: emulator token issued in the future")
 		}
 		iss, _ := claims["iss"].(string)
 		if iss != firebaseSecureTokenIssuer+f.cfg.ProjectID {
 			return nil, fmt.Errorf("account: emulator token issuer mismatch: %q", iss)
 		}
-		if aud, _ := claims["aud"].(string); aud != f.cfg.ProjectID {
-			return nil, fmt.Errorf("account: emulator token audience mismatch: %q", aud)
+		audList, err := claims.GetAudience()
+		if err != nil {
+			return nil, fmt.Errorf("account: emulator token aud: %w", err)
+		}
+		audOK := false
+		for _, a := range audList {
+			if a == f.cfg.ProjectID {
+				audOK = true
+				break
+			}
+		}
+		if !audOK {
+			return nil, fmt.Errorf("account: emulator token audience mismatch: %v", audList)
 		}
 		return claims, nil
 	}
 
+	if f.keys == nil {
+		return nil, errors.New("account: uninitialized FirebaseResolver")
+	}
 	tok, err := parser.ParseWithClaims(raw, jwt.MapClaims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("account: unexpected JWT alg %v", t.Header["alg"])
@@ -312,6 +426,7 @@ func (f *FirebaseResolver) verify(ctx context.Context, raw string) (jwt.MapClaim
 type jwksCache struct {
 	url    string
 	client *http.Client
+	now    func() time.Time
 
 	mu        sync.RWMutex
 	keys      map[string]*rsa.PublicKey
@@ -329,16 +444,28 @@ type jwksCache struct {
 	refreshMu sync.Mutex
 }
 
-func newJWKSCache(url string, client *http.Client) *jwksCache {
-	return &jwksCache{url: url, client: client, keys: map[string]*rsa.PublicKey{}}
+func newJWKSCache(url string, client *http.Client, now func() time.Time) *jwksCache {
+	if now == nil {
+		now = time.Now
+	}
+	return &jwksCache{url: url, client: client, now: now, keys: map[string]*rsa.PublicKey{}}
 }
 
+const jwksMinRefreshInterval = 10 * time.Second
+
 func (c *jwksCache) get(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+	now := c.now()
 	c.mu.RLock()
-	if time.Now().Before(c.expiry) {
+	if now.Before(c.expiry) {
 		if k, ok := c.keys[kid]; ok {
 			c.mu.RUnlock()
 			return k, nil
+		}
+		// Cooldown guard: prevent forged unknown-kid bursts from forcing
+		// an outbound JWKS HTTP fetch on every unauthenticated request.
+		if len(c.keys) > 0 && !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < jwksMinRefreshInterval {
+			c.mu.RUnlock()
+			return nil, fmt.Errorf("account: unknown JWT kid %q", kid)
 		}
 	}
 	c.mu.RUnlock()
@@ -349,11 +476,16 @@ func (c *jwksCache) get(ctx context.Context, kid string) (*rsa.PublicKey, error)
 	// populated the kid we need.
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
+	now = c.now()
 	c.mu.RLock()
-	if time.Now().Before(c.expiry) {
+	if now.Before(c.expiry) {
 		if k, ok := c.keys[kid]; ok {
 			c.mu.RUnlock()
 			return k, nil
+		}
+		if len(c.keys) > 0 && !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < jwksMinRefreshInterval {
+			c.mu.RUnlock()
+			return nil, fmt.Errorf("account: unknown JWT kid %q", kid)
 		}
 	}
 	c.mu.RUnlock()
@@ -383,7 +515,7 @@ func (c *jwksCache) refresh(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("account: jwks endpoint %s returned %d", c.url, resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return err
 	}
@@ -407,10 +539,13 @@ func (c *jwksCache) refresh(ctx context.Context) error {
 		}
 		keys[kid] = rsaKey
 	}
+	if len(keys) == 0 {
+		return errors.New("account: jwks endpoint returned 0 keys")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.keys = keys
-	c.fetchedAt = time.Now()
+	c.fetchedAt = c.now()
 	expiresIn := time.Hour
 	if cc := resp.Header.Get("Cache-Control"); cc != "" {
 		if d, ok := parseMaxAge(cc); ok {
@@ -425,20 +560,42 @@ func (c *jwksCache) refresh(ctx context.Context) error {
 }
 
 func parseMaxAge(cc string) (time.Duration, bool) {
+	const prefix = "max-age="
+	const maxDurationSec = math.MaxInt64 / int64(time.Second)
 	for _, raw := range strings.Split(cc, ",") {
 		part := strings.TrimSpace(raw)
-		if !strings.HasPrefix(part, "max-age=") {
+		if len(part) <= len(prefix) || !strings.EqualFold(part[:len(prefix)], prefix) {
 			continue
 		}
-		sec := strings.TrimPrefix(part, "max-age=")
-		sec = strings.Trim(sec, `"`)
-		var v time.Duration
-		if _, err := fmt.Sscanf(sec, "%d", &v); err != nil {
+		sec := strings.TrimSpace(strings.Trim(part[len(prefix):], `"`))
+		v, err := strconv.ParseInt(sec, 10, 64)
+		if err != nil {
+			if errors.Is(err, strconv.ErrRange) && isAllASCIIUnsignedDigits(sec) {
+				return time.Duration(math.MaxInt64), true
+			}
 			return 0, false
 		}
-		return v * time.Second, true
+		if v <= 0 {
+			return 0, false
+		}
+		if v > maxDurationSec {
+			return time.Duration(math.MaxInt64), true
+		}
+		return time.Duration(v) * time.Second, true
 	}
 	return 0, false
+}
+
+func isAllASCIIUnsignedDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Compile-time guard.

@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -201,7 +201,7 @@ func TestIsAgentEngineURL(t *testing.T) {
 	}{
 		{
 			name:     "standard local URL",
-			url:      "http://127.0.0.1:8201",
+			url:      "http://127.0.0.1:9104",
 			expected: false,
 		},
 		{
@@ -490,17 +490,17 @@ func TestAgentCard_DispatchMode(t *testing.T) {
 
 func TestAgentCard_OrchestrationBaseURL_ReturnsBaseURL(t *testing.T) {
 	card := AgentCard{
-		URL:     "http://localhost:8202/a2a/simulator/",
-		BaseURL: "http://localhost:8202",
+		URL:     "http://127.0.0.1:9104/a2a/simulator/",
+		BaseURL: "http://127.0.0.1:9104",
 	}
-	assert.Equal(t, "http://localhost:8202", card.OrchestrationBaseURL())
+	assert.Equal(t, "http://127.0.0.1:9104", card.OrchestrationBaseURL())
 }
 
 func TestAgentCard_OrchestrationBaseURL_FallsBackToURL(t *testing.T) {
 	card := AgentCard{
-		URL: "http://localhost:8202",
+		URL: "http://127.0.0.1:9104",
 	}
-	assert.Equal(t, "http://localhost:8202", card.OrchestrationBaseURL())
+	assert.Equal(t, "http://127.0.0.1:9104", card.OrchestrationBaseURL())
 }
 
 func TestCatalog_DiscoverAgents_CachesResults(t *testing.T) {

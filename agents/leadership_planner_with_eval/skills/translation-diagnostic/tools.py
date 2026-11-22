@@ -23,8 +23,10 @@ the ADK plugin auto-broadcasts the tool_end event; no manual
 ``emit_gateway_message`` call needed.
 """
 
+from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 import re
 from typing import Any
@@ -33,6 +35,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import Client, types
 
 from agents.ai_echo.process_decision_round import format_role_display
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL, get_model
 from agents.utils.retry import resilient_http_options
 
 logger = logging.getLogger(__name__)
@@ -42,10 +45,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _client: Client | None = None
-_MODEL = (
-    os.environ.get("TRANSLATION_DIAGNOSTIC_MODEL")
-    or os.environ.get("EVALUATOR_MODEL")
-    or "gemini-3.5-flash-lite"
+_MODEL = get_model(
+    "TRANSLATION_DIAGNOSTIC_MODEL",
+    DEFAULT_FLASH_LITE_MODEL,
+    fallback_env_vars=("EVALUATOR_MODEL",),
 )
 
 
@@ -55,10 +58,16 @@ _client_key: tuple | None = None
 def _get_client() -> Client:
     """Lazy-singleton GenAI client with project/API-key config and retry options."""
     global _client, _client_key
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID") or ""
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in ("0", "false", "no")
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
+    project_id = (
+        (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+        or (os.environ.get("PROJECT_ID") or "").strip()
+    )
+    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
+    use_vertex = (os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") or "").strip().lower() not in ("0", "false", "no")
+    api_key = (
+        (os.environ.get("GEMINI_API_KEY") or "").strip()
+        or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+    )
     vertex_active = bool(project_id and use_vertex)
     key = (
         vertex_active,
@@ -87,6 +96,133 @@ def _get_client() -> Client:
 # Inflection-point detection
 # ---------------------------------------------------------------------------
 
+def _safe_int(val: Any, default: int = 0) -> int:
+    """Safely coerce a value to int, rejecting bools and non-finite floats."""
+    if val is None or isinstance(val, bool):
+        return default
+    if isinstance(val, int):
+        try:
+            fv = float(val)
+        except OverflowError:
+            return default
+        return val if math.isfinite(fv) else default
+    if isinstance(val, float):
+        return int(round(val)) if math.isfinite(val) else default
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return default
+        try:
+            fv = float(s)
+        except (ValueError, OverflowError):
+            return default
+        return int(round(fv)) if math.isfinite(fv) else default
+    return default
+
+
+def _safe_finite_float(val: Any, default: float = 0.0) -> float:
+    """Safely coerce a value to a finite float, rejecting bools and NaN/Inf."""
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        fv = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return fv if math.isfinite(fv) else default
+
+
+def _coerce_state_list(raw: Any) -> list[Any]:
+    """Parse list or JSON-encoded list from session state safely."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception as exc:
+            logger.warning("Failed to parse JSON list from session state: %s", exc)
+            return []
+    return list(raw) if isinstance(raw, list) else []
+
+
+def _coerce_state_dict(raw: Any) -> dict[str, Any]:
+    """Parse dict or JSON-encoded dict from session state safely."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception as exc:
+            logger.warning("Failed to parse JSON dict from session state: %s", exc)
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _coerce_str_list(val: Any) -> list[str]:
+    """Coerce a sequence or set to a list of non-empty strings without splitting strings."""
+    if isinstance(val, (list, tuple, set)):
+        out: list[str] = []
+        for x in val:
+            if x is not None and not isinstance(x, bool):
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+        return out
+    return []
+
+
+def _normalize_gap_severity(raw_sev: Any) -> str:
+    """Normalize severity strings to 'high' | 'medium' | 'low' for frontend cards."""
+    s = str(raw_sev or "medium").strip().lower()
+    if s in ("high", "major", "critical", "severe"):
+        return "high"
+    if s in ("low", "minor", "minimal"):
+        return "low"
+    return "medium"
+
+
+def _normalize_llm_diagnostic(parsed_diag: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize LLM-returned translation diagnostic JSON to match card schema."""
+    raw_gaps = parsed_diag.get("gaps")
+    if not isinstance(raw_gaps, list):
+        raise ValueError("Translation diagnostic JSON must contain a 'gaps' list")
+
+    clean_gaps: list[dict[str, Any]] = []
+    for raw_gap in raw_gaps:
+        if not isinstance(raw_gap, dict):
+            continue
+        sid = str(raw_gap.get("stakeholder_id") or raw_gap.get("role") or "stakeholder").strip()
+        slabel = str(
+            raw_gap.get("stakeholder_label")
+            or format_role_display(sid)
+        ).strip()
+        raw_tps = raw_gap.get("trigger_phrases")
+        clean_tps: list[dict[str, Any]] = []
+        if isinstance(raw_tps, list):
+            for tp in raw_tps:
+                if not isinstance(tp, dict):
+                    continue
+                clean_tps.append(
+                    {
+                        "phrase": str(tp.get("phrase") or "").strip(),
+                        "tick": _safe_int(tp.get("tick"), 1),
+                        "leader_intent": str(tp.get("leader_intent") or "").strip(),
+                        "stakeholder_decoded_as": str(tp.get("stakeholder_decoded_as") or "").strip(),
+                        "gap_type": str(tp.get("gap_type") or "system directive → lifeworld friction").strip(),
+                        "severity": _normalize_gap_severity(tp.get("severity")),
+                    }
+                )
+        clean_gaps.append(
+            {
+                "stakeholder_id": sid,
+                "stakeholder_label": slabel,
+                "trigger_phrases": clean_tps,
+                "suggested_reframing": str(raw_gap.get("suggested_reframing") or "").strip(),
+                "overall_gap_severity": _normalize_gap_severity(raw_gap.get("overall_gap_severity")),
+            }
+        )
+
+    return {
+        "gaps": clean_gaps,
+        "summary": str(parsed_diag.get("summary") or "").strip(),
+    }
+
+
 def _find_inflection_points(
     echo_voice_log: list[dict[str, Any]],
     top_n: int = 3,
@@ -96,35 +232,40 @@ def _find_inflection_points(
     Returns a dict mapping role → list of log entries at inflection ticks,
     sorted by absolute delta (largest first), capped at *top_n* per role.
     """
+    if not isinstance(echo_voice_log, list):
+        return {}
+    n = max(_safe_int(top_n, 3), 0)
+    if n <= 0:
+        return {}
+
     # Group by role, ordered by tick.
     by_role: dict[str, list[dict[str, Any]]] = {}
     for entry in echo_voice_log:
-        role = entry.get("role", "")
+        if not isinstance(entry, dict):
+            continue
+        raw_role = entry.get("role", "")
+        if not isinstance(raw_role, str):
+            continue
+        role = raw_role.strip()
         if not role:
             continue
         by_role.setdefault(role, []).append(entry)
 
     inflections: dict[str, list[dict[str, Any]]] = {}
     for role, entries in by_role.items():
-        entries.sort(key=lambda e: int(e.get("tick") or 0))
+        entries.sort(key=lambda e: _safe_int(e.get("tick"), 0))
         deltas: list[tuple[float, dict[str, Any]]] = []
         for i in range(1, len(entries)):
-            try:
-                prev_s = float(entries[i - 1].get("sentiment") or 0.0)
-            except (ValueError, TypeError):
-                prev_s = 0.0
-            try:
-                curr_s = float(entries[i].get("sentiment") or 0.0)
-            except (ValueError, TypeError):
-                curr_s = 0.0
+            prev_s = _safe_finite_float(entries[i - 1].get("sentiment"), 0.0)
+            curr_s = _safe_finite_float(entries[i].get("sentiment"), 0.0)
             delta = abs(curr_s - prev_s)
             if delta > 0.01:  # ignore noise
                 deltas.append((delta, entries[i]))
         # Sort by largest delta first, take top_n.
         deltas.sort(key=lambda t: t[0], reverse=True)
-        if deltas:
-            inflections[role] = [entry for _, entry in deltas[:top_n]]
-        elif entries:
+        if deltas and n > 0:
+            inflections[role] = [entry for _, entry in deltas[:n]]
+        elif entries and n > 0:
             inflections[role] = [entries[-1]]
 
     return inflections
@@ -190,34 +331,55 @@ def _build_analysis_prompt(
     """Build the user prompt for the LLM analysis."""
     # Index decisions by tick for lookup.
     decisions_by_tick: dict[int, str] = {}
-    for entry in decision_log:
+    for entry in (decision_log if isinstance(decision_log, list) else []):
+        if not isinstance(entry, dict):
+            continue
         tick = entry.get("tick")
         text = entry.get("decision_text", "")
         if tick is not None and text:
-            decisions_by_tick[int(tick)] = text
+            tick_int = _safe_int(tick, -1)
+            if tick_int >= 0:
+                decisions_by_tick[tick_int] = str(text)
 
     # Index stakeholder personas by role.
     personas_by_role: dict[str, str] = {}
-    if stakeholder_map:
+    if isinstance(stakeholder_map, list):
         for s in stakeholder_map:
-            role = s.get("role", s.get("id", ""))
-            persona = s.get("persona", s.get("description", ""))
-            if role and persona:
-                personas_by_role[role] = persona
+            if not isinstance(s, dict):
+                continue
+            raw_role = s.get("role") or s.get("id")
+            if not isinstance(raw_role, str) or not raw_role.strip():
+                continue
+            role_key = raw_role.strip()
+            raw_persona = s.get("persona") or s.get("description")
+            persona = str(raw_persona).strip() if raw_persona is not None else ""
+            if persona:
+                personas_by_role[role_key] = persona
+                personas_by_role.setdefault(role_key.lower(), persona)
+
+    if not isinstance(inflections, dict):
+        inflections = {}
 
     sections: list[str] = []
     for role, entries in inflections.items():
-        persona_desc = personas_by_role.get(role, "No persona description available.")
+        if not isinstance(role, str) or not role.strip():
+            continue
+        if not isinstance(entries, list):
+            continue
+        persona_desc = (
+            personas_by_role.get(role)
+            or personas_by_role.get(role.lower())
+            or "No persona description available."
+        )
         lines = [f"## Stakeholder: {role}", f"Persona: {persona_desc}", ""]
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             tick = entry.get("tick", "?")
             sentiment = entry.get("sentiment", "?")
             stance = entry.get("stance", "?")
             thought = entry.get("inner_thought", "")
-            try:
-                tick_int = int(tick)
-            except (ValueError, TypeError):
-                tick_int = -1
+            tick_int = _safe_int(tick, -1)
             decision_text = decisions_by_tick.get(tick_int, "(decision text not available)")
             lines.append(f"### Tick {tick}")
             lines.append(f"- Sentiment: {sentiment}, Stance: {stance}")
@@ -230,7 +392,7 @@ def _build_analysis_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Habermas translation diagnostic & heuristic fallback
+# Habermas translation diagnostic (local_gemma deterministic mode)
 # ---------------------------------------------------------------------------
 
 def _matches_any(text: str, *keywords: str) -> bool:
@@ -243,15 +405,28 @@ def _matches_any(text: str, *keywords: str) -> bool:
 
 
 def _classify_habermas_gap(
-    principles: list[str],
+    principles: list[str] | str | None,
     role: str,
     thought: str,
     sentiment: float,
 ) -> str:
     """Classify the translation gap into Habermas System vs. Lifeworld archetypes."""
-    t_low = thought.lower()
-    p_low = " ".join(principles).lower()
-    r_low = role.lower()
+    t_low = (
+        thought.lower()
+        if isinstance(thought, str)
+        else ("" if thought is None or isinstance(thought, bool) else str(thought).lower())
+    )
+    normalized = (
+        [principles.strip()]
+        if isinstance(principles, str) and principles.strip()
+        else _coerce_str_list(principles)
+    )
+    p_low = " ".join(normalized).lower()
+    r_low = (
+        role.lower()
+        if isinstance(role, str)
+        else ("" if role is None or isinstance(role, bool) else str(role).lower())
+    )
 
     # 1. Stakeholder's observed lifeworld experience (fine-grained matching)
     if _matches_any(t_low, "autonomy", "micromanag", "mandat", "freedom", "inflexib", "prescriptiv"):
@@ -308,12 +483,9 @@ def _build_suggested_reframing(
     thought: str,
 ) -> str:
     """Generate an actionable, stakeholder-specific Habermas reframing."""
-    dp_focus = (
-        domain_principles[0]
-        if domain_principles
-        else (principles_applied[0] if principles_applied else None)
-    )
-    t_low = thought.lower()
+    dp_candidates = _coerce_str_list(domain_principles) or _coerce_str_list(principles_applied)
+    dp_focus = dp_candidates[0] if dp_candidates else None
+    t_low = str(thought or "").lower()
 
     if tier == 1:
         if _matches_any(t_low, "capital", "roi", "expenditure", "margin", "cost", "budget", "fiduciary"):
@@ -383,18 +555,26 @@ def _generate_habermas_diagnostic(
     each stakeholder's Lifeworld (shared background understandings, autonomy,
     psychological safety, craftsmanship).
     """
+    if not isinstance(inflections, dict):
+        inflections = {}
+    if not isinstance(decision_log, list):
+        decision_log = []
+    if not isinstance(stakeholder_map, list):
+        stakeholder_map = []
+
     decisions_by_tick: dict[int, dict[str, Any]] = {}
     for entry in decision_log:
-        tick = entry.get("tick")
-        if tick is not None:
-            try:
-                decisions_by_tick[int(tick)] = entry
-            except (ValueError, TypeError):
-                pass
+        if not isinstance(entry, dict):
+            continue
+        tick_int = _safe_int(entry.get("tick"), -1)
+        if tick_int >= 0:
+            decisions_by_tick[tick_int] = entry
 
     stakeholders_by_key: dict[str, dict[str, Any]] = {}
     if stakeholder_map:
         for s in stakeholder_map:
+            if not isinstance(s, dict):
+                continue
             for k in (s.get("id"), s.get("role"), s.get("label")):
                 if k and isinstance(k, str):
                     stakeholders_by_key[k] = s
@@ -404,23 +584,36 @@ def _generate_habermas_diagnostic(
     gaps: list[dict[str, Any]] = []
 
     for role, entries in inflections.items():
-        st = stakeholders_by_key.get(role) or stakeholders_by_key.get(role.lower()) or {}
-        label = st.get("label") or role.replace("_", " ").title()
-        persona = st.get("persona") or st.get("description", "")
-        tier = int(st.get("tier") or 2)
-        domain_principles = st.get("domain_principles", [])
+        if not isinstance(role, str) or not role.strip():
+            continue
+        clean_entries = [e for e in (entries if isinstance(entries, list) else []) if isinstance(e, dict)]
+        if not clean_entries:
+            continue
+        st = (
+            stakeholders_by_key.get(role)
+            or stakeholders_by_key.get(role.lower())
+            or stakeholders_by_key.get(role.lower().replace(" ", "_"))
+            or {}
+        )
+        raw_label = st.get("label")
+        label = (
+            str(raw_label).strip()
+            if raw_label is not None and str(raw_label).strip()
+            else role.replace("_", " ").title()
+        )
+        raw_persona = st.get("persona") if st.get("persona") is not None else st.get("description", "")
+        persona = str(raw_persona or "")
+        tier = _safe_int(st.get("tier"), 2)
+        domain_principles = _coerce_str_list(st.get("domain_principles"))
 
         trigger_phrases: list[dict[str, Any]] = []
         all_principles_for_stakeholder: list[str] = []
 
-        entries_sorted = sorted(entries, key=lambda e: int(e.get("tick") or 0))
+        entries_sorted = sorted(clean_entries, key=lambda e: _safe_int(e.get("tick"), 0))
         for entry in entries_sorted:
-            tick = int(entry.get("tick", 1))
-            try:
-                sentiment = float(entry.get("sentiment") or 0.0)
-            except (ValueError, TypeError):
-                sentiment = 0.0
-            stance = str(entry.get("stance", "neutral"))
+            tick = _safe_int(entry.get("tick"), 1)
+            sentiment = _safe_finite_float(entry.get("sentiment"), 0.0)
+            stance = str(entry.get("stance") or "neutral").strip().lower()
             thought = str(entry.get("inner_thought") or "").strip()
 
             d_entry = decisions_by_tick.get(tick, {})
@@ -429,15 +622,17 @@ def _generate_habermas_diagnostic(
             if isinstance(tags, str):
                 try:
                     tags = json.loads(tags)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Failed to parse decision_tags JSON in diagnostic: %s", exc)
                     tags = {}
             if not isinstance(tags, dict):
                 tags = {}
-            principles_applied = tags.get("principles_applied") or []
-            if isinstance(principles_applied, str):
-                principles_applied = [principles_applied]
-            elif not isinstance(principles_applied, list):
-                principles_applied = []
+            raw_pa = tags.get("principles_applied")
+            if isinstance(raw_pa, str):
+                stripped_pa = raw_pa.strip()
+                principles_applied = [stripped_pa] if stripped_pa else []
+            else:
+                principles_applied = _coerce_str_list(raw_pa)
             if principles_applied:
                 all_principles_for_stakeholder.extend(principles_applied)
 
@@ -448,12 +643,8 @@ def _generate_habermas_diagnostic(
             else:
                 if principles_applied:
                     phrase = f"Implement operational priorities aligned with {principles_applied[0]}"
-                elif tick == 1:
-                    phrase = "Establish core governance framework and clarify resource commitments"
-                elif tick == 2:
-                    phrase = "Roll out phased operational workflows with protected team buffer capacity"
                 else:
-                    phrase = "Align operational delivery standards and institutionalize communication channels"
+                    phrase = "(No decision text recorded)"
 
             # 2. Leader intent
             if principles_applied:
@@ -530,7 +721,7 @@ def _generate_habermas_diagnostic(
 
         # Suggested reframing: pass combined thoughts observed across inflection entries
         combined_thoughts = " ".join(
-            str(e.get("inner_thought") or "") for e in entries
+            str(e.get("inner_thought") or "") for e in clean_entries
         ).strip()
         suggested_reframing = _build_suggested_reframing(
             role=role,
@@ -563,19 +754,6 @@ def _generate_habermas_diagnostic(
         "gaps": gaps,
         "summary": summary,
     }
-
-
-def _heuristic_fallback(
-    inflections: dict[str, list[dict[str, Any]]],
-    decision_log: list[dict[str, Any]],
-    stakeholder_map: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Deterministic fallback when the LLM is unavailable."""
-    return _generate_habermas_diagnostic(
-        inflections=inflections,
-        decision_log=decision_log,
-        stakeholder_map=stakeholder_map,
-    )
 
 
 _TIER_BEHAVIORAL_DEFAULTS: dict[int, dict[str, str]] = {
@@ -612,7 +790,8 @@ def _resolve_stakeholder_map(tool_context: ToolContext) -> list[dict[str, Any]]:
     if isinstance(stakeholder_map, str):
         try:
             stakeholder_map = json.loads(stakeholder_map)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to parse stakeholder_map JSON from session state: %s", exc)
             stakeholder_map = None
 
     if isinstance(stakeholder_map, list):
@@ -628,7 +807,8 @@ def _resolve_stakeholder_map(tool_context: ToolContext) -> list[dict[str, Any]]:
     if isinstance(scenario, str):
         try:
             scenario = json.loads(scenario)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to parse leadership_scenario JSON from session state: %s", exc)
             scenario = {}
 
     if isinstance(scenario, dict):
@@ -636,7 +816,8 @@ def _resolve_stakeholder_map(tool_context: ToolContext) -> list[dict[str, Any]]:
         if isinstance(fallback, str):
             try:
                 fallback = json.loads(fallback)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning("Failed to parse scenario stakeholders JSON from session state: %s", exc)
                 fallback = []
         if isinstance(fallback, list):
             return [s for s in fallback if isinstance(s, dict)]
@@ -644,76 +825,10 @@ def _resolve_stakeholder_map(tool_context: ToolContext) -> list[dict[str, Any]]:
     return []
 
 
-def _get_or_create_fallback_stakeholders(
-    tool_context: ToolContext,
-) -> list[dict[str, Any]]:
-    """Return stakeholders from state or construct realistic default personas."""
-    stakeholders = _resolve_stakeholder_map(tool_context)
-    if stakeholders:
-        return stakeholders
-
-    scenario: dict[str, Any] = {}
-    try:
-        scenario = tool_context.state.get("leadership_scenario", {})
-    except (AttributeError, TypeError):
-        pass
-    if isinstance(scenario, str):
-        try:
-            scenario = json.loads(scenario)
-        except Exception:
-            scenario = {}
-    if isinstance(scenario, dict):
-        st = scenario.get("stakeholders") or scenario.get("echoes")
-        if isinstance(st, list) and st:
-            return [s for s in st if isinstance(s, dict)]
-
-    return [
-        {
-            "id": "executive_sponsor",
-            "role": "executive_sponsor",
-            "label": "Executive Sponsor",
-            "tier": 1,
-            "persona": "Champions enterprise transformation, governance cadence, and capital allocation.",
-            "domain_principles": ["Strategic Value Creation", "Governance Milestones"],
-            "behavioral_patterns": {
-                "decision_style": "data-driven",
-                "communication": "direct",
-                "risk_tolerance": "moderate",
-            },
-        },
-        {
-            "id": "operations_director",
-            "role": "operations_director",
-            "label": "Director of Operations",
-            "tier": 2,
-            "persona": "Oversees operational continuity, process handoffs, and resource bandwidth.",
-            "domain_principles": ["Operational Reliability", "Delivery Cadence"],
-            "behavioral_patterns": {
-                "decision_style": "consensus-seeking",
-                "communication": "diplomatic",
-                "risk_tolerance": "low",
-            },
-        },
-        {
-            "id": "team_representative",
-            "role": "team_representative",
-            "label": "Frontline Team Representative",
-            "tier": 3,
-            "persona": "Advocates for frontline workload sustainability and psychological safety.",
-            "domain_principles": ["Workforce Bandwidth", "Psychological Safety"],
-            "behavioral_patterns": {
-                "decision_style": "pragmatic",
-                "communication": "structured",
-                "risk_tolerance": "moderate",
-            },
-        },
-    ]
-
-
 def _ensure_telemetry_in_state(
     tool_context: ToolContext,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Ensure realistic echo_voice_log and decision_log exist in session state."""
+    """Retrieve echo_voice_log and decision_log from session state without injecting synthetic data."""
     echo_voice_log: list[dict[str, Any]] = []
     decision_log: list[dict[str, Any]] = []
 
@@ -722,138 +837,25 @@ def _ensure_telemetry_in_state(
         if isinstance(raw_vl, str):
             try:
                 raw_vl = json.loads(raw_vl)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to parse echo_voice_log JSON from session state: %s", exc)
                 raw_vl = []
         if isinstance(raw_vl, list) and raw_vl:
-            echo_voice_log = raw_vl
+            echo_voice_log = [e for e in raw_vl if isinstance(e, dict)]
 
         raw_dl = tool_context.state.get("decision_log")
         if isinstance(raw_dl, str):
             try:
                 raw_dl = json.loads(raw_dl)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to parse decision_log JSON from session state: %s", exc)
                 raw_dl = []
         if isinstance(raw_dl, list) and raw_dl:
-            decision_log = raw_dl
+            decision_log = [d for d in raw_dl if isinstance(d, dict)]
     except (AttributeError, TypeError):
         pass
 
-    if echo_voice_log and decision_log:
-        return echo_voice_log, decision_log
-
-    stakeholders = _get_or_create_fallback_stakeholders(tool_context)
-
-    # Synthesize decision_log if missing
-    if not decision_log:
-        decision_log = [
-            {
-                "tick": 1,
-                "decision_text": "Establish core governance framework and clarify resource commitments.",
-                "decision_tags": {
-                    "principles_applied": [
-                        "Strategic Value Creation",
-                        "Governance Milestones",
-                    ]
-                },
-            },
-            {
-                "tick": 2,
-                "decision_text": "Roll out phased operational workflows with protected team buffer capacity.",
-                "decision_tags": {
-                    "principles_applied": [
-                        "Operational Reliability",
-                        "Delivery Cadence",
-                    ]
-                },
-            },
-            {
-                "tick": 3,
-                "decision_text": "Align incentive structures and institutionalize psychological safety channels.",
-                "decision_tags": {
-                    "principles_applied": [
-                        "Workforce Bandwidth",
-                        "Psychological Safety",
-                    ]
-                },
-            },
-        ]
-        try:
-            tool_context.state["decision_log"] = decision_log
-        except (AttributeError, TypeError):
-            pass
-
-    # Synthesize echo_voice_log if missing
-    if not echo_voice_log:
-        synth_voice_log: list[dict[str, Any]] = []
-        for s in stakeholders:
-            role = str(s.get("role") or s.get("id") or "stakeholder")
-            tier = int(s.get("tier") or 2)
-            if tier == 1:
-                trajectories = [
-                    (1, 0.2, 0.4, "receptive", "Monitoring initial capital outlay and milestone risks."),
-                    (2, 0.5, 0.2, "supportive", "Milestone delivery metrics show promising governance tracking."),
-                    (3, 0.8, 0.1, "aligned", "Strategic value realized; fully endorsing next operational phase."),
-                ]
-            elif tier == 2:
-                trajectories = [
-                    (1, -0.3, 0.6, "skeptical", "Concerned about bandwidth strain across cross-functional handoffs."),
-                    (2, 0.1, 0.4, "neutral", "Capacity buffers mitigated early friction points."),
-                    (3, 0.5, 0.2, "supportive", "Workflow stabilization confirmed; operational buy-in established."),
-                ]
-            else:
-                trajectories = [
-                    (1, -0.5, 0.7, "resistant", "High risk of cognitive overload without clear workload limits."),
-                    (2, -0.1, 0.5, "skeptical", "Appreciate the safety channel, but delivery cadence remains intense."),
-                    (3, 0.3, 0.3, "receptive", "Psychological safety guardrails functioning effectively."),
-                ]
-
-            for tick, sent, res, stance, thought in trajectories:
-                entry = {
-                    "tick": tick,
-                    "role": role,
-                    "sentiment": sent,
-                    "resistance": res,
-                    "stance": stance,
-                    "inner_thought": thought,
-                    "tier": tier,
-                }
-                synth_voice_log.append(entry)
-
-        echo_voice_log = synth_voice_log
-        try:
-            tool_context.state["echo_voice_log"] = echo_voice_log
-            if "aligned_echo_ids" not in tool_context.state:
-                tool_context.state["aligned_echo_ids"] = [
-                    str(s.get("role") or s.get("id"))
-                    for s in stakeholders
-                    if int(s.get("tier") or 2) <= 2
-                ]
-        except (AttributeError, TypeError):
-            pass
-
     return echo_voice_log, decision_log
-
-
-def _fallback_inflections(stakeholders: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Generate deterministic inflection points for stakeholders when none detected."""
-    inflections: dict[str, list[dict[str, Any]]] = {}
-    for s in stakeholders:
-        role = str(s.get("role") or s.get("id") or "stakeholder")
-        inflections[role] = [
-            {
-                "tick": 1,
-                "sentiment": -0.2,
-                "stance": "skeptical",
-                "inner_thought": "Concerned about delivery timeline and cross-functional coordination.",
-            },
-            {
-                "tick": 3,
-                "sentiment": 0.5,
-                "stance": "supportive",
-                "inner_thought": "Alignment confirmed after governance milestones clarified.",
-            },
-        ]
-    return inflections
 
 
 # ---------------------------------------------------------------------------
@@ -865,32 +867,47 @@ async def emit_translation_diagnostic(
 ) -> dict[str, Any]:
     """Analyse the leader's communication for System–Lifeworld translation gaps.
 
-    Reads ``echo_voice_log`` and ``decision_log`` from session state (or
-    generates realistic fallback telemetry if unseeded), identifies sentiment
-    inflection points per stakeholder, and uses Gemini/heuristics to diagnose
-    where the leader's System language collided with each stakeholder's Lifeworld.
+    Reads ``echo_voice_log`` and ``decision_log`` from session state, identifies
+    sentiment inflection points per stakeholder, and uses Gemini (or the
+    deterministic Habermas analyzer in ``local_gemma`` mode) to diagnose where
+    the leader's System language collided with each stakeholder's Lifeworld.
 
     Returns:
         On success: ``{"status": "success", "translation_diagnostic": {...}}``.
+        On error: ``{"status": "error", "error": "...", "message": "..."}``.
     """
-    # 1. Read state data or seed realistic fallback telemetry.
-    had_vl = bool(tool_context.state.get("echo_voice_log") if hasattr(tool_context, "state") and isinstance(tool_context.state, dict) else False)
+    # 1. Read telemetry from state. Never synthesize fake telemetry into state.
     echo_voice_log, decision_log = _ensure_telemetry_in_state(tool_context)
+    if not echo_voice_log or not decision_log:
+        return {
+            "status": "error",
+            "error": "no_telemetry",
+            "message": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting translation diagnostic.",
+            "translation_diagnostic": {
+                "gaps": [],
+                "summary": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting translation diagnostic.",
+                "actionable_corrections": [],
+            },
+        }
 
-    # 2. Stakeholder personas for richer context (with scenario fallback).
+    # 2. Stakeholder personas for richer context (empty list if absent; never fabricate fake personas).
     stakeholder_map = _resolve_stakeholder_map(tool_context)
-    if not had_vl and not stakeholder_map:
-        stakeholder_map = _get_or_create_fallback_stakeholders(tool_context)
 
     # 3. Find inflection points (top 3 per stakeholder).
     inflections = _find_inflection_points(echo_voice_log, top_n=3)
     if not inflections:
-        if not stakeholder_map:
-            stakeholder_map = _get_or_create_fallback_stakeholders(tool_context)
-        inflections = _fallback_inflections(stakeholder_map)
+        return {
+            "status": "error",
+            "error": "no_inflections",
+            "message": "No sentiment inflection points could be extracted from echo_voice_log.",
+            "translation_diagnostic": {
+                "gaps": [],
+                "summary": "No sentiment inflection points could be extracted from echo_voice_log.",
+            },
+        }
 
-    # 4. Generate diagnostic: deterministic Habermas engine in local mode (<10ms),
-    #    or Gemini call when running cloud/Vertex.
+    # 4. Generate diagnostic: deterministic Habermas engine in explicit local_gemma
+    #    mode (<10ms), or Gemini call in cloud mode (failing explicitly on error).
     diagnostic: dict[str, Any] | None = None
     eval_method = "llm"
 
@@ -919,33 +936,35 @@ async def emit_translation_diagnostic(
                     temperature=0.3,
                 ),
             )
-            raw_text = response.text or ""
-            # Strip markdown fences if present.
+            raw_text = (response.text or "").strip()
+            # Strip markdown fences if present (including trailing whitespace/newlines).
             if raw_text.startswith("```"):
                 raw_text = raw_text.split("\n", 1)[1] if "\n" in raw_text else raw_text[3:]
+                raw_text = raw_text.strip()
                 if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
+                    raw_text = raw_text[:-3].strip()
             parsed_diag = json.loads(raw_text)
-            if not isinstance(parsed_diag, dict) or not isinstance(
-                parsed_diag.get("gaps"), list
-            ):
-                raise ValueError(
-                    "Translation diagnostic JSON must be an object with a 'gaps' list"
-                )
-            diagnostic = parsed_diag
-        except Exception:
-            logger.warning(
-                "emit_translation_diagnostic: LLM call failed, using heuristic fallback",
+            if not isinstance(parsed_diag, dict):
+                raise ValueError("Translation diagnostic JSON must be an object")
+            normalized_diag = _normalize_llm_diagnostic(parsed_diag)
+            if inflections and not normalized_diag["gaps"]:
+                raise ValueError("LLM returned empty gaps despite active inflection points")
+            diagnostic = normalized_diag
+        except Exception as exc:
+            logger.error(
+                "emit_translation_diagnostic: LLM analysis failed: %s",
+                exc,
                 exc_info=True,
             )
-            eval_method = "heuristic"
-
-    if diagnostic is None:
-        diagnostic = _heuristic_fallback(
-            inflections=inflections,
-            decision_log=decision_log,
-            stakeholder_map=stakeholder_map,
-        )
+            return {
+                "status": "error",
+                "error": "llm_failed",
+                "message": f"Translation diagnostic LLM analysis failed: {exc}",
+                "translation_diagnostic": {
+                    "gaps": [],
+                    "summary": f"Translation diagnostic LLM analysis failed: {exc}",
+                },
+            }
 
     # 5. Enrich with metadata.
     diagnostic["inferred"] = True
@@ -976,44 +995,55 @@ def _compute_sentiment_trajectory(
     role: str | set[str] | list[str],
 ) -> dict[str, Any]:
     """Compute sentiment trajectory stats for a single stakeholder."""
+    if not isinstance(echo_voice_log, list):
+        return {
+            "initial": 0.0, "final": 0.0, "min": 0.0, "max": 0.0,
+            "max_delta_tick": 0, "trend": "flat",
+        }
     if isinstance(role, (set, list, tuple)):
-        role_set = {str(r).strip().lower() for r in role if r}
+        role_set = {
+            str(r).strip().lower()
+            for r in role
+            if r is not None and not isinstance(r, bool) and str(r).strip()
+        }
         entries = [
             e for e in echo_voice_log
-            if str(e.get("role", "")).strip().lower() in role_set
-            or str(e.get("role", "")).strip().lower().replace(" ", "_") in role_set
+            if isinstance(e, dict) and isinstance(e.get("role"), str) and (
+                e["role"].strip().lower() in role_set
+                or e["role"].strip().lower().replace(" ", "_") in role_set
+            )
         ]
     else:
-        role_low = str(role).strip().lower()
-        entries = [
-            e for e in echo_voice_log
-            if str(e.get("role", "")).strip().lower() == role_low
-            or str(e.get("role", "")).strip().lower().replace(" ", "_") == role_low
-        ]
-    entries.sort(key=lambda e: int(e.get("tick") or 0))
+        role_low = role.strip().lower() if isinstance(role, str) else ""
+        if not role_low:
+            entries = []
+        else:
+            entries = [
+                e for e in echo_voice_log
+                if isinstance(e, dict) and isinstance(e.get("role"), str) and (
+                    e["role"].strip().lower() == role_low
+                    or e["role"].strip().lower().replace(" ", "_") == role_low
+                )
+            ]
+    entries.sort(key=lambda e: _safe_int(e.get("tick"), 0))
     if not entries:
         return {
             "initial": 0.0, "final": 0.0, "min": 0.0, "max": 0.0,
             "max_delta_tick": 0, "trend": "flat",
         }
 
-    sentiments = []
-    for e in entries:
-        try:
-            sentiments.append(float(e.get("sentiment") or 0.0))
-        except (ValueError, TypeError):
-            sentiments.append(0.0)
+    sentiments = [_safe_finite_float(e.get("sentiment"), 0.0) for e in entries]
     initial = sentiments[0]
     final = sentiments[-1]
 
     # Find the tick with the largest single-step delta.
     max_delta = 0.0
-    max_delta_tick = int(entries[0].get("tick") or 0)
+    max_delta_tick = _safe_int(entries[0].get("tick"), 0)
     for i in range(1, len(sentiments)):
         delta = abs(sentiments[i] - sentiments[i - 1])
         if delta > max_delta:
             max_delta = delta
-            max_delta_tick = int(entries[i].get("tick") or 0)
+            max_delta_tick = _safe_int(entries[i].get("tick"), 0)
 
     diff = final - initial
     if diff > 0.1:
@@ -1047,22 +1077,10 @@ def _compute_wtt(
       - Domain principle engagement ratio: 25%
       - Trust integrity (absence of contradiction impact): 20%
     """
-    try:
-        final_sentiment = float(final_sentiment)
-    except (ValueError, TypeError):
-        final_sentiment = 0.0
-    try:
-        final_resistance = float(final_resistance)
-    except (ValueError, TypeError):
-        final_resistance = 0.5
-    try:
-        domain_engagement_ratio = float(domain_engagement_ratio)
-    except (ValueError, TypeError):
-        domain_engagement_ratio = 0.0
-    try:
-        contradiction_impact = float(contradiction_impact)
-    except (ValueError, TypeError):
-        contradiction_impact = 0.0
+    final_sentiment = _safe_finite_float(final_sentiment, 0.0)
+    final_resistance = _safe_finite_float(final_resistance, 0.5)
+    domain_engagement_ratio = _safe_finite_float(domain_engagement_ratio, 0.0)
+    contradiction_impact = _safe_finite_float(contradiction_impact, 0.0)
 
     trust_level = max(0.0, min(1.0, (final_sentiment + 1.0) / 2.0))
     resistance_absence = max(0.0, min(1.0, 1.0 - final_resistance))
@@ -1089,14 +1107,8 @@ def _assess_malicious_compliance(
     avg_inner_sentiment: float,
 ) -> tuple[str, dict[str, Any]]:
     """Detect malicious compliance risk from displayed vs. operative behavior."""
-    try:
-        wall_severity = float(wall_severity)
-    except (ValueError, TypeError):
-        wall_severity = 0.0
-    try:
-        avg_inner_sentiment = float(avg_inner_sentiment)
-    except (ValueError, TypeError):
-        avg_inner_sentiment = 0.0
+    wall_severity = _safe_finite_float(wall_severity, 0.0)
+    avg_inner_sentiment = _safe_finite_float(avg_inner_sentiment, 0.0)
 
     displayed_cooperative = final_stance in ("neutral", "supportive", "receptive", "champion")
     operative_friction = wall_severity > 5.0
@@ -1125,28 +1137,49 @@ def _avg_inner_sentiment_for_role(
     We don't have numeric inner_thought sentiment, so we map stance to
     approximate values and average them.
     """
+    if not isinstance(echo_voice_log, list):
+        return 0.0
     stance_to_val = {
         "hostile": -0.8, "resistant": -0.3, "skeptical": -0.1,
         "neutral": 0.1, "receptive": 0.4, "supportive": 0.5, "champion": 0.8,
         "defected": -1.0, "aligned": 1.0,
     }
     if isinstance(role, (set, list, tuple)):
-        role_set = {str(r).strip().lower() for r in role if r}
+        role_set = {
+            str(r).strip().lower()
+            for r in role
+            if r is not None and not isinstance(r, bool) and str(r).strip()
+        }
         entries = [
             e for e in echo_voice_log
-            if str(e.get("role", "")).strip().lower() in role_set
-            or str(e.get("role", "")).strip().lower().replace(" ", "_") in role_set
+            if isinstance(e, dict) and isinstance(e.get("role"), str) and (
+                e["role"].strip().lower() in role_set
+                or e["role"].strip().lower().replace(" ", "_") in role_set
+            )
         ]
     else:
-        role_low = str(role).strip().lower()
-        entries = [
-            e for e in echo_voice_log
-            if str(e.get("role", "")).strip().lower() == role_low
-            or str(e.get("role", "")).strip().lower().replace(" ", "_") == role_low
-        ]
+        role_low = role.strip().lower() if isinstance(role, str) else ""
+        if not role_low:
+            entries = []
+        else:
+            entries = [
+                e for e in echo_voice_log
+                if isinstance(e, dict) and isinstance(e.get("role"), str) and (
+                    e["role"].strip().lower() == role_low
+                    or e["role"].strip().lower().replace(" ", "_") == role_low
+                )
+            ]
     if not entries:
         return 0.0
-    vals = [stance_to_val.get(e.get("stance", "neutral"), 0.0) for e in entries]
+    vals: list[float] = []
+    for e in entries:
+        raw_stance = e.get("stance")
+        stance_key = (
+            raw_stance.strip().lower()
+            if isinstance(raw_stance, str)
+            else ("neutral" if raw_stance is None else str(raw_stance))
+        )
+        vals.append(stance_to_val.get(stance_key, 0.0))
     return sum(vals) / len(vals)
 
 
@@ -1161,16 +1194,32 @@ async def emit_stakeholder_psychology(
 
     Returns:
         On success: ``{"status": "success", "stakeholder_psychology": {...}}``.
-        On no data: ``{"status": "skipped", "reason": "..."}``.
+        On no data: ``{"status": "error", "error": "no_telemetry", ...}``.
     """
-    # 1. Read state data or seed realistic fallback telemetry.
+    # 1. Read telemetry from session state.
+    state_obj: Any = None
     try:
-        echo_voice_log = tool_context.state.get("echo_voice_log", [])
-        route_friction_map = tool_context.state.get("route_friction_map", {})
-        contradiction_log = tool_context.state.get("contradiction_log", [])
-        defected_ids = tool_context.state.get("defected_echo_ids", [])
-        aligned_ids = tool_context.state.get("aligned_echo_ids", [])
-        decision_log = tool_context.state.get("decision_log", [])
+        state_obj = getattr(tool_context, "state", None) if tool_context else None
+        if state_obj is not None and hasattr(state_obj, "get"):
+            echo_voice_log = [
+                e for e in _coerce_state_list(state_obj.get("echo_voice_log")) if isinstance(e, dict)
+            ]
+            route_friction_map = _coerce_state_dict(state_obj.get("route_friction_map"))
+            contradiction_log = [
+                c for c in _coerce_state_list(state_obj.get("contradiction_log")) if isinstance(c, dict)
+            ]
+            defected_ids = _coerce_state_list(state_obj.get("defected_echo_ids"))
+            aligned_ids = _coerce_state_list(state_obj.get("aligned_echo_ids"))
+            decision_log = [
+                d for d in _coerce_state_list(state_obj.get("decision_log")) if isinstance(d, dict)
+            ]
+        else:
+            echo_voice_log = []
+            route_friction_map = {}
+            contradiction_log = []
+            defected_ids = []
+            aligned_ids = []
+            decision_log = []
     except (AttributeError, TypeError):
         echo_voice_log = []
         route_friction_map = {}
@@ -1179,21 +1228,208 @@ async def emit_stakeholder_psychology(
         aligned_ids = []
         decision_log = []
 
-    has_existing_vl = bool(echo_voice_log)
     if not echo_voice_log:
-        echo_voice_log, decision_log = _ensure_telemetry_in_state(tool_context)
+        raw_vl, raw_dl = _ensure_telemetry_in_state(tool_context)
+        echo_voice_log = [e for e in raw_vl if isinstance(e, dict)]
+        decision_log = [d for d in raw_dl if isinstance(d, dict)]
 
-    stakeholder_map = _resolve_stakeholder_map(tool_context)
-    if not has_existing_vl and not stakeholder_map:
-        stakeholder_map = _get_or_create_fallback_stakeholders(tool_context)
+    raw_sh_map = None
+    try:
+        if state_obj is not None and hasattr(state_obj, "get"):
+            raw_sh_map = state_obj.get("stakeholder_map")
+    except (AttributeError, TypeError):
+        raw_sh_map = None
+
+    if isinstance(raw_sh_map, str):
+        try:
+            raw_sh_map = json.loads(raw_sh_map)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Failed to parse stakeholder_map JSON in psychology tool: %s", exc)
+            raw_sh_map = None
+
+    stakeholder_map = (
+        [s for s in raw_sh_map if isinstance(s, dict)]
+        if isinstance(raw_sh_map, list)
+        else []
+    )
+
+    if not echo_voice_log:
+        if not stakeholder_map:
+            return {
+                "status": "error",
+                "error": "no_telemetry",
+                "message": "No telemetry or stakeholder data available to compute psychology.",
+                "stakeholder_psychology": {
+                    "profiles": [],
+                    "summary": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting stakeholder psychology.",
+                },
+            }
+
+        # Baseline stakeholder psychological profiles from stakeholder_map
+        profiles: list[dict[str, Any]] = []
+        for sh in stakeholder_map:
+            if not isinstance(sh, dict):
+                continue
+            role = str(sh.get("role") or sh.get("id") or "stakeholder").strip() or "stakeholder"
+            sh_id = str(sh.get("stakeholder_id") or sh.get("id") or sh.get("role") or "stakeholder").strip() or "stakeholder"
+            resolved_tier = _safe_int(sh.get("tier"), 2)
+            label = str(sh.get("label") or sh.get("name") or format_role_display(role)).strip()
+            persona_summary = str(sh.get("persona") or sh.get("description") or "")[:200]
+            archetype = str(sh.get("archetype") or format_role_display(role)).strip()
+            department = str(sh.get("department") or sh.get("department_name") or "").strip()
+
+            power_level = _safe_finite_float(
+                sh.get("power_level") if sh.get("power_level") is not None
+                else sh.get("initial_influence"),
+                0.5,
+            )
+            interest_level = _safe_finite_float(
+                sh.get("interest_level"),
+                0.5,
+            )
+            s_res = _safe_finite_float(
+                sh.get("resistance_score") if sh.get("resistance_score") is not None
+                else (sh.get("resistance") if sh.get("resistance") is not None
+                      else sh.get("initial_resistance")),
+                0.5,
+            )
+
+            raw_behavioral = sh.get("behavioral_patterns")
+            if isinstance(raw_behavioral, dict) and raw_behavioral:
+                dec_from_bp = raw_behavioral.get("decision_style")
+                comm_from_bp = raw_behavioral.get("communication_style") or raw_behavioral.get("communication")
+                risk_from_bp = raw_behavioral.get("risk_tolerance")
+            else:
+                dec_from_bp = None
+                comm_from_bp = None
+                risk_from_bp = None
+
+            tier_defaults = _default_behavioral_for_tier(resolved_tier)
+            decision_style = str(
+                dec_from_bp or sh.get("decision_style") or tier_defaults.get("decision_style", "pragmatic")
+            )
+            communication_style = str(
+                comm_from_bp
+                or sh.get("communication_style")
+                or sh.get("communication")
+                or tier_defaults.get("communication_style")
+                or tier_defaults.get("communication", "structured")
+            )
+            risk_tolerance = str(
+                risk_from_bp or sh.get("risk_tolerance") or tier_defaults.get("risk_tolerance", "moderate")
+            )
+
+            coalition = sh.get("coalition_affinity", sh.get("coalition_allies", []))
+            allies: list[str] = []
+            for c in (coalition if isinstance(coalition, list) else []):
+                if isinstance(c, str):
+                    ally_name = c.split(" (")[0].strip()
+                    if ally_name:
+                        allies.append(format_role_display(ally_name))
+
+            wtt_score, wtt_breakdown = _compute_wtt(0.0, s_res, 0.0, 0.0)
+
+            profiles.append({
+                "stakeholder_id": sh_id,
+                "role": role,
+                "stakeholder_label": label,
+                "tier": resolved_tier,
+                "archetype": archetype,
+                "department": department,
+                "power_level": power_level,
+                "interest_level": interest_level,
+                "resistance_score": s_res,
+                "persona_summary": persona_summary,
+                "decision_style": decision_style,
+                "communication_style": communication_style,
+                "risk_tolerance": risk_tolerance,
+                "domain_principles": _coerce_str_list(sh.get("domain_principles")) or _coerce_str_list(sh.get("principles")),
+                "alignment_drivers": _coerce_str_list(sh.get("alignment_drivers")),
+                "resistance_triggers": _coerce_str_list(sh.get("resistance_triggers")),
+                "coalition_allies": allies,
+                "wtt_score": wtt_score,
+                "wtt_breakdown": wtt_breakdown,
+                "malicious_compliance_risk": "low",
+                "malicious_compliance_signals": {
+                    "displayed_stance": "neutral",
+                    "wall_severity": 0.0,
+                    "inner_sentiment_avg": 0.0,
+                },
+                "sentiment_trajectory": {
+                    "initial": 0.0,
+                    "final": 0.0,
+                    "min": 0.0,
+                    "max": 0.0,
+                    "max_delta_tick": 0,
+                    "trend": "flat",
+                },
+                "trust_breaches": 0,
+                "terminal_state": None,
+                "advocacy_actions": [],
+                "escalation_events": [],
+            })
+
+        if not profiles:
+            return {
+                "status": "error",
+                "error": "no_telemetry",
+                "message": "No telemetry or stakeholder data available to compute psychology.",
+                "stakeholder_psychology": {
+                    "profiles": [],
+                    "summary": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting stakeholder psychology.",
+                },
+            }
+
+        profiles.sort(key=lambda p: p["wtt_score"])
+        total = len(profiles)
+        avg_wtt = round(sum(p["wtt_score"] for p in profiles) / max(total, 1))
+        summary = (
+            f"Baseline psychological profiles established for {total} stakeholder(s). "
+            f"Average baseline WTT score: {avg_wtt}/100. Simulation telemetry pending."
+        )
+
+        archetypes = [
+            str(p.get("archetype") or p.get("role") or "").strip()
+            for p in profiles
+            if (p.get("archetype") or p.get("role"))
+        ]
+        dominant = max(set(archetypes), key=archetypes.count) if archetypes else "Pragmatic Executor"
+
+        result: dict[str, Any] = {
+            "profiles": profiles,
+            "coalitions": [],
+            "polarization_index": 0.0,
+            "dominant_archetype": dominant,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "inferred": False,
+        }
+
+        try:
+            tool_context.state["stakeholder_psychology"] = result
+        except (AttributeError, TypeError):
+            logger.warning("emit_stakeholder_psychology: could not write to session state")
+
+        logger.info(
+            "emit_stakeholder_psychology: %d baseline profile(s), avg_wtt=%d",
+            total, avg_wtt,
+        )
+        return {"status": "success", "stakeholder_psychology": result}
+
+    if not stakeholder_map:
+        stakeholder_map = _resolve_stakeholder_map(tool_context)
+
+    # Sort voice log chronologically by tick so trajectory and event extraction are deterministic.
+    echo_voice_log.sort(key=lambda e: _safe_int(e.get("tick"), 0))
 
     # 2. Build role → last tick entry lookup.
     last_entry_by_role: dict[str, dict[str, Any]] = {}
     for entry in echo_voice_log:
-        role = entry.get("role", "")
+        raw_role = entry.get("role")
+        role = raw_role.strip() if isinstance(raw_role, str) else ""
         if role:
             prev = last_entry_by_role.get(role)
-            if prev is None or int(entry.get("tick") or 0) > int(prev.get("tick") or 0):
+            if prev is None or _safe_int(entry.get("tick"), 0) >= _safe_int(prev.get("tick"), 0):
                 last_entry_by_role[role] = entry
 
     # 3. Index stakeholder_map by role/id/label/name for persona data.
@@ -1228,7 +1464,7 @@ async def emit_stakeholder_psychology(
     total_ticks = max(len(decision_log), 1)
     domain_engagement_counts: dict[str, int] = {}
     for primary_key, persona in canonical_personas:
-        dp = set(persona.get("domain_principles", []))
+        dp = set(_coerce_str_list(persona.get("domain_principles")))
         if not dp:
             continue
         count = 0
@@ -1237,11 +1473,12 @@ async def emit_stakeholder_psychology(
             if isinstance(tags, str):
                 try:
                     tags = json.loads(tags)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Failed to parse decision_tags JSON in psychology tool: %s", exc)
                     tags = {}
             if not isinstance(tags, dict):
                 tags = {}
-            applied = set(tags.get("principles_applied", []))
+            applied = set(_coerce_str_list(tags.get("principles_applied")))
             if dp & applied:
                 count += 1
         domain_engagement_counts[primary_key] = count
@@ -1254,10 +1491,10 @@ async def emit_stakeholder_psychology(
     # 5. Count contradictions per stakeholder's domain.
     contradiction_counts: dict[str, int] = {}
     for c in contradiction_log:
-        violated_principle = c.get("violated_principle", "")
+        violated_principle = str(c.get("violated_principle") or "")
         for primary_key, persona in canonical_personas:
-            dp = persona.get("domain_principles", [])
-            if violated_principle in dp:
+            dp = set(_coerce_str_list(persona.get("domain_principles")))
+            if violated_principle and violated_principle in dp:
                 new_val = contradiction_counts.get(primary_key, 0) + 1
                 contradiction_counts[primary_key] = new_val
                 for alias in (persona.get("role"), persona.get("id"), persona.get("name"), persona.get("label")):
@@ -1298,24 +1535,25 @@ async def emit_stakeholder_psychology(
         elif not persona and slug in ("unknown", "echo") and stakeholder_map:
             persona = stakeholder_map[0]
 
-        resolved_role = (
-            persona.get("role")
-            or persona.get("id")
-            or persona.get("name")
-            or role
-        ) if persona else role
-        resolved_tier = int(
-            persona.get("tier")
-            or last.get("tier")
-            or (1 if persona else 3)
+        resolved_role = str(
+            (
+                persona.get("role")
+                or persona.get("id")
+                or persona.get("name")
+                or role
+            ) if persona else role
+        )
+        resolved_tier = _safe_int(
+            persona.get("tier") or last.get("tier"),
+            1 if persona else 3,
         )
 
         default_label = (
             "Stakeholder Representative"
-            if str(resolved_role).strip().lower() in ("unknown", "echo", "")
-            else format_role_display(str(resolved_role))
+            if resolved_role.strip().lower() in ("unknown", "echo", "")
+            else format_role_display(resolved_role)
         )
-        stakeholder_label = (
+        stakeholder_label = str(
             persona.get("label")
             or persona.get("name")
             or default_label
@@ -1339,19 +1577,16 @@ async def emit_stakeholder_psychology(
         else:
             behavioral = _default_behavioral_for_tier(resolved_tier)
 
-        try:
-            final_sentiment = float(last.get("sentiment") or 0.0)
-        except (ValueError, TypeError):
-            final_sentiment = 0.0
-        try:
-            final_resistance = float(last.get("resistance") if last.get("resistance") is not None else 0.5)
-        except (ValueError, TypeError):
-            final_resistance = 0.5
-        final_stance = last.get("stance", "neutral")
-        try:
-            wall_severity = float(route_friction_map.get(resolved_role, route_friction_map.get(role, 0.0)) or 0.0)
-        except (ValueError, TypeError):
-            wall_severity = 0.0
+        final_sentiment = _safe_finite_float(last.get("sentiment"), 0.0)
+        final_resistance = _safe_finite_float(
+            last.get("resistance") if last.get("resistance") is not None else 0.5,
+            0.5,
+        )
+        final_stance = str(last.get("stance") or "neutral")
+        wall_severity = _safe_finite_float(
+            route_friction_map.get(resolved_role, route_friction_map.get(role, 0.0)),
+            0.0,
+        )
 
         # Sentiment trajectory.
         trajectory = _compute_sentiment_trajectory(echo_voice_log, persona_aliases)
@@ -1427,8 +1662,16 @@ async def emit_stakeholder_psychology(
                     # Defensively replace raw role slug with formatted stakeholder_label if present at the start
                     replace_patterns = sorted(persona_aliases, key=len, reverse=True)
                     alias_regex = "|".join(re.escape(a) for a in replace_patterns if a)
-                    leading_pattern = rf"^(?:{alias_regex})\b"
-                    evt_formatted = re.sub(leading_pattern, stakeholder_label, evt_str, flags=re.IGNORECASE)
+                    if alias_regex:
+                        leading_pattern = rf"^(?:{alias_regex})\b"
+                        evt_formatted = re.sub(
+                            leading_pattern,
+                            lambda _: stakeholder_label,
+                            evt_str,
+                            flags=re.IGNORECASE,
+                        )
+                    else:
+                        evt_formatted = evt_str
 
                     # Defensively format any remaining snake_case slugs in the string
                     def _replace_slug(m: re.Match) -> str:
@@ -1490,13 +1733,15 @@ async def emit_stakeholder_psychology(
             "stakeholder_id": resolved_role,
             "stakeholder_label": stakeholder_label,
             "tier": resolved_tier,
-            "persona_summary": (persona.get("persona", ""))[:200],
-            "decision_style": behavioral.get("decision_style", "pragmatic"),
-            "communication_style": behavioral.get("communication", "structured"),
-            "risk_tolerance": behavioral.get("risk_tolerance", "moderate"),
-            "domain_principles": persona.get("domain_principles", []),
-            "alignment_drivers": persona.get("alignment_drivers", []),
-            "resistance_triggers": persona.get("resistance_triggers", []),
+            "persona_summary": str(persona.get("persona") or "")[:200],
+            "decision_style": str(behavioral.get("decision_style") or "pragmatic"),
+            "communication_style": str(
+                behavioral.get("communication_style") or behavioral.get("communication") or "structured"
+            ),
+            "risk_tolerance": str(behavioral.get("risk_tolerance") or "moderate"),
+            "domain_principles": _coerce_str_list(persona.get("domain_principles")),
+            "alignment_drivers": _coerce_str_list(persona.get("alignment_drivers")),
+            "resistance_triggers": _coerce_str_list(persona.get("resistance_triggers")),
             "coalition_allies": allies,
             "wtt_score": wtt_score,
             "wtt_breakdown": wtt_breakdown,
@@ -1510,49 +1755,16 @@ async def emit_stakeholder_psychology(
         }
         profiles.append(profile)
 
-    if not profiles and stakeholder_map:
-        for s in stakeholder_map:
-            role = str(s.get("role") or s.get("id") or "stakeholder")
-            tier = int(s.get("tier") or 2)
-            behavioral = _default_behavioral_for_tier(tier)
-            profiles.append({
-                "stakeholder_id": role,
-                "stakeholder_label": s.get("label") or format_role_display(role),
-                "tier": tier,
-                "persona_summary": s.get("persona", "")[:200],
-                "decision_style": behavioral.get("decision_style", "pragmatic"),
-                "communication_style": behavioral.get("communication", "structured"),
-                "risk_tolerance": behavioral.get("risk_tolerance", "moderate"),
-                "domain_principles": s.get("domain_principles", []),
-                "alignment_drivers": s.get("alignment_drivers", []),
-                "resistance_triggers": s.get("resistance_triggers", []),
-                "coalition_allies": [],
-                "wtt_score": 75 if tier == 1 else (65 if tier == 2 else 55),
-                "wtt_breakdown": {
-                    "trust_level": 70 if tier == 1 else (60 if tier == 2 else 50),
-                    "resistance_absence": 75 if tier == 1 else (65 if tier == 2 else 55),
-                    "principle_engagement": 80 if tier == 1 else (70 if tier == 2 else 60),
-                    "trust_integrity": 100,
-                },
-                "malicious_compliance_risk": "low" if tier <= 2 else "medium",
-                "malicious_compliance_signals": {
-                    "displayed_stance": "supportive" if tier == 1 else "neutral",
-                    "wall_severity": 1.0 if tier == 1 else 2.5,
-                    "inner_sentiment_avg": 0.4 if tier == 1 else 0.1,
-                },
-                "sentiment_trajectory": {
-                    "initial": 0.2 if tier == 1 else 0.0,
-                    "final": 0.6 if tier == 1 else 0.3,
-                    "min": 0.1 if tier == 1 else -0.1,
-                    "max": 0.7 if tier == 1 else 0.4,
-                    "max_delta_tick": 1,
-                    "trend": "rising",
-                },
-                "trust_breaches": 0,
-                "terminal_state": "aligned" if tier <= 2 else None,
-                "advocacy_actions": [],
-                "escalation_events": [],
-            })
+    if not profiles:
+        return {
+            "status": "error",
+            "error": "no_telemetry",
+            "message": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting stakeholder psychology.",
+            "stakeholder_psychology": {
+                "profiles": [],
+                "summary": "No simulation telemetry available. Run the simulation to record stakeholder decisions and sentiment before requesting stakeholder psychology.",
+            },
+        }
 
     # 7. Sort by WTT score (lowest first — most at-risk stakeholders on top).
     profiles.sort(key=lambda p: p["wtt_score"])

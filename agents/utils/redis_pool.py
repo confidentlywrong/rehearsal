@@ -94,7 +94,16 @@ def get_shared_redis_client() -> redis.Redis | None:
             redis_url = "rediss://" + redis_url[len("redis://") :]
     else:
         redis_url = ("rediss://" if tls_enabled else "redis://") + redis_url
-    max_conn = int(os.environ.get("REDIS_MAX_CONNECTIONS", "50"))
+    raw_max_conn = os.environ.get("REDIS_MAX_CONNECTIONS", "50").strip()
+    if raw_max_conn:
+        try:
+            max_conn = int(raw_max_conn)
+        except ValueError as exc:
+            raise ValueError(f"Invalid REDIS_MAX_CONNECTIONS={raw_max_conn!r}") from exc
+        if max_conn < 1:
+            raise ValueError(f"REDIS_MAX_CONNECTIONS must be >= 1, got {max_conn}")
+    else:
+        max_conn = 50
     redis_password = os.environ.get("REDIS_PASSWORD")
     pool = redis.BlockingConnectionPool.from_url(
         redis_url,
@@ -111,10 +120,14 @@ def get_shared_redis_client() -> redis.Redis | None:
 async def aclose() -> None:
     """Gracefully close the shared Redis client and its connection pool.
 
+    Also prunes any entries bound to already-closed event loops so long-lived
+    multi-loop processes or test suites do not leak closed-loop entries.
     Safe to call multiple times or when no client was ever created.
-    After this call, ``get_shared_redis_client()`` will re-create the pool
-    on the next invocation.
     """
+    for cached_loop in list(_shared_clients.keys()):
+        if cached_loop is not None and cached_loop.is_closed():
+            _shared_clients.pop(cached_loop, None)
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

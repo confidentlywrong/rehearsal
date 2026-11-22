@@ -17,14 +17,26 @@
 """In-memory route memory store.
 
 Provides ``RouteMemoryStore``, an in-memory repository for planned routes and
-their simulation history.  This is a Phase-1 stub — production will swap in a
-persistent backend.
+their simulation history. Production deployments use ``AlloyDBRouteStore``
+(``store_alloydb.py``) for persistent PostgreSQL/AlloyDB storage, while
+``RouteMemoryStore`` serves as the in-memory store and unit-test double.
 """
 
+import math
 import uuid
 from datetime import datetime, timezone
 
 from agents.planner_with_memory.memory.schemas import PlannedRoute, SimulationRecord
+
+
+def _sanitize_score(score: float | None) -> float | None:
+    if score is None or isinstance(score, bool):
+        return None
+    try:
+        val = float(score)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return val if math.isfinite(val) else None
 
 
 class RouteMemoryStore:
@@ -58,7 +70,7 @@ class RouteMemoryStore:
             route_id=route_id,
             route_data=route_data,
             created_at=datetime.now(tz=timezone.utc),
-            evaluation_score=evaluation_score,
+            evaluation_score=_sanitize_score(evaluation_score),
             evaluation_result=evaluation_result,
             owner_id=owner_id,
         )
@@ -128,6 +140,19 @@ class RouteMemoryStore:
                 (highest evaluation_score first; unscored routes sort last).
             owner_id: Per-user tenancy scope; ``None`` returns all routes.
         """
+        if count is None or isinstance(count, bool):
+            safe_count = 10
+        elif isinstance(count, int):
+            safe_count = max(0, count)
+        elif isinstance(count, float):
+            safe_count = max(0, int(count)) if math.isfinite(count) else 10
+        else:
+            try:
+                safe_count = max(0, int(count))
+            except (ValueError, TypeError, OverflowError):
+                safe_count = 10
+        if safe_count == 0:
+            return []
         if owner_id is None:
             routes = list(self._routes.values())
         else:
@@ -135,14 +160,14 @@ class RouteMemoryStore:
         if sort_by == "best_score":
             routes.sort(
                 key=lambda r: (
-                    r.evaluation_score is not None,
-                    r.evaluation_score if r.evaluation_score is not None else 0.0,
+                    _sanitize_score(r.evaluation_score) is not None,
+                    _sanitize_score(r.evaluation_score) or 0.0,
                 ),
                 reverse=True,
             )
         else:  # "recent"
             routes.sort(key=lambda r: r.created_at, reverse=True)
-        return routes[:count]
+        return routes[:min(safe_count, len(routes))]
 
     def get_best_route(self, owner_id: str | None = None) -> PlannedRoute | None:
         """Return the route with the highest evaluation score, or ``None``.
@@ -151,9 +176,13 @@ class RouteMemoryStore:
         is set, only the caller's routes are considered.
         """
         if owner_id is None:
-            scored = [r for r in self._routes.values() if r.evaluation_score is not None]
+            scored = [r for r in self._routes.values() if _sanitize_score(r.evaluation_score) is not None]
         else:
-            scored = [r for r in self._routes.values() if r.evaluation_score is not None and r.owner_id == owner_id]
+            scored = [
+                r
+                for r in self._routes.values()
+                if _sanitize_score(r.evaluation_score) is not None and r.owner_id == owner_id
+            ]
         if not scored:
             return None
-        return max(scored, key=lambda r: r.evaluation_score)  # type: ignore[arg-type]
+        return max(scored, key=lambda r: _sanitize_score(r.evaluation_score) or 0.0)

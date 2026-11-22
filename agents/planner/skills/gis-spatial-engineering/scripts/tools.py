@@ -70,6 +70,7 @@ def _haversine(coord1: tuple[float, float], coord2: tuple[float, float]) -> floa
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = min(1.0, max(0.0, a))
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
@@ -297,17 +298,35 @@ def _build_graph(
     nodes: Set[tuple] = set()
     strip_nodes: Set[tuple] = set()
 
-    for feat in data.get("features", []):
-        geom_type = feat.get("geometry", {}).get("type")
+    if not isinstance(data, dict):
+        return adj, landmarks, road_names, strip_nodes
+
+    for feat in data.get("features") or []:
+        if not isinstance(feat, dict):
+            continue
+        geom = feat.get("geometry")
+        props = feat.get("properties")
+        if not isinstance(geom, dict):
+            continue
+        if not isinstance(props, dict):
+            props = {}
+        geom_type = geom.get("type")
         if geom_type == "LineString":
             # Skip motorways (I-15, etc.) — not usable for marathon routes
-            if feat.get("properties", {}).get("highway") == "motorway":
+            if props.get("highway") == "motorway":
                 continue
-            name = feat.get("properties", {}).get("name")
-            coords = feat["geometry"]["coordinates"]
+            name = props.get("name")
+            coords = geom.get("coordinates")
+            if not isinstance(coords, list) or len(coords) < 2:
+                continue
             for i in range(len(coords) - 1):
-                p1 = tuple(coords[i])
-                p2 = tuple(coords[i + 1])
+                c1, c2 = coords[i], coords[i + 1]
+                if not isinstance(c1, (list, tuple)) or not isinstance(c2, (list, tuple)):
+                    continue
+                if len(c1) < 2 or len(c2) < 2:
+                    continue
+                p1 = (float(c1[0]), float(c1[1]))
+                p2 = (float(c2[0]), float(c2[1]))
                 edge_key = tuple(sorted((p1, p2)))
                 if name:
                     road_names[edge_key] = name
@@ -322,9 +341,11 @@ def _build_graph(
                     dist = _haversine(p1, p2)
                     adj.setdefault(p1, []).append((p2, dist))
                     adj.setdefault(p2, []).append((p1, dist))
-        elif geom_type == "Point" and "name" in feat.get("properties", {}):
-            name = feat["properties"]["name"]
-            landmarks[name] = tuple(feat["geometry"]["coordinates"])
+        elif geom_type == "Point" and "name" in props:
+            coords = geom.get("coordinates")
+            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                name = props["name"]
+                landmarks[name] = (float(coords[0]), float(coords[1]))
 
     # Sort adj lists for determinism
     for k in adj:
@@ -1230,6 +1251,8 @@ def _split_route_by_road(
     LineString Feature with ``properties.name`` set to the road name.
     The first segment also carries the overall route metadata.
     """
+    if not route_coords:
+        return []
     segments: List[dict] = []
     current_name: Optional[str] = None
     current_coords: List[list] = [list(route_coords[0])]
@@ -1317,13 +1340,14 @@ async def plan_marathon_route(
         runner_count: Number of participants (scales infrastructure).
         tool_context: ADK tool context.
     """
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
     # Idempotency guard: return cached route if already planned (unless force_replan)
-    if not force_replan and tool_context and tool_context.state.get("marathon_route"):
+    if not force_replan and state is not None and hasattr(state, "get") and state.get("marathon_route"):
         logger.info("PLANNER: Route already planned, returning cached result.")
         return {
             "status": "already_planned",
             "message": "Marathon route was already planned in this session. Use report_marathon_route to emit it.",
-            "geojson": tool_context.state["marathon_route"],
+            "geojson": state["marathon_route"],
         }
 
     logger.info("PLANNER: Generating marathon route...")
@@ -1336,21 +1360,36 @@ async def plan_marathon_route(
 
             skill_dir = Path(os.path.dirname(__file__)).parent
             data_path = skill_dir / "assets" / "network.json"
-            if os.path.exists(data_path):
-                with open(data_path, "r") as f:
-                    geojson_data = f.read()
-                logger.info("PLANNER: Using built-in Las Vegas road network.")
-            else:
-                logger.warning(f"PLANNER: network.json not found at {data_path}. Using fallback.")
-                geojson_data = '{"type": "FeatureCollection", "features": []}'
+            if not os.path.exists(data_path):
+                logger.error("PLANNER: network.json not found at %s", data_path)
+                return {
+                    "status": "error",
+                    "message": f"Built-in road network file network.json not found at {data_path}.",
+                }
+            with open(data_path, "r") as f:
+                geojson_data = f.read()
+            logger.info("PLANNER: Using built-in Las Vegas road network.")
         except Exception as e:
-            logger.error(f"PLANNER: Failed to load network.json: {e}")
-            geojson_data = '{"type": "FeatureCollection", "features": []}'
+            logger.error("PLANNER: Failed to load network.json: %s", e)
+            return {
+                "status": "error",
+                "message": f"Failed to load built-in road network (network.json): {e}",
+            }
 
     try:
         data = json.loads(geojson_data)
+        if not isinstance(data, dict):
+            return {
+                "status": "error",
+                "message": "GeoJSON payload must be a JSON object.",
+            }
         adj, landmarks, road_names, strip_nodes = _build_graph(data)
         nodes = set(adj.keys())
+        if not nodes:
+            return {
+                "status": "error",
+                "message": "GeoJSON road network contains no valid LineString segments.",
+            }
 
         # Route generation - zone-sweep algorithm with tournament strategy
         route_coords, final_dist = _generate_best_route(
@@ -1363,6 +1402,11 @@ async def plan_marathon_route(
             finish_landmark=finish_landmark,
             max_candidates=10,
         )
+        if not route_coords:
+            return {
+                "status": "error",
+                "message": "Failed to generate a marathon route from the provided road network.",
+            }
 
         # ---- Post-tournament validation ---------------------------------
         # `_generate_zone_sweep_route` no longer raises when its 100
@@ -1442,8 +1486,8 @@ async def plan_marathon_route(
             output = infra_result["geojson"]
 
         # Cache in session state for later/other agent recall
-        if tool_context:
-            tool_context.state["marathon_route"] = output
+        if state is not None and hasattr(state, "__setitem__"):
+            state["marathon_route"] = output
 
         # Downgrade to "degraded" when re-validation found issues, so
         # downstream (evaluator, UI, A2A callers) can distinguish a
@@ -1504,7 +1548,7 @@ def _place_hydration_stations(
     Note: runner_count is accepted for API consistency but does not
     affect station count.  WA TR 55 mandates spacing, not per-runner scaling.
     """
-    if not index:
+    if not index or index[-1][1] <= 0.0:
         return []
     total_mi = index[-1][1]
     features: list[dict] = []
@@ -1536,7 +1580,7 @@ def _place_medical_stations(
       - major: Start area (mi 0.5), mile ~20 ("the wall"), finish line
       - course: Distributed at strategic mile markers
     """
-    if not index:
+    if not index or index[-1][1] <= 0.0:
         return []
     total_mi = index[-1][1]
     finish_mi = min(total_mi, TARGET_DIST_MI)
@@ -1605,7 +1649,7 @@ def _place_portable_toilets(
     Stations are evenly distributed but nudged away from hydration
     mile markers to avoid co-location congestion.
     """
-    if not index:
+    if not index or index[-1][1] <= 0.0:
         return []
     total_mi = index[-1][1]
     finish_mi = min(total_mi, TARGET_DIST_MI)
@@ -1629,7 +1673,7 @@ def _place_portable_toilets(
         # Nudge to nearest offset point to avoid hydration overlap
         mi = round(mi / offset) * offset + (offset / 2)
         if mi > finish_mi:
-            mi = finish_mi - 0.5
+            mi = max(0.0, finish_mi - 0.5)
         coord = _point_at_mile(index, mi)
         features.append(
             {
@@ -1666,7 +1710,7 @@ def _place_cheer_zones(
     Critical placements: halfway (~mi 13.1), the wall (~mi 20),
     finish approach (~mi 25). Remaining zones distributed evenly.
     """
-    if not index:
+    if not index or index[-1][1] <= 0.0:
         return []
     total_mi = index[-1][1]
     finish_mi = min(total_mi, TARGET_DIST_MI)
@@ -1734,7 +1778,32 @@ async def add_course_infrastructure(
         runner_count: Number of participants (scales infrastructure).
         tool_context: ADK tool context (unused, kept for API consistency).
     """
-    runner_count = max(1, int(runner_count))
+    if not isinstance(route_geojson, dict):
+        return {"status": "error", "message": "route_geojson must be a GeoJSON object"}
+    if isinstance(runner_count, bool):
+        runner_count = 10000
+    elif isinstance(runner_count, int):
+        runner_count = max(1, runner_count)
+    elif isinstance(runner_count, float):
+        if not math.isfinite(runner_count):
+            return {"status": "error", "message": "runner_count must be a finite number"}
+        runner_count = max(1, int(runner_count))
+    elif isinstance(runner_count, str):
+        cleaned = runner_count.strip().replace(",", "")
+        if not cleaned:
+            return {"status": "error", "message": "runner_count must be a finite integer"}
+        try:
+            fv = float(cleaned)
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "error", "message": f"Invalid runner_count: {runner_count!r}"}
+        if not math.isfinite(fv):
+            return {"status": "error", "message": f"Invalid runner_count: {runner_count!r}"}
+        try:
+            runner_count = max(1, int(fv))
+        except (ValueError, OverflowError):
+            return {"status": "error", "message": f"Invalid runner_count: {runner_count!r}"}
+    else:
+        return {"status": "error", "message": "runner_count must be a finite integer"}
     logger.info("PLANNER: Adding course infrastructure (runners=%d)...", runner_count)
     coords = _extract_route_coords(route_geojson)
     if not coords:
@@ -1749,7 +1818,8 @@ async def add_course_infrastructure(
     cheer = _place_cheer_zones(index, runner_count)
 
     all_features = hydration + medical + toilets + cheer
-    route_geojson["features"].extend(all_features)
+    existing_features = list(route_geojson.get("features") or [])
+    out_geojson = {**route_geojson, "features": existing_features + all_features}
 
     counts = {
         "water_stations": len(hydration),
@@ -1762,7 +1832,7 @@ async def add_course_infrastructure(
     return {
         "status": "success",
         "message": f"Added {len(all_features)} infrastructure points ({counts}).",
-        "geojson": route_geojson,
+        "geojson": out_geojson,
     }
 
 
@@ -1778,7 +1848,8 @@ async def report_marathon_route(
     """
     logger.info("PLANNER: Reporting final marathon route...")
 
-    route_geojson = tool_context.state.get("marathon_route")
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    route_geojson = state.get("marathon_route") if state is not None and hasattr(state, "get") else None
     if not route_geojson:
         return {
             "status": "error",
@@ -1816,6 +1887,7 @@ async def _gemini_traffic_enrichment(closed_segments: list, affected_intersectio
     """
     from google import genai
     from agents.utils.local_ai import generate_local_json_async, is_local_gemma_active
+    from agents.utils.models import DEFAULT_PLANNER_MODEL, get_model
     from agents.utils.retry import resilient_http_options
 
     prompt = (
@@ -1830,23 +1902,27 @@ async def _gemini_traffic_enrichment(closed_segments: list, affected_intersectio
     )
 
     if is_local_gemma_active():
-        text = (await generate_local_json_async(prompt, temperature=0.3, max_tokens=1024)).strip()
+        text = (await generate_local_json_async(prompt, temperature=0.3, max_tokens=1024, timeout=120.0)).strip()
     else:
         # Use Vertex AI on the global endpoint when a project is configured
         # (unless GOOGLE_GENAI_USE_VERTEXAI=false). Fall back to standard Client
         # initialization (e.g., GEMINI_API_KEY) when no GCP project is set.
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID") or ""
-        use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() not in ("0", "false", "no")
+        project_id = (
+            (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+            or (os.environ.get("PROJECT_ID") or "").strip()
+        )
+        location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip() or "global"
+        use_vertex = (os.environ.get("GOOGLE_GENAI_USE_VERTEXAI") or "").strip().lower() not in ("0", "false", "no")
         client_kwargs: dict = {"http_options": resilient_http_options()}
         if project_id and use_vertex:
             client_kwargs["vertexai"] = True
             client_kwargs["project"] = project_id
-            client_kwargs["location"] = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+            client_kwargs["location"] = location
         client = genai.Client(**client_kwargs)
-        model_name = (
-            os.environ.get("TRAFFIC_ENRICHMENT_MODEL")
-            or os.environ.get("PLANNER_MODEL")
-            or "gemini-3-flash-preview"
+        model_name = get_model(
+            "TRAFFIC_ENRICHMENT_MODEL",
+            DEFAULT_PLANNER_MODEL,
+            fallback_env_vars=("PLANNER_MODEL",),
         )
         response = await client.aio.models.generate_content(
             model=model_name,
@@ -1860,7 +1936,10 @@ async def _gemini_traffic_enrichment(closed_segments: list, affected_intersectio
     if text.endswith("```"):
         text = text[:-3].strip()
 
-    return json.loads(text)
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected JSON object from traffic enrichment, got {type(parsed).__name__}")
+    return parsed
 
 
 async def assess_traffic_impact(
@@ -1879,7 +1958,8 @@ async def assess_traffic_impact(
     """
     from agents.utils.traffic import identify_closed_segments
 
-    route_geojson = tool_context.state.get("marathon_route")
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    route_geojson = state.get("marathon_route") if state is not None and hasattr(state, "get") else None
     if not route_geojson:
         return {
             "status": "error",
@@ -1911,17 +1991,19 @@ async def assess_traffic_impact(
     affected = traffic_result["affected"]
     intersections = traffic_result["intersections"]
 
-    # Gemini enrichment with graceful degradation.
+    # Gemini enrichment with explicit degradation flagging.
     # Pass ALL closures (including route lines) to Gemini for context.
     all_closures = closed + route_closures
     narrative = ""
     congestion_zones: list = []
+    enrichment_status = "ok"
     try:
         enrichment = await _gemini_traffic_enrichment(all_closures, intersections)
         narrative = enrichment.get("narrative", "")
         congestion_zones = enrichment.get("congestion_zones", [])
     except Exception as exc:
         logger.warning("Gemini traffic enrichment failed: %s", exc)
+        enrichment_status = "degraded"
         narrative = (
             f"Gemini enrichment unavailable: {exc}. "
             f"Code-only analysis: {len(all_closures)} closed segments, "
@@ -1938,6 +2020,7 @@ async def assess_traffic_impact(
 
     result = {
         "status": "success",
+        "enrichment_status": enrichment_status,
         "closed_segments": closed,
         "affected_segments": affected,
         "affected_intersections": intersections,
@@ -1947,7 +2030,7 @@ async def assess_traffic_impact(
     }
 
     # Store assessment in session state for downstream tools
-    if tool_context:
-        tool_context.state["traffic_assessment"] = result
+    if state is not None and hasattr(state, "__setitem__"):
+        state["traffic_assessment"] = result
 
     return result

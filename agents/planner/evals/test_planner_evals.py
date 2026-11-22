@@ -25,6 +25,8 @@ import pathlib
 
 import pytest
 
+from agents.utils.models import DEFAULT_FLASH_LITE_MODEL
+
 EVALS_DIR = pathlib.Path(__file__).parent
 
 
@@ -124,7 +126,7 @@ def test_eval_dataset_standard_planning_trajectory():
 # not valid" errors.  Use gemini-3.5-flash-lite for evals until ADK or the Gemini 3
 # API resolves this.  The trajectory evaluation tests tool-call ordering, not
 # model-specific behavior, so the model choice is acceptable.
-_EVAL_MODEL = "gemini-3.5-flash-lite"
+_EVAL_MODEL = DEFAULT_FLASH_LITE_MODEL
 
 # Expected tool call sequences (name-only, IN_ORDER).
 # ADK's built-in TrajectoryEvaluator requires exact args matching which is too

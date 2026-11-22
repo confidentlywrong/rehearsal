@@ -55,8 +55,8 @@ func TestChunkDocument_MultipleParagraphsMerged(t *testing.T) {
 }
 
 func TestChunkDocument_ParagraphsSplit(t *testing.T) {
-	// Two paragraphs of 5 words each with maxTokens=5 should
-	// yield 2 chunks with overlap.
+	// Two paragraphs of 5 words each with maxTokens=5 (<= chunkOverlap)
+	// yield 2 chunks without exceeding maxTokens.
 	p1 := "one two three four five"
 	p2 := "six seven eight nine ten"
 	text := p1 + "\n\n" + p2
@@ -68,7 +68,6 @@ func TestChunkDocument_ParagraphsSplit(t *testing.T) {
 	if got[0] != p1 {
 		t.Fatalf("chunk[0] = %q, want %q", got[0], p1)
 	}
-	// Second chunk should have overlap from chunk[0].
 	if !strings.Contains(got[1], "six seven eight nine ten") {
 		t.Fatalf("chunk[1] missing p2 content: %q", got[1])
 	}
@@ -123,5 +122,27 @@ func TestChunkDocument_MultipleBlankLines(t *testing.T) {
 	}
 	if !strings.Contains(got[0], "first para") || !strings.Contains(got[0], "second para") {
 		t.Fatalf("missing content: %q", got[0])
+	}
+}
+
+func TestChunkDocument_OverlapAppliedWhenMaxTokensExceedsOverlap(t *testing.T) {
+	// 120 distinct words with maxTokens=100 (> chunkOverlap=50) should
+	// produce overlapping chunks bounded by maxTokens.
+	words := make([]string, 120)
+	for i := range words {
+		words[i] = "w" + string(rune('a'+i%26))
+	}
+	words[49] = "BOUNDARY_TAIL"
+	got := ChunkDocument(strings.Join(words, " "), 100)
+	if len(got) < 2 {
+		t.Fatalf("expected >=2 chunks, got %d", len(got))
+	}
+	for idx, ch := range got {
+		if wc := len(strings.Fields(ch)); wc > 100 {
+			t.Fatalf("chunk[%d] exceeded maxTokens=100: %d words", idx, wc)
+		}
+	}
+	if !strings.Contains(got[1], "BOUNDARY_TAIL") {
+		t.Fatalf("expected chunk[1] to include trailing overlap token BOUNDARY_TAIL from chunk[0], got %q", got[1])
 	}
 }

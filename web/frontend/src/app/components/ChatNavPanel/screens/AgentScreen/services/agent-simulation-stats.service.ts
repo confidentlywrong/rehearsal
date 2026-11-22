@@ -1,7 +1,20 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changed for The Rehearsal: cancel progress RAF on simulation finish and reset active runner/follow-leader flags on stats reset.
  */
 
 import { Injectable, NgZone, ChangeDetectorRef, inject } from '@angular/core';
@@ -164,6 +177,10 @@ export class AgentSimulationStatsService {
 
   onSimFinished = (): void => {
     this.ngZone.run(() => {
+      if (this.simProgressRafId != null) {
+        cancelAnimationFrame(this.simProgressRafId);
+        this.simProgressRafId = null;
+      }
       this.showSimPanel = false;
       this.isSimulationRunning = false;
       this.mark();
@@ -174,6 +191,8 @@ export class AgentSimulationStatsService {
     this.simulationProgress = 0;
     this.averageDistance = 0;
     this.numberOfFinishers = 0;
+    this.numberOfActiveRunners = 0;
+    this.isFollowingLeader = false;
     this.runnersFinishedAwaitingHud.clear();
     this.runnerCourseProgressByGuid.clear();
     this.averagePace = '0:00';

@@ -235,3 +235,30 @@ run "rejects_group_operator_principal" {
 
   expect_failures = [var.operator_principals]
 }
+
+run "billing_webhook_service_gets_allusers_when_present" {
+  command = plan
+
+  variables {
+    service_names = {
+      gateway                     = "gateway"
+      runner_autopilot            = "runner-autopilot"
+      runner_cloudrun             = "runner-cloudrun"
+      leadership_runner_autopilot = "leadership-runner-autopilot"
+      leadership_runner           = "leadership-runner"
+      ai_echo                     = "ai-echo"
+      ai_echo_reactive            = "ai-echo-reactive"
+      ai_echo_autopilot           = "ai-echo-autopilot"
+      frontend                    = "frontend"
+      admin                       = "admin"
+      dash                        = "dash"
+      tester                      = "tester"
+      billing                     = "billing"
+    }
+  }
+
+  assert {
+    condition     = length(google_cloud_run_v2_service_iam_member.billing_public) == 1 && google_cloud_run_v2_service_iam_member.billing_public[0].member == "allUsers"
+    error_message = "billing webhook service must receive allUsers run.invoker when present in service_names"
+  }
+}

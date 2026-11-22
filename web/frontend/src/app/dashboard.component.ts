@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: guard labels:update CustomEvent detail against non-array payloads.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,7 +74,8 @@ export class DashboardComponent implements OnDestroy {
   // Without this the listener would leak on every route change away
   // from / and back (B-14, 2026-06-22 audit).
   private readonly onLabelsUpdate = (e: Event): void => {
-    this.labels = (e as CustomEvent).detail;
+    const detail = (e as CustomEvent).detail;
+    this.labels = Array.isArray(detail) ? detail : [];
     this.cdr.markForCheck();
   };
 

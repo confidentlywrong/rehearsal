@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -383,3 +385,93 @@ class TestRealSeeds:
                     f"Seed {route_id}: water station gap {gap:.2f} mi "
                     f"(expected ~3.1 mi) between mi {water_miles[i - 1]} and {water_miles[i]}"
                 )
+
+
+class TestSeedRoutesAlloyDBSchema:
+    """Verify AlloyDB seed_routes sets ALLOYDB_SCHEMA search_path and validates identifier."""
+
+    @pytest.mark.asyncio
+    async def test_seed_routes_passes_schema_search_path(self, monkeypatch, tmp_path):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import sys
+        import types as pytypes
+
+        from agents.planner_with_memory.alloydb import seed_routes as sr_mod
+
+        monkeypatch.setenv("ALLOYDB_HOST", "127.0.0.1")
+        monkeypatch.setenv("ALLOYDB_PASSWORD", "secret")
+        monkeypatch.setenv("ALLOYDB_SCHEMA", "rehearsal_prod")
+
+        mock_conn = MagicMock()
+        mock_conn.execute = AsyncMock()
+        mock_conn.close = AsyncMock()
+        mock_connect = AsyncMock(return_value=mock_conn)
+
+        fake_asyncpg = pytypes.ModuleType("asyncpg")
+        fake_asyncpg.connect = mock_connect  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(sys.modules, {"asyncpg": fake_asyncpg}),
+            patch.object(sr_mod, "_SEEDS_DIR", tmp_path),
+        ):
+            count = await sr_mod.seed_routes()
+
+        assert count == 0
+        mock_connect.assert_awaited_once()
+        assert mock_connect.await_args.kwargs["server_settings"] == {
+            "search_path": "rehearsal_prod, public"
+        }
+
+    @pytest.mark.asyncio
+    async def test_seed_routes_rejects_invalid_schema_identifier(self, monkeypatch):
+        import sys
+        import types as pytypes
+        from unittest.mock import patch
+
+        from agents.planner_with_memory.alloydb import seed_routes as sr_mod
+
+        monkeypatch.setenv("ALLOYDB_HOST", "127.0.0.1")
+        monkeypatch.setenv("ALLOYDB_PASSWORD", "secret")
+        monkeypatch.setenv("ALLOYDB_SCHEMA", "bad; DROP SCHEMA public;--")
+
+        fake_asyncpg = pytypes.ModuleType("asyncpg")
+        with patch.dict(sys.modules, {"asyncpg": fake_asyncpg}):
+            with pytest.raises(ValueError, match="Invalid ALLOYDB_SCHEMA"):
+                await sr_mod.seed_routes()
+
+    @pytest.mark.asyncio
+    async def test_seed_routes_defaults_to_public_and_tags_owner_id(self, monkeypatch, tmp_path):
+        import sys
+        import types as pytypes
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from agents.planner_with_memory.alloydb import seed_routes as sr_mod
+
+        monkeypatch.setenv("ALLOYDB_HOST", "127.0.0.1")
+        monkeypatch.setenv("ALLOYDB_PASSWORD", "secret")
+        monkeypatch.delenv("ALLOYDB_SCHEMA", raising=False)
+
+        seed_file = tmp_path / "seed_one.json"
+        seed_file.write_text(json.dumps(_make_seed()))
+
+        mock_conn = MagicMock()
+        mock_conn.execute = AsyncMock()
+        mock_conn.close = AsyncMock()
+        mock_connect = AsyncMock(return_value=mock_conn)
+
+        fake_asyncpg = pytypes.ModuleType("asyncpg")
+        fake_asyncpg.connect = mock_connect  # type: ignore[attr-defined]
+
+        with (
+            patch.dict(sys.modules, {"asyncpg": fake_asyncpg}),
+            patch.object(sr_mod, "_SEEDS_DIR", tmp_path),
+        ):
+            count = await sr_mod.seed_routes()
+
+        assert count == 1
+        assert mock_connect.await_args.kwargs["server_settings"] == {
+            "search_path": "public, public"
+        }
+        exec_sql = mock_conn.execute.await_args.args[0]
+        assert "'__seed__'" in exec_sql
+        assert "COALESCE(planned_routes.owner_id, EXCLUDED.owner_id)" in exec_sql

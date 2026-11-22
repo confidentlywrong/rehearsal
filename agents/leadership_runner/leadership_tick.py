@@ -19,8 +19,10 @@ physics with organizational dynamics.  Returns identical state keys so
 the frontend 3D viewport, HUD, and Redis telemetry pipeline work unchanged.
 """
 
+import inspect
 import json
 import logging
+import math
 
 from google.adk.tools.tool_context import ToolContext
 
@@ -33,6 +35,134 @@ from agents.leadership_runner.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_float(value: object, default: float = 0.0) -> float:
+    """Coerce numeric value to finite float, falling back to default."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if math.isfinite(num) else default
+
+
+def _finite_int(value: object, default: int = 0) -> int:
+    """Coerce int/float value to int, rejecting bool/None/NaN/Inf."""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        try:
+            num = float(value)
+        except OverflowError:
+            return default
+        return value if math.isfinite(num) else default
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return int(num)
+
+
+def _strip_nonfinite(obj: object) -> object:
+    """Recursively replace non-finite floats (NaN/Inf) with None for RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _strip_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strip_nonfinite(v) for v in obj]
+    return obj
+
+
+def _progress_in_gatekeeper_zone(progress: float, data: object) -> bool:
+    """Return True if *progress* falls within a gatekeeper's route zone.
+
+    Supports dict segments (``{"start_mi": ..., "end_mi": ...}``), 2-element
+    numeric ``[start_mi, end_mi]`` lists/tuples, discrete mile-marker lists,
+    and scalar numeric mile markers.
+    """
+    if not isinstance(progress, (int, float)) or isinstance(progress, bool):
+        return False
+    try:
+        progress_f = float(progress)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(progress_f):
+        return False
+    if isinstance(data, dict):
+        try:
+            start_mi = float(data.get("start_mi", 0.0))
+            end_mi = float(data.get("end_mi", 0.0))
+            return math.isfinite(start_mi) and math.isfinite(end_mi) and start_mi <= progress_f <= end_mi
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if isinstance(data, (list, tuple)):
+        numeric_items: list[float] = []
+        for x in data:
+            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                try:
+                    xf = float(x)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(xf):
+                    numeric_items.append(xf)
+        if len(numeric_items) == 2 and numeric_items[0] <= numeric_items[1]:
+            return numeric_items[0] <= progress_f <= numeric_items[1]
+        return any(int(m) == int(progress_f) for m in numeric_items)
+    if isinstance(data, (int, float)) and not isinstance(data, bool):
+        try:
+            val = float(data)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(val) and int(val) == int(progress_f)
+    if isinstance(data, str):
+        try:
+            val = float(data)
+            return math.isfinite(val) and int(val) == int(progress_f)
+        except (ValueError, OverflowError):
+            return False
+    return False
+
+
+async def _push_to_collector_buffer(
+    collector_buffer_key: str,
+    tool_context: ToolContext,
+    result: dict,
+) -> None:
+    """Direct-write tick result to RaceCollector Redis buffer (sync/async safe)."""
+    if not collector_buffer_key:
+        return
+    try:
+        r = get_shared_redis_client()
+        if r is not None:
+            session_id = getattr(getattr(tool_context, "session", None), "id", "") or ""
+            payload_obj = {
+                "session_id": session_id,
+                "payload": {
+                    "tool_name": "process_leadership_tick",
+                    "result": result,
+                },
+            }
+            try:
+                direct_msg = json.dumps(payload_obj, allow_nan=False, default=str)
+            except ValueError:
+                direct_msg = json.dumps(_strip_nonfinite(payload_obj), allow_nan=False, default=str)
+            maybe_push = r.rpush(collector_buffer_key, direct_msg)  # type: ignore[misc]
+            if inspect.isawaitable(maybe_push):
+                await maybe_push
+            maybe_exp = r.expire(collector_buffer_key, 7200)
+            if inspect.isawaitable(maybe_exp):
+                await maybe_exp
+    except Exception:
+        logger.warning(
+            "process_leadership_tick: direct-write RPUSH failed for %s",
+            collector_buffer_key,
+            exc_info=True,
+        )
 
 
 async def _emit_leadership_narrative(
@@ -84,13 +214,15 @@ async def accelerate(intensity: float, tool_context: ToolContext) -> dict:
         intensity: Acceleration intensity (0.0 to 1.0).
         tool_context: ADK tool context for state management.
     """
-    persona = tool_context.state.get("persona", "pragmatist")
+    raw_persona = tool_context.state.get("persona", "pragmatist")
+    persona = raw_persona if isinstance(raw_persona, str) and raw_persona else "pragmatist"
     profile = get_persona_profile(persona)
-    scale_factor = profile["momentum_scale"] / 4.0  # Normalize to pragmatist default
+    scale_factor = max(profile["momentum_scale"], 1e-6) / 4.0  # Normalize to pragmatist default
 
-    momentum = tool_context.state.get("velocity", 0.0)
-    political_capital = tool_context.state.get("water", 100.0)
-    crowd_responsiveness = tool_context.state.get("crowd_responsiveness", 0.5)
+    safe_intensity = max(0.0, _finite_float(intensity, 0.0))
+    momentum = max(0.0, _finite_float(tool_context.state.get("velocity", 0.0), 0.0))
+    political_capital = max(0.0, min(100.0, _finite_float(tool_context.state.get("water", 100.0), 100.0)))
+    crowd_responsiveness = max(0.0, _finite_float(tool_context.state.get("crowd_responsiveness", 0.5), 0.5))
 
     boost_multiplier = 0.1 * scale_factor
     max_momentum = 1.0 * scale_factor
@@ -98,7 +230,7 @@ async def accelerate(intensity: float, tool_context: ToolContext) -> dict:
     # Capital penalty: linearly scale from 1.0 (full capital) to 0.5 (no capital)
     capital_factor = 0.5 + 0.5 * (political_capital / 100.0)
     effective_responsiveness = max(0.2, crowd_responsiveness)  # Minimum 20% response
-    new_momentum = min(max_momentum, momentum + (intensity * boost_multiplier * capital_factor * effective_responsiveness))
+    new_momentum = min(max_momentum, momentum + (safe_intensity * boost_multiplier * capital_factor * effective_responsiveness))
     tool_context.state["velocity"] = new_momentum
     logger.info(
         f"Stakeholder ({persona}) accelerating: momentum={new_momentum:.2f} (capital: {political_capital:.0f}%)"
@@ -119,13 +251,15 @@ async def brake(intensity: float, tool_context: ToolContext) -> dict:
         intensity: Braking intensity (0.0 to 1.0).
         tool_context: ADK tool context for state management.
     """
-    persona = tool_context.state.get("persona", "pragmatist")
+    raw_persona = tool_context.state.get("persona", "pragmatist")
+    persona = raw_persona if isinstance(raw_persona, str) and raw_persona else "pragmatist"
     profile = get_persona_profile(persona)
-    scale_factor = profile["momentum_scale"] / 4.0  # Normalize to pragmatist default
+    scale_factor = max(profile["momentum_scale"], 1e-6) / 4.0  # Normalize to pragmatist default
     brake_multiplier = 1.5 * scale_factor
 
-    momentum = tool_context.state.get("velocity", 0.0)
-    new_momentum = max(0.0, momentum - (intensity * brake_multiplier))
+    safe_intensity = max(0.0, _finite_float(intensity, 0.0))
+    momentum = max(0.0, _finite_float(tool_context.state.get("velocity", 0.0), 0.0))
+    new_momentum = max(0.0, momentum - (safe_intensity * brake_multiplier))
     tool_context.state["velocity"] = new_momentum
     logger.info(f"Stakeholder ({persona}) braking: momentum={new_momentum:.2f}")
     return {
@@ -198,35 +332,53 @@ async def process_leadership_tick(
     state = tool_context.state
 
     # Resolve persona profile for physics parameters
-    persona = state.get("persona", "pragmatist")
+    raw_persona = state.get("persona", "pragmatist")
+    persona = raw_persona if isinstance(raw_persona, str) and raw_persona else "pragmatist"
     profile = get_persona_profile(persona)
 
     # Read tick params from state if the caller didn't provide them.
-    tick_params = state.get("_tick_params", {})
-    if tick < 0:
-        tick = tick_params.get("tick")
-    if minutes_per_tick < 0:
-        minutes_per_tick = tick_params.get("minutes_per_tick")
-    if elapsed_minutes < 0:
-        elapsed_minutes = tick_params.get("elapsed_minutes")
-    if race_distance_mi < 0:
-        race_distance_mi = tick_params.get("race_distance_mi")
+    raw_tick_params = state.get("_tick_params")
+    tick_params = raw_tick_params if isinstance(raw_tick_params, dict) else {}
+    raw_tick = tick_params.get("tick") if tick < 0 else tick
+    raw_minutes_per_tick = tick_params.get("minutes_per_tick") if minutes_per_tick < 0 else minutes_per_tick
+    raw_elapsed_minutes = tick_params.get("elapsed_minutes") if elapsed_minutes < 0 else elapsed_minutes
+    raw_race_distance_mi = tick_params.get("race_distance_mi") if race_distance_mi < 0 else race_distance_mi
     if not collector_buffer_key:
-        collector_buffer_key = tick_params.get("collector_buffer_key", "")
+        raw_cbk = tick_params.get("collector_buffer_key")
+        collector_buffer_key = raw_cbk if isinstance(raw_cbk, str) else ""
 
     # H5 fix: fall back to _tick_params for friction maps when the LLM
     # doesn't pass them as function arguments.
     if route_friction_map is None:
-        route_friction_map = tick_params.get("route_friction_map", {})
+        raw_rfm = tick_params.get("route_friction_map")
+        route_friction_map = raw_rfm if isinstance(raw_rfm, dict) else {}
+    elif not isinstance(route_friction_map, dict):
+        route_friction_map = {}
     if gatekeeper_route_map is None:
-        gatekeeper_route_map = tick_params.get("gatekeeper_route_map", {})
+        raw_grm = tick_params.get("gatekeeper_route_map")
+        gatekeeper_route_map = raw_grm if isinstance(raw_grm, dict) else {}
+    elif not isinstance(gatekeeper_route_map, dict):
+        gatekeeper_route_map = {}
 
     # Weather modifier: capital/time/morale costs from environmental conditions.
-    weather_modifier = state.get("_tick_params", {}).get("weather_modifier", {})
-    weather_capital_factor = weather_modifier.get("capital_factor", 1.0)
+    # May be a dict ({"capital_factor": ...}) or a numeric scalar (e.g. 1.0 default,
+    # 0.8 adverse weather) set by before_agent_callback / autopilot.
+    weather_modifier = tick_params.get("weather_modifier", {})
+    if isinstance(weather_modifier, dict):
+        weather_capital_factor = max(0.0, _finite_float(weather_modifier.get("capital_factor"), 1.0))
+    elif isinstance(weather_modifier, (int, float)) and not isinstance(weather_modifier, bool):
+        wm_val = _finite_float(weather_modifier, 1.0)
+        weather_capital_factor = min(2.5, max(0.5, 1.0 / wm_val)) if wm_val > 0 else 1.0
+    else:
+        weather_capital_factor = 1.0
 
     # Validate we have all required params.
-    if tick is None or minutes_per_tick is None or elapsed_minutes is None or race_distance_mi is None:
+    if (
+        raw_tick is None
+        or raw_minutes_per_tick is None
+        or raw_elapsed_minutes is None
+        or raw_race_distance_mi is None
+    ):
         logger.warning("process_leadership_tick called without tick params")
         return {
             "status": "error",
@@ -236,16 +388,42 @@ async def process_leadership_tick(
             ),
         }
 
-    momentum = state.get("velocity", 0.0)
-    progress = state.get("distance", 0.0)
-    political_capital = state.get("water", 100.0)
-    stalled = state.get("exhausted", False)
-    deadlocked = state.get("collapsed", False)
-    aligned = state.get("finished", False)
-
-    # Already aligned or deadlocked: no-op
-    if aligned or deadlocked:
+    tick = _finite_int(raw_tick, -1)
+    minutes_per_tick = _finite_float(raw_minutes_per_tick, -1.0)
+    elapsed_minutes = _finite_float(raw_elapsed_minutes, -1.0)
+    race_distance_mi = _finite_float(raw_race_distance_mi, -1.0)
+    if tick < 0 or minutes_per_tick < 0.0 or elapsed_minutes < 0.0 or race_distance_mi <= 0.0:
+        logger.warning(
+            "process_leadership_tick invalid numeric params: tick=%s mpt=%s elapsed=%s dist=%s",
+            tick,
+            minutes_per_tick,
+            elapsed_minutes,
+            race_distance_mi,
+        )
         return {
+            "status": "error",
+            "message": "Invalid tick timing parameters.",
+        }
+
+    momentum = max(0.0, _finite_float(state.get("velocity", 0.0), 0.0))
+    progress = max(0.0, _finite_float(state.get("distance", 0.0), 0.0))
+    political_capital = max(0.0, min(100.0, _finite_float(state.get("water", 100.0), 100.0)))
+    stalled = bool(state.get("exhausted", False))
+    deadlocked = bool(state.get("collapsed", False))
+    aligned = bool(state.get("finished", False))
+
+    # Already aligned or deadlocked: no-op (still report to collector buffer)
+    if aligned or deadlocked:
+        term_injury = max(0.0, _finite_float(state.get("injury_risk", 0.0), 0.0))
+        term_comfort = max(0.0, min(100.0, _finite_float(state.get("comfort", 100.0), 100.0)))
+        term_bs = _finite_float(state.get("black_swan_multiplier", 1.0), 1.0)
+        term_wall_sev = _finite_float(state.get("wall_severity", 0.0), 0.0)
+        raw_term_pace = state.get("pace_min_per_mi")
+        term_pace = _finite_float(raw_term_pace, 0.0) if raw_term_pace is not None else None
+        raw_term_finish = state.get("finish_time_minutes")
+        term_finish = _finite_float(raw_term_finish, 0.0) if raw_term_finish is not None else None
+        term_wave = _finite_int(state.get("wave_number", 0), 0)
+        terminal_result = {
             "status": "success",
             "tick": tick,
             "runner_status": "finished" if aligned else "collapsed",
@@ -254,20 +432,22 @@ async def process_leadership_tick(
             "effective_velocity": 0.0,
             "distance_mi": progress,
             "distance": round(progress, 4),
-            "water": political_capital,
-            "pace_min_per_mi": state.get("pace_min_per_mi"),
+            "water": round(political_capital, 1),
+            "pace_min_per_mi": term_pace,
             "elapsed_minutes": elapsed_minutes,
             "mi_this_tick": 0.0,
-            "finish_time_minutes": state.get("finish_time_minutes"),
+            "finish_time_minutes": term_finish,
             "exhausted": stalled,
             "collapsed": deadlocked,
             "inner_thought": inner_thought,
+            "wave_number": term_wave,
             # Leadership-semantic aliases
             "momentum": momentum,
             "effective_momentum": 0.0,
             "alignment_progress": round(progress, 4),
-            "political_capital": political_capital,
-            "alignment_rate": state.get("pace_min_per_mi"),
+            "political_capital": round(political_capital, 1),
+            "alignment_rate": term_pace,
+            "progress_this_tick": 0.0,
             "stalled": stalled,
             "deadlocked": deadlocked,
             "persona": persona,
@@ -283,52 +463,46 @@ async def process_leadership_tick(
                 "entropy_factor": 0.0,
                 "entropy_rate": 1.0,
                 "capital_factor": 0.0,
-                "black_swan_factor": state.get("black_swan_multiplier", 1.0),
+                "black_swan_factor": term_bs,
                 "hygiene_factor": 1.0,
                 "gatekeeper_engaged": False,
-                "wall_severity": state.get("wall_severity", 0.0),
+                "wall_severity": term_wall_sev,
                 "burnout_capital_multiplier": 1.0,
                 "cliff_capital_cost": 0.0,
             },
             "health": {
-                "burnout_risk": round(state.get("injury_risk", 0.0), 3),
-                "injury_risk": round(state.get("injury_risk", 0.0), 3),
+                "burnout_risk": round(term_injury, 3),
+                "injury_risk": round(term_injury, 3),
                 "recovery_mode": False,
                 "recovery_ticks_left": 0,
-                "medical_saves": state.get("medical_saves", 0),
-                "comfort": round(state.get("comfort", 100.0), 1),
+                "medical_saves": _finite_int(state.get("medical_saves", 0), 0),
+                "comfort": round(term_comfort, 1),
             },
             "roadblocks": [],
             "narratives": [],
         }
+        await _push_to_collector_buffer(collector_buffer_key, tool_context, terminal_result)
+        return terminal_result
 
     # --- Effective momentum with organizational degradation factors ---
 
     # 2. Resistance cliff: dynamic route friction
     resistance_factor = 1.0
-    wall_severity = state.get("wall_severity", 0.30)
+    wall_severity = max(0.0, min(1.0, _finite_float(state.get("wall_severity", 0.30), 0.30)))
     gatekeeper_found = False
+    active_gatekeeper: str | None = None
     cliff_capital_cost = 0.0
 
     # Dynamic check: which Gatekeeper controls the current mile?
     if route_friction_map and gatekeeper_route_map:
-        current_mile = int(progress)
-        # Find which role owns this mile (if any)
+        # Find which role owns this mile/segment (if any)
         for role, data in gatekeeper_route_map.items():
-            if isinstance(data, dict):
-                # Modern map structure with explicit segments
-                if data.get("start_mi", 0.0) <= progress <= data.get("end_mi", 0.0):
-                    raw_severity = route_friction_map.get(role, 5.0)
-                    wall_severity = raw_severity / 10.0
-                    gatekeeper_found = True
-                    break
-            else:
-                # Legacy map structure (integers)
-                if int(data) == current_mile:
-                    raw_severity = route_friction_map.get(role, 5.0)
-                    wall_severity = raw_severity / 10.0
-                    gatekeeper_found = True
-                    break
+            if _progress_in_gatekeeper_zone(progress, data):
+                raw_severity = _finite_float(route_friction_map.get(role, 5.0), 5.0)
+                wall_severity = max(0.0, min(1.0, raw_severity / 10.0))
+                gatekeeper_found = True
+                active_gatekeeper = role
+                break
 
     # If progress is past a wall or we hit a dynamic wall
     if gatekeeper_found:
@@ -339,30 +513,20 @@ async def process_leadership_tick(
         # 0.0 severity = 1.5 factor (coalition boost)
         resistance_factor = max(0.0, 1.0 - (wall_severity - 0.5) * 2.0)
         # One-time cliff capital penalty per gatekeeper zone.
-        charged_gatekeepers = state.get("_cliff_charged_gatekeepers", [])
-        active_gatekeeper = None
-        if gatekeeper_found and wall_severity > 0.5:
-            # Find which gatekeeper is active (re-use the loop variable from above)
-            for role, data in (gatekeeper_route_map or {}).items():
-                if isinstance(data, dict):
-                    if data.get("start_mi", 0.0) <= progress <= data.get("end_mi", 0.0):
-                        active_gatekeeper = role
-                        break
-                else:
-                    if int(data) == int(progress):
-                        active_gatekeeper = role
-                        break
-            if active_gatekeeper and active_gatekeeper not in charged_gatekeepers:
-                cliff_capital_cost = (wall_severity - 0.5) * 20.0
-                political_capital = max(0.0, political_capital - cliff_capital_cost)
-                charged_gatekeepers.append(active_gatekeeper)
-                state["_cliff_charged_gatekeepers"] = charged_gatekeepers
-    elif state.get("will_hit_wall") and progress > state.get("wall_mi", 16.0):
+        raw_charged = state.get("_cliff_charged_gatekeepers")
+        charged_gatekeepers = list(raw_charged) if isinstance(raw_charged, list) else []
+        if wall_severity > 0.5 and active_gatekeeper and active_gatekeeper not in charged_gatekeepers:
+            cliff_capital_cost = (wall_severity - 0.5) * 20.0
+            political_capital = max(0.0, political_capital - cliff_capital_cost)
+            charged_gatekeepers.append(active_gatekeeper)
+            state["_cliff_charged_gatekeepers"] = charged_gatekeepers
+    elif state.get("will_hit_wall") and progress > _finite_float(state.get("wall_mi", 16.0), 16.0):
         # Traditional physical marathon physics
-        resistance_factor = 1.0 - state.get("wall_severity", 0.30)
+        wall_sev = max(0.0, min(1.0, _finite_float(state.get("wall_severity", 0.30), 0.30)))
+        resistance_factor = 1.0 - wall_sev
         # One-time capital drain when first hitting the wall
         if not state.get("_wall_capital_charged"):
-            wall_capital_cost = state.get("wall_severity", 0.30) * 15.0
+            wall_capital_cost = wall_sev * 15.0
             political_capital = max(0.0, political_capital - wall_capital_cost)
             state["_wall_capital_charged"] = True
 
@@ -391,7 +555,7 @@ async def process_leadership_tick(
     )
 
     # 4. Black swan modifier (injected mid-simulation by scenario events)
-    black_swan_factor = state.get("black_swan_multiplier", 1.0)
+    black_swan_factor = max(0.0, _finite_float(state.get("black_swan_multiplier", 1.0), 1.0))
 
     # 5. Decay the black swan multiplier back toward 1.0 over time
     if black_swan_factor != 1.0:
@@ -402,7 +566,7 @@ async def process_leadership_tick(
             state["black_swan_multiplier"] = max(1.0, black_swan_factor - recovery_rate)
 
     # 6. Phase 3: Hygiene (Comfort) degradation
-    hygiene = state.get("comfort", 100.0)
+    hygiene = max(0.0, min(100.0, _finite_float(state.get("comfort", 100.0), 100.0)))
     hygiene_factor = 1.0
     if hygiene < 20.0:
         hygiene_factor = 0.85
@@ -412,23 +576,32 @@ async def process_leadership_tick(
     effective_momentum = (
         momentum * capital_factor * resistance_factor * entropy_factor * black_swan_factor * hygiene_factor
     )
+    if not math.isfinite(effective_momentum):
+        effective_momentum = 0.0
     # --- Phase 2: Recovery Logic ---
-    recovering = state.get("recovering", False)
-    recovery_ticks_left = state.get("recovery_ticks_left", 0)
+    recovering = bool(state.get("recovering", False))
+    recovery_ticks_left = _finite_int(state.get("recovery_ticks_left", 0), 0)
 
     if recovering:
         recovery_ticks_left -= 1
         if recovery_ticks_left <= 0:
             recovering = False
+            recovery_ticks_left = 0
         state["recovery_ticks_left"] = recovery_ticks_left
         state["recovering"] = recovering
         # Heavy speed penalty while recovering from burnout
         effective_momentum *= 0.7
+        if not math.isfinite(effective_momentum):
+            effective_momentum = 0.0
 
     # --- Progress computation ---
-    effective_rate = effective_momentum * profile["momentum_scale"]
-    progress_this_tick = effective_rate / 60.0 * minutes_per_tick
+    raw_effective_rate = effective_momentum * profile["momentum_scale"]
+    effective_rate = raw_effective_rate if math.isfinite(raw_effective_rate) else 0.0
+    raw_progress_this_tick = (effective_rate / 60.0) * minutes_per_tick
+    progress_this_tick = raw_progress_this_tick if math.isfinite(raw_progress_this_tick) else 0.0
     raw_progress = progress + progress_this_tick
+    if not math.isfinite(raw_progress):
+        raw_progress = race_distance_mi
     new_progress = min(raw_progress, race_distance_mi)
     state["distance"] = new_progress
 
@@ -437,9 +610,19 @@ async def process_leadership_tick(
     # penalty from stopping at a venting station is applied before any
     # checkpoint crossing is evaluated. This prevents double-refills from
     # the same checkpoint when venting reduces new_progress backward.
-    station_index = state.get("_tick_params", {}).get("station_index", {})
+    raw_station_index = tick_params.get("station_index")
+    station_index = raw_station_index if isinstance(raw_station_index, dict) else {}
     hygiene = max(0.0, hygiene - 0.5 * minutes_per_tick)
-    toilet_stations = station_index.get("portable_toilets", [])
+    raw_toilets = station_index.get("portable_toilets")
+    toilet_stations = (
+        [
+            num
+            for x in raw_toilets
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_toilets, list)
+        else []
+    )
 
     for toilet_mi in toilet_stations:
         if progress < toilet_mi <= new_progress:
@@ -447,22 +630,28 @@ async def process_leadership_tick(
                 hygiene = 100.0
                 # Small speed penalty for stopping
                 progress_this_tick *= 0.9
-                new_progress = min(progress + progress_this_tick, race_distance_mi)
-                raw_progress = new_progress  # Re-sync after venting penalty
+                if not math.isfinite(progress_this_tick):
+                    progress_this_tick = 0.0
+                raw_progress = progress + progress_this_tick
+                if not math.isfinite(raw_progress):
+                    raw_progress = race_distance_mi
+                new_progress = min(raw_progress, race_distance_mi)
                 state["distance"] = new_progress
                 break  # At most one venting stop per tick
 
     # --- Political capital depletion ---
-    efficiency = state.get("hydration_efficiency", 1.0)
-    local_resistance = state.get("local_resistance", 0.0)
+    efficiency = max(0.0, _finite_float(state.get("hydration_efficiency", 1.0), 1.0))
+    local_resistance = max(0.0, _finite_float(state.get("local_resistance", 0.0), 0.0))
     resistance_modifier = 1.0 + local_resistance
 
-    base_depletion = profile["capital_depletion_rate"] * progress_this_tick * efficiency
-    friction = 1.0 + profile["friction_growth"] * new_progress
+    raw_base_depletion = profile["capital_depletion_rate"] * progress_this_tick * efficiency
+    base_depletion = raw_base_depletion if math.isfinite(raw_base_depletion) else 0.0
+    raw_friction = 1.0 + profile["friction_growth"] * new_progress
+    friction = raw_friction if math.isfinite(raw_friction) else 1.0
 
     # Burnout ↔ capital coupling: high burnout accelerates capital drain.
     # 0.0-0.5 → no extra cost; 0.5-0.8 → up to 40% extra (linear ramp)
-    burnout_risk_current = state.get("injury_risk", 0.0)
+    burnout_risk_current = max(0.0, _finite_float(state.get("injury_risk", 0.0), 0.0))
     if burnout_risk_current > 0.5:
         burnout_capital_multiplier = 1.0 + min(0.4, (burnout_risk_current - 0.5) * 1.33)
     else:
@@ -472,22 +661,37 @@ async def process_leadership_tick(
     if political_capital < 20.0:
         burnout_capital_multiplier = min(burnout_capital_multiplier, 1.1)
 
-    depletion = base_depletion * friction * resistance_modifier * burnout_capital_multiplier * weather_capital_factor
+    raw_depletion = base_depletion * friction * resistance_modifier * burnout_capital_multiplier * weather_capital_factor
+    if math.isnan(raw_depletion):
+        depletion = 0.0
+    elif not math.isfinite(raw_depletion):
+        depletion = political_capital
+    else:
+        depletion = raw_depletion
     new_capital = max(0.0, political_capital - depletion)
 
     # --- Alignment checkpoint auto-refill (at planner-placed positions) ---
     # Uses new_progress (already adjusted for venting penalty above).
-    water_stations = station_index.get("water_stations", [])
+    raw_water_stations = station_index.get("water_stations")
+    water_stations = (
+        [
+            num
+            for x in raw_water_stations
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_water_stations, list)
+        else []
+    )
 
     # Check EVERY checkpoint crossed this tick.
     if not water_stations:
-        prev_marker = int(progress / CHECKPOINT_INTERVAL)
-        new_marker = int(new_progress / CHECKPOINT_INTERVAL)
+        interval = max(CHECKPOINT_INTERVAL, 1e-6)
+        prev_marker = int(progress / interval)
+        new_marker = int(new_progress / interval)
         if new_marker > prev_marker:
-            session_id = getattr(getattr(tool_context, "session", None), "id", "default")
             for marker in range(prev_marker + 1, new_marker + 1):
                 # Coalition bonus from DCNS zones (if available)
-                coalition_bonus = state.get("coalition_bonus", 0.0)
+                coalition_bonus = max(0.0, _finite_float(state.get("coalition_bonus", 0.0), 0.0))
                 refill = profile["checkpoint_refill"] * (1.0 + coalition_bonus)
 
                 # Deterministic refill: always refill, amount scales with need.
@@ -502,12 +706,13 @@ async def process_leadership_tick(
                 scaled_refill = refill * refill_pct
                 new_capital = min(100.0, new_capital + scaled_refill)
                 hygiene = max(0.0, hygiene - 15.0)  # Gaining capital uses up hygiene (like drinking water)
+                if (new_capital >= 100.0 or scaled_refill == 0.0) and hygiene <= 0.0:
+                    break
     else:
         for cp_mi in water_stations:
             if progress < cp_mi <= new_progress:
-                session_id = getattr(getattr(tool_context, "session", None), "id", "default")
                 # Coalition bonus from DCNS zones (if available)
-                coalition_bonus = state.get("coalition_bonus", 0.0)
+                coalition_bonus = max(0.0, _finite_float(state.get("coalition_bonus", 0.0), 0.0))
                 refill = profile["checkpoint_refill"] * (1.0 + coalition_bonus)
 
                 # Deterministic refill: always refill, amount scales with need.
@@ -522,13 +727,24 @@ async def process_leadership_tick(
                 scaled_refill = refill * refill_pct
                 new_capital = min(100.0, new_capital + scaled_refill)
                 hygiene = max(0.0, hygiene - 15.0)  # Gaining capital uses up hygiene (like drinking water)
+                if (new_capital >= 100.0 or scaled_refill == 0.0) and hygiene <= 0.0:
+                    break
 
     state["water"] = new_capital
     state["comfort"] = hygiene
 
     # --- Phase 2: Burnout Risk ---
-    medical_stations = station_index.get("medical_tents", [])
-    burnout_risk = state.get("injury_risk", 0.0)
+    raw_medical_stations = station_index.get("medical_tents")
+    medical_stations = (
+        [
+            num
+            for x in raw_medical_stations
+            if math.isfinite(num := _finite_float(x, float("nan")))
+        ]
+        if isinstance(raw_medical_stations, list)
+        else []
+    )
+    burnout_risk = max(0.0, _finite_float(state.get("injury_risk", 0.0), 0.0))
 
     if not recovering:
         # Natural recovery: small per-tick decay so burnout_risk is not
@@ -542,7 +758,7 @@ async def process_leadership_tick(
 
         # "The Wall" zone: burnout risk doubles
         if state.get("will_hit_wall", False):
-            wall_start = state.get("wall_mi", 16.0)
+            wall_start = _finite_float(state.get("wall_mi", 16.0), 16.0)
             if wall_start <= new_progress <= wall_start + 6.0:
                 burnout_risk += base_risk_rate * fatigue_multiplier
 
@@ -550,14 +766,14 @@ async def process_leadership_tick(
         for med_mi in medical_stations:
             if progress < med_mi <= new_progress:
                 burnout_risk = max(0.0, burnout_risk - 0.15)
-                state["medical_saves"] = state.get("medical_saves", 0) + 1
+                state["medical_saves"] = _finite_int(state.get("medical_saves", 0), 0) + 1
 
         state["injury_risk"] = burnout_risk
 
         # Tier 0 debug: log burnout trajectory at threshold crossings.
         # Narrative (Tier 2) fires at 0.6 and 0.8; this also catches the
         # earlier 0.3 ramp so developers see fragility building up.
-        _prev_burnout = state.get("_prev_burnout_bucket", 0)
+        _prev_burnout = _finite_int(state.get("_prev_burnout_bucket", 0), 0)
         for _threshold, _bucket, _level in (
             (0.3, 1, "info"),
             (0.6, 2, "info"),
@@ -596,7 +812,7 @@ async def process_leadership_tick(
             state["recovering"] = True
             state["recovery_ticks_left"] = 2
             state["injury_risk"] = 0.4
-            state["medical_saves"] = state.get("medical_saves", 0) + 1
+            state["medical_saves"] = _finite_int(state.get("medical_saves", 0), 0) + 1
         elif not medical_stations:
             # M11 fix: When no medical stations exist, auto-recover with
             # a heavier penalty instead of guaranteed deadlock. This gives
@@ -618,8 +834,10 @@ async def process_leadership_tick(
 
     # --- Alignment (finish) detection ---
     stakeholder_status = "running"
-    finish_time = state.get("finish_time_minutes", 0.0)
-    pace = state.get("pace_min_per_mi", 0.0)
+    raw_finish_state = state.get("finish_time_minutes", 0.0)
+    finish_time = _finite_float(raw_finish_state, 0.0) if raw_finish_state is not None else None
+    raw_pace_state = state.get("pace_min_per_mi", 0.0)
+    pace = _finite_float(raw_pace_state, 0.0) if raw_pace_state is not None else None
 
     if new_progress >= race_distance_mi and not aligned:
         aligned = True
@@ -627,8 +845,13 @@ async def process_leadership_tick(
         stakeholder_status = "finished"
         overshoot = raw_progress - race_distance_mi
         fraction = 1.0 - (overshoot / progress_this_tick) if progress_this_tick > 0 else 1.0
-        finish_time = elapsed_minutes - minutes_per_tick * (1.0 - fraction)
-        pace = finish_time / race_distance_mi if race_distance_mi > 0 else 0.0
+        if not math.isfinite(fraction):
+            fraction = 1.0
+        fraction = max(0.0, min(1.0, fraction))
+        raw_finish_time = elapsed_minutes - minutes_per_tick * (1.0 - fraction)
+        finish_time = raw_finish_time if math.isfinite(raw_finish_time) else 0.0
+        raw_pace = finish_time / race_distance_mi if race_distance_mi > 0 else 0.0
+        pace = raw_pace if math.isfinite(raw_pace) else 0.0
         state["finish_time_minutes"] = round(finish_time, 2)
         state["pace_min_per_mi"] = round(pace, 2)
     elif deadlocked:
@@ -663,7 +886,8 @@ async def process_leadership_tick(
     # Surfaces internally-computed organizational dynamics through the
     # existing tool-result channel.  No UI changes required: the frontend
     # Chat Log panel already renders arbitrary nested JSON under tool_end.
-    capital_efficiency = round(effective_momentum / momentum, 3) if momentum > 1e-6 else 0.0
+    raw_cap_eff = effective_momentum / momentum if momentum > 1e-6 else 0.0
+    capital_efficiency = round(raw_cap_eff, 3) if math.isfinite(raw_cap_eff) else 0.0
 
     if recovering:
         decision_phase = "recover"
@@ -892,8 +1116,8 @@ async def process_leadership_tick(
         state["_emitted_hard_wall"] = False
 
     if _narratives:
-        _session_id = getattr(getattr(tool_context, "session", None), "id", "default")
-        _simulation_id = state.get("simulation_id") or state.get("_tick_params", {}).get("simulation_id")
+        _session_id = getattr(getattr(tool_context, "session", None), "id", None) or "default"
+        _simulation_id = state.get("simulation_id") or tick_params.get("simulation_id")
         for _kind, _text, _meta in _narratives:
             # Tier 0 debug: mirror every narrative as a structured log line.
             # phase_transition:* → INFO, critical:* → WARNING.
@@ -924,6 +1148,9 @@ async def process_leadership_tick(
                 metadata=_meta,
             )
 
+    wave = _finite_int(state.get("wave_number", 0), 0)
+    medical_saves_val = _finite_int(state.get("medical_saves", 0), 0)
+    recovery_ticks_val = _finite_int(state.get("recovery_ticks_left", 0), 0)
     result = {
         "status": "success",
         "tick": tick,
@@ -941,7 +1168,7 @@ async def process_leadership_tick(
         "exhausted": stalled,
         "collapsed": deadlocked,
         "inner_thought": inner_thought,
-        "wave_number": state.get("wave_number", 0),
+        "wave_number": wave,
         # Leadership-semantic aliases
         "momentum": momentum,
         "effective_momentum": round(effective_momentum, 4),
@@ -974,8 +1201,8 @@ async def process_leadership_tick(
             "burnout_risk": round(burnout_risk, 3),
             "injury_risk": round(burnout_risk, 3),
             "recovery_mode": recovering,
-            "recovery_ticks_left": state.get("recovery_ticks_left", 0),
-            "medical_saves": state.get("medical_saves", 0),
+            "recovery_ticks_left": recovery_ticks_val,
+            "medical_saves": medical_saves_val,
             "comfort": round(hygiene, 1),
         },
         "roadblocks": roadblocks,
@@ -984,33 +1211,16 @@ async def process_leadership_tick(
 
     # Stagger first tick emission by wave
     WAVE_STAGGER_SECONDS = 2.0
-    wave = state.get("wave_number", 0)
+    MAX_GATEWAY_DELAY_SECONDS = 30.0
     if tick == 1 and wave > 0:
-        result["gateway_delay_seconds"] = wave * WAVE_STAGGER_SECONDS
+        try:
+            gateway_delay = wave * WAVE_STAGGER_SECONDS
+        except OverflowError:
+            gateway_delay = float("nan")
+        if math.isfinite(gateway_delay):
+            result["gateway_delay_seconds"] = min(gateway_delay, MAX_GATEWAY_DELAY_SECONDS)
 
     # --- Direct-write to collector buffer (bypass PubSub bottleneck) ---
-    if collector_buffer_key:
-        try:
-            r = get_shared_redis_client()
-            if r is not None:
-                session_id = getattr(getattr(tool_context, "session", None), "id", "")
-                direct_msg = json.dumps(
-                    {
-                        "session_id": session_id,
-                        "payload": {
-                            "tool_name": "process_leadership_tick",
-                            "result": result,
-                        },
-                    },
-                    default=str,
-                )
-                await r.rpush(collector_buffer_key, direct_msg)  # type: ignore[misc]
-                await r.expire(collector_buffer_key, 7200)
-        except Exception:
-            logger.warning(
-                "process_leadership_tick: direct-write RPUSH failed for %s",
-                collector_buffer_key,
-                exc_info=True,
-            )
+    await _push_to_collector_buffer(collector_buffer_key, tool_context, result)
 
     return result

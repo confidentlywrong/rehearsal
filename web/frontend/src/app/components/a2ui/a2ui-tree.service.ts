@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: preserve component data on case-insensitive type recovery, resolve wrapped boolean/string/URL props, sanitize media URLs, and guard cyclic card traversal.
  */
 
 import { Injectable } from '@angular/core';
@@ -196,11 +199,21 @@ export class A2uiTreeService {
 
     if (node.component) {
       const type = this.getType(node);
-      return node.component[type] || {};
+      if (node.component[type] !== undefined) {
+        return node.component[type] || {};
+      }
+      const lower = type.toLowerCase();
+      const matchedKey = Object.keys(node.component).find((k) => k.toLowerCase() === lower);
+      return (matchedKey ? node.component[matchedKey] : undefined) || {};
     }
 
     const type = this.getType(node);
-    return node[type] || node;
+    if (node[type] !== undefined) {
+      return node[type] || node;
+    }
+    const lower = type.toLowerCase();
+    const matchedKey = Object.keys(node).find((k) => k.toLowerCase() === lower);
+    return (matchedKey ? node[matchedKey] : undefined) || node;
   }
 
   getId(node: A2uiNode | null | undefined): string {
@@ -234,21 +247,18 @@ export class A2uiTreeService {
 
   getTabItems(node: A2uiNode | null | undefined): unknown[] {
     const data = this.getData(node);
-    return (data.tabItems as unknown[]) || [];
+    return Array.isArray(data.tabItems) ? data.tabItems : [];
   }
 
   getTabTitle(tab: Record<string, unknown>): string {
-    const title = tab['title'];
+    const title = tab?.['title'];
     if (!title) return '';
-    if (typeof title === 'string') return title;
-    if (typeof title === 'object' && title !== null && 'literalString' in title) {
-      return String((title as { literalString: unknown }).literalString);
-    }
-    return String(title);
+    const resolved = this.resolveValue(title);
+    return resolved != null ? String(resolved) : '';
   }
 
   getTabChild(tab: Record<string, unknown>): string {
-    return String(tab['child'] || '');
+    return String(tab?.['child'] || '');
   }
 
   resolveValue(value: unknown): unknown {
@@ -269,11 +279,19 @@ export class A2uiTreeService {
     componentId: string,
     n: A2uiNode | null = root ?? null,
     cardStack: A2uiNode[] = [],
+    visited: Set<string> = new Set(),
   ): A2uiNode | null {
     if (!n || !componentId) return null;
+    const currentId = this.getId(n);
+    let nextVisited = visited;
+    if (currentId) {
+      if (visited.has(currentId)) return null;
+      nextVisited = new Set(visited);
+      nextVisited.add(currentId);
+    }
     const type = this.getType(n);
     const stack = type === 'Card' ? [...cardStack, n] : cardStack;
-    if (this.getId(n) === componentId) {
+    if (currentId === componentId) {
       const len = stack.length;
       return len > 0 ? stack[len - 1]! : null;
     }
@@ -288,6 +306,7 @@ export class A2uiTreeService {
           componentId,
           child,
           stack,
+          nextVisited,
         );
         if (found) return found;
       }
@@ -302,6 +321,7 @@ export class A2uiTreeService {
           componentId,
           child,
           stack,
+          nextVisited,
         );
         if (found) return found;
       }
@@ -315,6 +335,7 @@ export class A2uiTreeService {
         componentId,
         child,
         stack,
+        nextVisited,
       );
       if (found) return found;
     }
@@ -371,9 +392,7 @@ export class A2uiTreeService {
 
     // Path 1: explicit opt-in via Card.expandable.
     const cardData = this.getData(node);
-    const expandableProp = cardData?.expandable;
-    if (expandableProp && typeof expandableProp === 'object'
-        && (expandableProp as Record<string, unknown>)['literalBoolean'] === true) {
+    if (this.resolveValue(cardData?.expandable) === true) {
       return true;
     }
 
@@ -492,42 +511,49 @@ export class A2uiTreeService {
 
   getUrl(node: A2uiNode): string {
     const data = this.getData(node);
-    const url = data.url as Record<string, any> | undefined;
-    const src = data.src as Record<string, any> | undefined;
-    const urlLit = url?.['literalString'];
-    const srcLit = src?.['literalString'];
-    return String(urlLit ?? srcLit ?? '');
+    const resolved = this.resolveValue(data.url ?? data.src);
+    const raw = String(resolved ?? '')
+      .replace(/[\u0000-\u001f\u007f]+/g, '')
+      .trim();
+    if (
+      !raw ||
+      /^(?:javascript|vbscript|file):/i.test(raw) ||
+      /^data:(?!(?:image\/(?:png|jpeg|jpg|gif|webp|bmp|avif)|video\/|audio\/))/i.test(raw)
+    ) {
+      return '';
+    }
+    return raw;
   }
 
   getUsageHint(node: A2uiNode | null): string {
     if (!node) return 'body';
     const data = this.getData(node);
-    return String(data.usageHint || 'body');
+    return String(this.resolveValue(data.usageHint) || 'body');
   }
 
   isAutoplay(node: A2uiNode): boolean {
-    return !!this.getData(node).autoplay;
+    return Boolean(this.resolveValue(this.getData(node).autoplay));
   }
 
   isLoop(node: A2uiNode): boolean {
-    return !!this.getData(node).loop;
+    return Boolean(this.resolveValue(this.getData(node).loop));
   }
 
   isMuted(node: A2uiNode): boolean {
-    return !!this.getData(node).muted;
+    return Boolean(this.resolveValue(this.getData(node).muted));
   }
 
   isPlaysinline(node: A2uiNode): boolean {
-    return !!this.getData(node).playsinline;
+    return Boolean(this.resolveValue(this.getData(node).playsinline));
   }
 
   isPrimary(node: A2uiNode): boolean {
-    return !!this.getData(node).primary;
+    return Boolean(this.resolveValue(this.getData(node).primary));
   }
 
   getAxis(node: A2uiNode): string {
     const data = this.getData(node);
-    return String(data.axis || 'horizontal');
+    return String(this.resolveValue(data.axis) || 'horizontal');
   }
 
   getLabel(node: A2uiNode): string {
@@ -546,22 +572,27 @@ export class A2uiTreeService {
       date: 'date',
       obscured: 'password',
     };
-    return typeMap[String(data.textFieldType || 'shortText')] || 'text';
+    const resolvedType = String(this.resolveValue(data.textFieldType) || 'shortText');
+    return typeMap[resolvedType] || 'text';
   }
 
   getDateTimeInputType(node: A2uiNode): string {
     const data = this.getData(node);
-    if (data.enableDate && data.enableTime) return 'datetime-local';
-    if (data.enableDate) return 'date';
-    if (data.enableTime) return 'time';
+    const enableDate = Boolean(this.resolveValue(data.enableDate));
+    const enableTime = Boolean(this.resolveValue(data.enableTime));
+    if (enableDate && enableTime) return 'datetime-local';
+    if (enableDate) return 'date';
+    if (enableTime) return 'time';
     return 'datetime-local';
   }
 
   getDateTimeIcon(node: A2uiNode): string {
     const data = this.getData(node);
-    if (data.enableDate && data.enableTime) return 'event';
-    if (data.enableDate) return 'calendar_today';
-    if (data.enableTime) return 'schedule';
+    const enableDate = Boolean(this.resolveValue(data.enableDate));
+    const enableTime = Boolean(this.resolveValue(data.enableTime));
+    if (enableDate && enableTime) return 'event';
+    if (enableDate) return 'calendar_today';
+    if (enableTime) return 'schedule';
     return 'event';
   }
 
@@ -569,16 +600,18 @@ export class A2uiTreeService {
     const data = this.getData(node);
     const raw = this.resolveValue(data.value);
     if (!raw) return '';
+    const enableDate = Boolean(this.resolveValue(data.enableDate));
+    const enableTime = Boolean(this.resolveValue(data.enableTime));
     try {
       const d = new Date(String(raw));
       if (isNaN(d.getTime())) return String(raw);
-      if (data.enableDate && data.enableTime) {
+      if (enableDate && enableTime) {
         return d.toISOString().slice(0, 16);
       }
-      if (data.enableDate) {
+      if (enableDate) {
         return d.toISOString().slice(0, 10);
       }
-      if (data.enableTime) {
+      if (enableTime) {
         return d.toISOString().slice(11, 16);
       }
     } catch {
@@ -651,13 +684,22 @@ export class A2uiTreeService {
   }
 
   getOptions(node: A2uiNode): unknown[] {
-    return (this.getData(node).options as unknown[]) || [];
+    const opts = this.getData(node).options;
+    return Array.isArray(opts) ? opts : [];
   }
 
-  resolveOptionLabel(option: Record<string, unknown>): string {
-    const label = option['label'];
-    if (!label) return '';
+  resolveOptionLabel(option: Record<string, unknown> | null | undefined): string {
+    const label = option?.['label'];
+    if (label === null || label === undefined || label === '') return '';
     const resolved = this.resolveValue(label);
+    return resolved != null ? String(resolved) : '';
+  }
+
+  resolveOptionValue(option: Record<string, unknown> | null | undefined): string {
+    if (!option || typeof option !== 'object') return '';
+    const val = option['value'] ?? option['label'];
+    if (val === undefined || val === null) return '';
+    const resolved = this.resolveValue(val);
     return resolved != null ? String(resolved) : '';
   }
 

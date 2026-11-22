@@ -14,6 +14,8 @@
 
 /**
  * Copyright 2026 Google LLC. Apache-2.0.
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: preserve optional server indexing warning on MemoryDocument upload responses.
  *
  * TypeScript mirror of the Go-side DTOs from cmd/gateway/memory.go.
  * Field names match the JSON wire format byte-for-byte (snake_case)
@@ -40,5 +42,6 @@ export interface MemoryDocument {
   storage_uri: string;
   byte_size: number;
   ingested_at: string;
+  warning?: string;
 }
 

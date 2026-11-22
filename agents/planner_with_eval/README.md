@@ -9,8 +9,7 @@ financial modeling capabilities from the [base planner](../planner/).
 The base planner produces marathon plans. This variant adds three capabilities:
 
 1. **Plan evaluation**: scores the plan across 7 criteria using Vertex AI's
-   Eval API with a Gemini 3 Pro judge model, then falls back to heuristic
-   scoring if the API is unavailable
+   Eval API with a Gemini 3 Pro judge model (or local Gemma when configured)
 2. **Simulator coordination**: sends the evaluated plan to the simulator agent
    for verification or execution via A2A
 3. **A2UI dashboard**: renders structured plan and simulation result cards in
@@ -44,24 +43,17 @@ and a 1-5 scoring scale:
 
 ### Score normalization
 
-Raw scores (1-5 from the API, 0-100 from heuristics) are normalized to a
+Raw scores (1-5 from the LLM judge) are normalized to a
 0-100 scale. The overall score is a weighted average (equal weights). A plan
 passes if the overall score is >= 75 and there are no high-severity findings
 (score < 40).
-
-### Heuristic fallback
-
-When the Vertex AI Eval API is unavailable, a keyword-based scorer runs
-instead. Each criterion has a base score (70-85) adjusted by keyword bonuses
-and red-flag penalties. This ensures the evaluation tool always returns a
-result.
 
 ### LLM feedback
 
 After scoring, a separate Gemini call generates actionable improvement
 suggestions (e.g., "Add emergency vehicle crossing points at miles 5, 10, 15,
-and 20"). Falls back to pre-written suggestions per criterion if the LLM call
-fails.
+and 20"). Errors propagate (or return `eval_method="error"` in local Gemma mode)
+if the LLM call fails.
 
 ## Simulator coordination
 
@@ -141,7 +133,7 @@ simulation.
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `PLANNER_WITH_EVAL_PORT` | `8205` | HTTP listen port |
+| `PORT` / `PLANNER_WITH_EVAL_PORT` | `9106` | HTTP listen port |
 | `EVALUATOR_MODEL` | `gemini-3.1-pro-preview` | Judge model for evaluation |
 | `GOOGLE_CLOUD_PROJECT` | -- | GCP project (required for Vertex AI Eval) |
 | `GOOGLE_CLOUD_LOCATION` | `global` | Gemini API endpoint |

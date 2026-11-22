@@ -28,27 +28,33 @@ import (
 )
 
 type mockDedup struct {
-	mu   sync.Mutex
-	seen map[string]bool
+	mu          sync.Mutex
+	seen        map[string]bool
+	failErr     error
+	forgetCalls int
 }
 
 func newMockDedup() *mockDedup {
 	return &mockDedup{seen: make(map[string]bool)}
 }
 
-func (m *mockDedup) SeenOrMark(id string) bool {
+func (m *mockDedup) SeenOrMark(id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failErr != nil {
+		return false, m.failErr
+	}
 	if m.seen[id] {
-		return true
+		return true, nil
 	}
 	m.seen[id] = true
-	return false
+	return false, nil
 }
 
 func (m *mockDedup) Forget(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.forgetCalls++
 	delete(m.seen, id)
 }
 

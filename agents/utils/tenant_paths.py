@@ -33,18 +33,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from agents.utils import simulation_registry
+from agents.utils import tenant_keys
+
 # Default base directory: ``<repo-root>/data/simulation_runs``.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_BASE_DIR = _REPO_ROOT / "data" / "simulation_runs"
 
-
-def _saas_mode_enabled() -> bool:
-    """Mirror of ``tenant.saasModeEnabled`` in Go.
-
-    Accepts ``on``/``true``/``1``/``yes`` (case-insensitive — matches
-    Go and :mod:`agents.utils.tenant_keys`).
-    """
-    return os.environ.get("SAAS_MODE", "off").lower() in ("on", "true", "1", "yes")
+_ANONYMOUS_USER_IDS = frozenset(
+    {"anonymous", "default", "local-dev", "user", "simulation", "simulation_user", ""}
+)
 
 
 def runs_base_dir() -> Path:
@@ -62,14 +60,41 @@ def runs_base_dir() -> Path:
 def resolve_tenant_id(fallback: str | None = None) -> str:
     """Return the tenant id that should own a write.
 
-    In a user_id multi-tenant system, the fallback (participant_id) IS
-    the tenant_id. We no longer rely on DISPATCHER_USER_ID here.
-
-    ``fallback`` is returned verbatim. An empty/None fallback also
-    returns the empty string — callers must handle that themselves
-    rather than have this helper synthesize a tenant.
+    When ``SAAS_MODE=off``, preserves legacy behavior (returns ``fallback or ""``).
+    When ``SAAS_MODE=on``, resolves a non-anonymous, path-safe tenant id from
+    ``simulation_registry.get_current_user_id()`` or *fallback*, failing closed
+    with ``ValueError`` if missing or anonymous.
     """
-    return fallback or ""
+    if not tenant_keys._saas_mode_enabled():
+        return fallback or ""
+
+    active_uid = simulation_registry.get_current_user_id()
+    if active_uid:
+        if active_uid.lower() in _ANONYMOUS_USER_IDS:
+            raise ValueError(
+                f"tenant_paths: authenticated tenant_id is required when SAAS_MODE=on (got {active_uid!r})"
+            )
+        _validate_single_segment(active_uid, "tenant_id")
+        tenant_keys._validate_component(active_uid, "tenant_id")
+        return active_uid
+
+    fb = fallback.strip() if isinstance(fallback, str) else ""
+    if not fb or fb.lower() in _ANONYMOUS_USER_IDS:
+        raise ValueError(
+            f"tenant_paths: authenticated tenant_id is required when SAAS_MODE=on (got {fallback!r})"
+        )
+    _validate_single_segment(fb, "tenant_id")
+    tenant_keys._validate_component(fb, "tenant_id")
+    return fb
+
+
+def _validate_single_segment(value: str, label: str) -> str:
+    """Reject empty or path-traversing path components."""
+    if not value or not value.strip():
+        raise ValueError(f"tenant_paths: {label} must be non-empty")
+    if value in (".", "..") or "/" in value or "\\" in value or "\x00" in value or ".." in value:
+        raise ValueError(f"tenant_paths: unsafe {label} segment: {value!r}")
+    return value
 
 
 def tenant_runs_dir(tenant_id: str) -> Path:
@@ -79,15 +104,13 @@ def tenant_runs_dir(tenant_id: str) -> Path:
     ``mkdir(parents=True, exist_ok=True)`` pattern used today, so
     failure modes stay identical.
     """
-    if not tenant_id:
-        raise ValueError("tenant_paths.tenant_runs_dir: tenant_id must be non-empty")
+    _validate_single_segment(tenant_id, "tenant_id")
     return runs_base_dir() / tenant_id
 
 
 def run_path(tenant_id: str, sim_id: str) -> Path:
     """Return ``data/simulation_runs/{tenant_id}/{sim_id}.json``."""
-    if not sim_id:
-        raise ValueError("tenant_paths.run_path: sim_id must be non-empty")
+    _validate_single_segment(sim_id, "sim_id")
     return tenant_runs_dir(tenant_id) / f"{sim_id}.json"
 
 

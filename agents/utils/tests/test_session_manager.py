@@ -27,6 +27,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clean_saas_env(monkeypatch):
+    """Ensure SAAS_MODE / ACCOUNT_KEY_PREFIX never leak between tests."""
+    monkeypatch.delenv("SAAS_MODE", raising=False)
+    monkeypatch.delenv("ACCOUNT_KEY_PREFIX", raising=False)
+
+
 @pytest.fixture()
 def mock_session_service():
     """Mock session service that returns sessions with incrementing IDs."""
@@ -121,7 +128,7 @@ class TestSessionManagerRedisL2:
 
 
 class TestSessionManagerDefaultTTL:
-    """Verify default TTL is 600 seconds (10 minutes)."""
+    """Verify default TTL is 7200 seconds (2 hours)."""
 
     @pytest.mark.asyncio
     async def test_default_redis_ttl_is_7200_seconds(self, mock_session_service, mock_redis):
@@ -172,7 +179,7 @@ class TestSessionManagerNoRedis:
 
         broken_redis = AsyncMock()
         broken_redis.get = AsyncMock(side_effect=ConnectionError("Redis down"))
-        broken_redis.setex = AsyncMock(side_effect=ConnectionError("Redis down"))
+        broken_redis.set = AsyncMock(side_effect=ConnectionError("Redis down"))
 
         with patch("agents.utils.session_manager.get_shared_redis_client", return_value=broken_redis):
             mgr = SessionManager(session_service=mock_session_service)
@@ -182,3 +189,132 @@ class TestSessionManagerNoRedis:
             # Should still work — just without Redis L2
             assert session_id == "vertex-session-1"
             assert mgr.session_cache.get("ctx-005") == "vertex-session-1"
+
+
+class TestSessionManagerTenantScoping:
+    """Verify SAAS_MODE=off vs SAAS_MODE=on Redis and L1 key schema parity."""
+
+    @pytest.mark.asyncio
+    async def test_saas_off_ignores_user_id_for_key(self, mock_session_service, mock_redis, monkeypatch):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", "off")
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            session_id = await mgr.get_or_create_session(
+                context_id="spawn-ctx-abc",
+                app_name="leadership_planner",
+                user_id="local-dev-user",
+            )
+
+        assert session_id == "vertex-session-1"
+        assert "session_map:spawn-ctx-abc" in mock_redis._test_store
+        assert mock_redis._test_store["session_map:spawn-ctx-abc"] == b"vertex-session-1"
+        assert mgr.get_session_id("spawn-ctx-abc") == "vertex-session-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("saas_val", ["on", "true", "1", "yes", " ON "])
+    async def test_saas_on_namespaces_redis_key_by_user_id(
+        self, mock_session_service, mock_redis, monkeypatch, saas_val
+    ):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", saas_val)
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            session_id = await mgr.get_or_create_session(
+                context_id="spawn-ctx-1",
+                app_name="leadership_planner",
+                user_id="user-alice",
+            )
+
+        assert session_id == "vertex-session-1"
+        assert "session_map:user-alice:spawn-ctx-1" in mock_redis._test_store
+        assert "session_map:spawn-ctx-1" not in mock_redis._test_store
+        assert mock_redis._test_store["session_map:user-alice:spawn-ctx-1"] == b"vertex-session-1"
+
+    @pytest.mark.asyncio
+    async def test_saas_on_redis_hit_only_matches_same_tenant(self, mock_session_service, mock_redis, monkeypatch):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", "on")
+        mock_redis._test_store["session_map:ctx-shared"] = b"legacy-session"
+        mock_redis._test_store["session_map:user-bob:ctx-shared"] = b"bob-session"
+        mock_redis._test_store["session_map:user-alice:ctx-shared"] = b"alice-session"
+
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            alice_sid = await mgr.get_or_create_session(
+                context_id="ctx-shared",
+                app_name="leadership_planner",
+                user_id="user-alice",
+            )
+            bob_sid = await mgr.get_or_create_session(
+                context_id="ctx-shared",
+                app_name="leadership_planner",
+                user_id="user-bob",
+            )
+
+        assert alice_sid == "alice-session"
+        assert bob_sid == "bob-session"
+        mock_session_service.create_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_saas_on_l1_cache_isolated_across_tenants(self, mock_session_service, mock_redis, monkeypatch):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", "on")
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            alice_sid = await mgr.get_or_create_session(
+                context_id="same-ctx",
+                app_name="test",
+                user_id="user-alice",
+            )
+            bob_sid = await mgr.get_or_create_session(
+                context_id="same-ctx",
+                app_name="test",
+                user_id="user-bob",
+            )
+
+        assert alice_sid == "vertex-session-1"
+        assert bob_sid == "vertex-session-2"
+        assert alice_sid != bob_sid
+        assert mock_redis._test_store["session_map:user-alice:same-ctx"] == b"vertex-session-1"
+        assert mock_redis._test_store["session_map:user-bob:same-ctx"] == b"vertex-session-2"
+        assert mgr.get_session_id("same-ctx", user_id="user-alice") == "vertex-session-1"
+        assert mgr.get_session_id("same-ctx", user_id="user-bob") == "vertex-session-2"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_user_id", ["", "   ", "alice:bob", "alice\nbob", "alice bob"])
+    async def test_saas_on_rejects_missing_or_invalid_user_id(
+        self, mock_session_service, mock_redis, monkeypatch, bad_user_id
+    ):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", "on")
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            with pytest.raises(ValueError):
+                await mgr.get_or_create_session(
+                    context_id="ctx-bad-user",
+                    app_name="test",
+                    user_id=bad_user_id,
+                )
+
+        mock_session_service.create_session.assert_not_called()
+        mock_redis.get.assert_not_called()
+        mock_redis.set.assert_not_called()
+        assert mock_redis._test_store == {}
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_context_id(self, mock_session_service, mock_redis, monkeypatch):
+        from agents.utils.session_manager import SessionManager
+
+        monkeypatch.setenv("SAAS_MODE", "off")
+        with patch("agents.utils.session_manager.get_shared_redis_client", return_value=mock_redis):
+            mgr = SessionManager(session_service=mock_session_service)
+            with pytest.raises(ValueError, match="context_id"):
+                await mgr.get_or_create_session(context_id="   ", app_name="test", user_id="user1")
+
+        mock_session_service.create_session.assert_not_called()

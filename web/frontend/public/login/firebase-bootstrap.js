@@ -47,7 +47,11 @@ import {
   connectAuthEmulator,
 } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js';
 
-const app = initializeApp(window.__firebaseConfig);
+const fbConfig = window.__firebaseConfig;
+if (!fbConfig || typeof fbConfig !== 'object' || !fbConfig.apiKey) {
+  throw new Error('Firebase configuration missing.');
+}
+const app = initializeApp(fbConfig);
 
 // Bind App Check BEFORE getAuth so the auth SDK picks up the App
 // Check token on its first call. Skip when running against the
@@ -90,16 +94,28 @@ if (window.__firebaseEmulatorHost) {
 }
 
 window.__rcSignIn = async function (email, password) {
-  const cred = await signInWithEmailAndPassword(auth, email, password);
+  const trimmedEmail = typeof email === 'string' ? email.trim() : '';
+  if (!trimmedEmail || typeof password !== 'string' || !password) {
+    throw new Error('Email and password are required.');
+  }
+  const cred = await signInWithEmailAndPassword(auth, trimmedEmail, password);
   return await cred.user.getIdToken();
 };
 
 window.__rcSignUp = async function (email, password) {
-  const cred = await createUserWithEmailAndPassword(auth, email, password);
+  const trimmedEmail = typeof email === 'string' ? email.trim() : '';
+  if (!trimmedEmail || typeof password !== 'string' || !password) {
+    throw new Error('Email and password are required.');
+  }
+  const cred = await createUserWithEmailAndPassword(auth, trimmedEmail, password);
   return await cred.user.getIdToken();
 };
 
 window.__rcResetPassword = async function (email) {
+  const trimmedEmail = typeof email === 'string' ? email.trim() : '';
+  if (!trimmedEmail) {
+    throw new Error('Email is required.');
+  }
   // P1.2 (2026-06-22): pass actionCodeSettings so the reset email's
   // 'Continue' button after a successful password reset routes the
   // user back to our /login page instead of Firebase's default
@@ -110,7 +126,7 @@ window.__rcResetPassword = async function (email) {
     url: window.location.origin + '/login',
     handleCodeInApp: false,
   };
-  await sendPasswordResetEmail(auth, email, actionCodeSettings);
+  await sendPasswordResetEmail(auth, trimmedEmail, actionCodeSettings);
 };
 
 // Signal to index.html's submit handler that the module finished

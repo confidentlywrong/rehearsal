@@ -1,6 +1,6 @@
 # A2UI Component Catalog
 
-Reference for the 18 standard A2UI v0.8.0 primitives. Loaded only
+Reference for the 20 standard A2UI v0.8.0 primitives. Loaded only
 when an agent needs to look up component-specific props.
 
 ## Layout
@@ -23,7 +23,8 @@ when an agent needs to look up component-specific props.
 | Image       | `url` (wrapped)   | `fit`, `usageHint`           |                                             |
 | Icon        | `name` (wrapped)  | --                           | Material icon names                         |
 | Video       | `url` (wrapped)   | `autoplay` (wrapped bool)    |                                             |
-| AudioPlayer | `url` (wrapped)   | `description` (wrapped)      |                                             |
+| AudioPlayer      | `url` (wrapped)   | `description` (wrapped)      |                                             |
+| StakeholderGraph | `payload`         | --                           | Interactive stakeholder influence graph     |
 
 ## Input
 

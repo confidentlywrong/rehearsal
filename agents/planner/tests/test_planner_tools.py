@@ -542,7 +542,7 @@ class TestMapsAgentRegistry:
         """When env var is empty, _resolve_maps_key tries Secret Manager."""
         import agents.planner.adk_tools as mod
 
-        mod._resolved_maps_key = None  # Reset cache
+        mod._fetch_maps_key_from_gcloud.cache_clear()
         mock_run.return_value = MagicMock(stdout="secret-key-from-sm\n")
         try:
             key = mod._resolve_maps_key()
@@ -554,7 +554,7 @@ class TestMapsAgentRegistry:
             assert "secrets" in args
             assert "maps-api-key" in " ".join(args)
         finally:
-            mod._resolved_maps_key = None
+            mod._fetch_maps_key_from_gcloud.cache_clear()
 
     @patch.dict(
         "os.environ", {"GOOGLE_MAPS_API_KEY": "env-override-key", "GOOGLE_CLOUD_PROJECT": "test-proj"}, clear=False
@@ -564,13 +564,13 @@ class TestMapsAgentRegistry:
         """Env var takes priority over Secret Manager."""
         import agents.planner.adk_tools as mod
 
-        mod._resolved_maps_key = None  # Reset cache
+        mod._fetch_maps_key_from_gcloud.cache_clear()
         try:
             key = mod._resolve_maps_key()
             assert key == "env-override-key"
             mock_run.assert_not_called()
         finally:
-            mod._resolved_maps_key = None
+            mod._fetch_maps_key_from_gcloud.cache_clear()
 
     @patch.dict("os.environ", {"GOOGLE_MAPS_API_KEY": "", "GOOGLE_CLOUD_PROJECT": "test-proj"}, clear=False)
     @patch("subprocess.run", side_effect=FileNotFoundError("gcloud not found"))
@@ -578,12 +578,12 @@ class TestMapsAgentRegistry:
         """_resolve_maps_key returns None if gcloud is not installed."""
         import agents.planner.adk_tools as mod
 
-        mod._resolved_maps_key = None  # Reset cache
+        mod._fetch_maps_key_from_gcloud.cache_clear()
         try:
             key = mod._resolve_maps_key()
             assert key is None
         finally:
-            mod._resolved_maps_key = None
+            mod._fetch_maps_key_from_gcloud.cache_clear()
 
 
 def test_segments_intersect_crossing():
@@ -1242,3 +1242,89 @@ class TestMappingSkillDoc:
                 "registered tool names use the 'maps' prefix; the bare forms "
                 "will not resolve."
             )
+
+
+class TestPlanMarathonRouteNetworkErrors:
+    """Verify missing or unreadable network.json fails explicitly (no empty FeatureCollection fallback)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_network_json_returns_explicit_error(self):
+        module = _load_route_tools()
+        mock_ctx = MagicMock()
+        mock_ctx.state = {}
+
+        with patch("os.path.exists", return_value=False):
+            result = await module.plan_marathon_route(tool_context=mock_ctx)
+
+        assert result["status"] == "error"
+        assert "network.json" in result["message"]
+        assert "no valid LineString segments" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_network_json_returns_explicit_error(self):
+        module = _load_route_tools()
+        mock_ctx = MagicMock()
+        mock_ctx.state = {}
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=OSError("permission denied")),
+        ):
+            result = await module.plan_marathon_route(tool_context=mock_ctx)
+
+        assert result["status"] == "error"
+        assert "network.json" in result["message"]
+        assert "permission denied" in result["message"]
+
+
+class TestTrafficEnrichmentModelAndEnv:
+    """Verify _gemini_traffic_enrichment model resolution and env var stripping."""
+
+    @pytest.mark.asyncio
+    async def test_honors_model_precedence_and_strips_whitespace_project(self, monkeypatch):
+        from agents.utils.models import DEFAULT_PLANNER_MODEL
+
+        module = _load_route_tools()
+        captured_client_kwargs: list[dict] = []
+        captured_models: list[str] = []
+
+        class FakeModels:
+            async def generate_content(self, *, model, contents):
+                captured_models.append(model)
+                resp = MagicMock()
+                resp.text = '{"narrative": "ok", "congestion_zones": []}'
+                return resp
+
+        def fake_client(**kwargs):
+            captured_client_kwargs.append(kwargs)
+            client = MagicMock()
+            client.aio.models = FakeModels()
+            return client
+
+        with (
+            patch("agents.utils.local_ai.is_local_gemma_active", return_value=False),
+            patch("google.genai.Client", side_effect=fake_client),
+        ):
+            # Case 1: TRAFFIC_ENRICHMENT_MODEL set, whitespace GOOGLE_CLOUD_PROJECT ignored
+            monkeypatch.setenv("TRAFFIC_ENRICHMENT_MODEL", "custom-traffic-model")
+            monkeypatch.setenv("PLANNER_MODEL", "custom-planner-model")
+            monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "   ")
+            monkeypatch.delenv("PROJECT_ID", raising=False)
+            await module._gemini_traffic_enrichment([], [])
+
+            # Case 2: TRAFFIC_ENRICHMENT_MODEL whitespace -> falls back to PLANNER_MODEL
+            monkeypatch.setenv("TRAFFIC_ENRICHMENT_MODEL", "  ")
+            monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", " real-proj ")
+            monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", " us-central1 ")
+            await module._gemini_traffic_enrichment([], [])
+
+            # Case 3: Both unset -> defaults to DEFAULT_PLANNER_MODEL
+            monkeypatch.delenv("TRAFFIC_ENRICHMENT_MODEL", raising=False)
+            monkeypatch.delenv("PLANNER_MODEL", raising=False)
+            await module._gemini_traffic_enrichment([], [])
+
+        assert captured_models == ["custom-traffic-model", "custom-planner-model", DEFAULT_PLANNER_MODEL]
+        assert "vertexai" not in captured_client_kwargs[0]
+        assert captured_client_kwargs[1]["vertexai"] is True
+        assert captured_client_kwargs[1]["project"] == "real-proj"
+        assert captured_client_kwargs[1]["location"] == "us-central1"

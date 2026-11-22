@@ -18,6 +18,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/logging"
@@ -29,29 +30,51 @@ import (
 // portal opens the Stripe session.
 //
 // allowedBaseURL is the trusted base URL the return URL must share
-// an origin with (typically STRIPE_RETURN_BASE_URL). When empty
-// (stub creator path / tests) the origin check is skipped.
+// an origin with (typically STRIPE_RETURN_BASE_URL). Fails closed
+// with 503 portal_unavailable when empty.
 func PortalHandler(users UserLookup, portal PortalCreator, allowedBaseURL string) gin.HandlerFunc {
+	trimmedBase := strings.TrimSpace(allowedBaseURL)
 	return func(c *gin.Context) {
 		uc, ok := account.FromContextOK(c.Request.Context())
 		if !ok || uc.UserID == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
 		}
+		if users == nil || portal == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "billing portal not configured", "code": "portal_unavailable",
+			})
+			return
+		}
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+		}
 		var req struct {
 			ReturnURL string `json:"return_url"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body exceeds 1 MiB limit"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 			return
 		}
+		if trimmedBase == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "billing portal not configured", "code": "portal_unavailable",
+			})
+			return
+		}
+		req.ReturnURL = strings.TrimSpace(req.ReturnURL)
 		if req.ReturnURL == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "return_url required"})
 			return
 		}
 		// Open-redirect guard (MED-2 in the 2026-06-25 audit). The
 		// return_url must share an origin with allowedBaseURL.
-		if err := ValidateRedirectURL(req.ReturnURL, allowedBaseURL); err != nil {
+		if err := ValidateRedirectURL(req.ReturnURL, trimmedBase); err != nil {
 			logging.FromContext(c.Request.Context()).Warn("billing.portal.bad_return_url",
 				slog.String("user_id", uc.UserID),
 				slog.String("url", req.ReturnURL),

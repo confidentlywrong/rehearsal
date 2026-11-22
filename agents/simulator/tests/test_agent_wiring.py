@@ -653,3 +653,53 @@ class TestPipelineReexecutionGuard:
 
         _guard_pipeline_reexecution(tool=tool, args={}, tool_context=tool_context)
         assert tool_context.state.get("_pipeline_executed") is True
+
+
+class TestSimulatorModelAndPortResolution:
+    """Regression tests for centralized model & port resolution."""
+
+    def test_default_simulator_model_uses_canonical_flash_lite(self):
+        from agents.simulator.agent import DEFAULT_SIMULATOR_MODEL
+        from agents.utils.models import DEFAULT_FLASH_LITE_MODEL
+
+        assert DEFAULT_SIMULATOR_MODEL == DEFAULT_FLASH_LITE_MODEL
+        assert DEFAULT_SIMULATOR_MODEL == "gemini-3.5-flash-lite"
+
+    def test_simulator_model_ignores_blank_env(self, monkeypatch):
+        from agents.simulator.agent import DEFAULT_SIMULATOR_MODEL
+        from agents.utils.models import get_model
+
+        monkeypatch.setenv("SIMULATOR_MODEL", "   ")
+        assert get_model("SIMULATOR_MODEL", DEFAULT_SIMULATOR_MODEL) == "gemini-3.5-flash-lite"
+        monkeypatch.setenv("SIMULATOR_MODEL", " gemini-3-flash-preview ")
+        assert get_model("SIMULATOR_MODEL", DEFAULT_SIMULATOR_MODEL) == "gemini-3-flash-preview"
+
+    def test_resolve_port_handles_empty_port_env(self, monkeypatch):
+        from agents.simulator.agent import _resolve_port
+        from agents.simulator_with_failure.agent import _resolve_port as _resolve_fail_port
+
+        monkeypatch.setenv("PORT", "")
+        monkeypatch.setenv("SIMULATOR_PORT", "")
+        monkeypatch.setenv("SIMULATOR_WITH_FAILURE_PORT", "")
+        assert _resolve_port() == 9104
+        assert _resolve_fail_port() == 9107
+
+    def test_tick_callback_detects_error_response(self):
+        from google.genai import types
+        from agents.simulator.tick_callback import _detect_phase
+
+        req = MagicMock()
+        req.contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name="advance_tick",
+                            response={"status": "error", "message": "publish failed"},
+                        )
+                    )
+                ],
+            )
+        ]
+        assert _detect_phase(req) == "error::advance_tick::publish failed"

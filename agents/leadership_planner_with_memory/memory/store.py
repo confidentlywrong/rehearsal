@@ -22,14 +22,15 @@ API as :class:`AlloyDBScenarioStore` so it can be swapped in directly:
     from agents.leadership_planner_with_memory.memory.store import ScenarioMemoryStore
     tools._store = ScenarioMemoryStore()
 
-Used by unit tests (no AlloyDB required) and as a local fallback when
-``ALLOYDB_HOST`` is unset.  Mirrors the marathon
-``agents/planner_with_memory/memory/store.py`` pattern but with
-leadership-domain naming (scenarios instead of routes).
+Used by unit tests (no AlloyDB required); production persistence is wired
+unconditionally to ``AlloyDBScenarioStore`` in ``memory/tools.py``.
+Mirrors the marathon ``agents/planner_with_memory/memory/store.py`` pattern
+but with leadership-domain naming (scenarios instead of routes).
 """
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -37,6 +38,47 @@ from agents.leadership_planner_with_memory.memory.schemas import (
     PlannedScenario,
     SimulationRecord,
 )
+
+
+def _sanitize_score(score: float | None) -> float | None:
+    if score is None or isinstance(score, bool):
+        return None
+    try:
+        val = float(score)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _clamp_non_negative_limit(raw: object, default: int, max_limit: int | None = None) -> int:
+    """Safely coerce and clamp a limit parameter to [0, max_limit]."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return default
+        val = int(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return default
+        try:
+            val = int(s)
+        except ValueError:
+            try:
+                fv = float(s)
+            except (ValueError, OverflowError):
+                return default
+            if not math.isfinite(fv):
+                return default
+            val = int(fv)
+    else:
+        return default
+    if val <= 0:
+        return 0
+    return min(val, max_limit) if max_limit is not None else val
 
 
 class ScenarioMemoryStore:
@@ -84,7 +126,7 @@ class ScenarioMemoryStore:
             scenario_id=scenario_id,
             scenario_data=scenario_data,
             created_at=datetime.now(tz=timezone.utc),
-            evaluation_score=evaluation_score,
+            evaluation_score=_sanitize_score(evaluation_score),
             evaluation_result=evaluation_result,
             persona=persona,
             owner_id=owner_id,
@@ -149,8 +191,9 @@ class ScenarioMemoryStore:
         if owner_id is not None and scenario.owner_id != owner_id:
             return False
         changed = False
-        if scenario.evaluation_score is None and evaluation_score is not None:
-            scenario.evaluation_score = evaluation_score
+        safe_score = _sanitize_score(evaluation_score)
+        if scenario.evaluation_score is None and safe_score is not None:
+            scenario.evaluation_score = safe_score
             changed = True
         if scenario.evaluation_result is None and evaluation_result is not None:
             scenario.evaluation_result = evaluation_result
@@ -180,14 +223,15 @@ class ScenarioMemoryStore:
         if sort_by == "best_score":
             scenarios.sort(
                 key=lambda s: (
-                    s.evaluation_score is not None,
-                    s.evaluation_score if s.evaluation_score is not None else 0.0,
+                    _sanitize_score(s.evaluation_score) is not None,
+                    _sanitize_score(s.evaluation_score) or 0.0,
                 ),
                 reverse=True,
             )
         else:
             scenarios.sort(key=lambda s: s.created_at, reverse=True)
-        return scenarios[:count]
+        safe_count = _clamp_non_negative_limit(count, default=10)
+        return scenarios[:min(safe_count, len(scenarios))]
 
     async def get_best_scenario(
         self,
@@ -200,11 +244,12 @@ class ScenarioMemoryStore:
         scored = [
             s
             for s in self._scenarios.values()
-            if s.evaluation_score is not None and (owner_id is None or s.owner_id == owner_id)
+            if _sanitize_score(s.evaluation_score) is not None
+            and (owner_id is None or s.owner_id == owner_id)
         ]
         if not scored:
             return None
-        return max(scored, key=lambda s: s.evaluation_score)  # type: ignore[arg-type]
+        return max(scored, key=lambda s: _sanitize_score(s.evaluation_score) or 0.0)
 
     async def store_scenario_idempotent(
         self,
@@ -225,7 +270,7 @@ class ScenarioMemoryStore:
             scenario_id=scenario_id,
             scenario_data=scenario_data,
             created_at=created_at,
-            evaluation_score=evaluation_score,
+            evaluation_score=_sanitize_score(evaluation_score),
             evaluation_result=evaluation_result,
             owner_id=owner_id,
         )
@@ -315,7 +360,9 @@ class ScenarioMemoryStore:
         **Return-shape contract** (shared with :class:`AlloyDBScenarioStore`):
         each dict has keys ``scenario_id``, ``eval_score``, ``created_at``,
         ``stakeholder_graph``, ``stakeholder_personas``,
-        ``stakeholder_reactions``. Artifact values are ``dict | None``.
+        ``stakeholder_reactions``, ``simulation_timeline``,
+        ``simulation_report``, ``stakeholder_interview``. Artifact values are
+        ``dict | list | None``.
 
         Each returned dict has the shape::
 
@@ -326,6 +373,9 @@ class ScenarioMemoryStore:
                 "stakeholder_graph": dict | None,
                 "stakeholder_personas": dict | None,
                 "stakeholder_reactions": dict | None,
+                "simulation_timeline": dict | None,
+                "simulation_report": dict | None,
+                "stakeholder_interview": dict | list | None,
             }
 
         Scenarios without a stored artifact bundle still appear (with
@@ -336,8 +386,9 @@ class ScenarioMemoryStore:
         if owner_id is not None:
             scenarios = [s for s in scenarios if s.owner_id == owner_id]
         scenarios.sort(key=lambda s: s.created_at, reverse=True)
+        safe_limit = _clamp_non_negative_limit(limit, default=100)
         bundles: list[dict] = []
-        for scenario in scenarios[:limit]:
+        for scenario in scenarios[:min(safe_limit, len(scenarios))]:
             artifacts = self._artifacts.get(scenario.scenario_id) or {}
             bundles.append(
                 {

@@ -51,14 +51,14 @@ _terraform_outputs_cache: dict | None = None
 # to this file, so the python:3.13-slim AE deploy steps (which do NOT have
 # a terraform binary) can still load infrastructure values without shelling
 # out. Module-level for monkeypatchability in tests.
-_TF_OUTPUTS_FILE = "/workspace/tf_outputs.json"
+_TF_OUTPUTS_FILE = os.getenv("TF_OUTPUTS_FILE", "/workspace/tf_outputs.json")
 
 
 def _read_terraform_outputs() -> dict:
     """Read infrastructure values from Terraform outputs.
 
     Resolution order:
-      1. /workspace/tf_outputs.json (Cloud Build path; the slim python image
+      1. TF_OUTPUTS_FILE / /workspace/tf_outputs.json (Cloud Build path; the slim python image
          has no terraform binary -- without this, AE deploys silently fall
          back to empty env vars and Vertex rejects them).
       2. ``terraform -chdir=infra output -json`` (local dev with terraform on PATH).
@@ -74,10 +74,16 @@ def _read_terraform_outputs() -> dict:
     if os.path.exists(_TF_OUTPUTS_FILE):
         try:
             with open(_TF_OUTPUTS_FILE) as f:
-                raw = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise RuntimeError(
+                    f"Failed to read Terraform outputs from {_TF_OUTPUTS_FILE}: "
+                    f"expected JSON object, got {type(loaded).__name__}"
+                )
+            raw = loaded
             print(f"  Loaded Terraform outputs from {_TF_OUTPUTS_FILE}")
         except (OSError, json.JSONDecodeError) as e:
-            print(f"  {_TF_OUTPUTS_FILE} present but unreadable ({e}); falling back")
+            raise RuntimeError(f"Failed to read Terraform outputs from {_TF_OUTPUTS_FILE}: {e}") from e
 
     # 2. Local dev path: shell out to terraform.
     if raw is None:
@@ -88,7 +94,13 @@ def _read_terraform_outputs() -> dict:
                 text=True,
                 check=True,
             )
-            raw = json.loads(result.stdout)
+            loaded = json.loads(result.stdout)
+            if not isinstance(loaded, dict):
+                raise RuntimeError(
+                    f"Failed to read Terraform outputs from terraform output: "
+                    f"expected JSON object, got {type(loaded).__name__}"
+                )
+            raw = loaded
         except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
             print(f"  Terraform outputs unavailable ({e}), falling back to env vars")
             raw = {}
@@ -282,7 +294,7 @@ def _extract_resource_name(url: str) -> str | None:
     idx = url.find(prefix)
     if idx == -1:
         return None
-    resource = url[idx + len(prefix) :]
+    resource = url[idx + len(prefix) :].rstrip("/")
     return resource if resource else None
 
 
@@ -389,8 +401,8 @@ def _fetch_current_card_version(resource_name: str, location: str) -> str | None
         )
         if resp.status_code == 200:
             return resp.json().get("version")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"   WARNING: failed to fetch current card version from {card_url}: {e}")
     return None
 
 
@@ -618,31 +630,33 @@ def _stage_extra_packages(
     Returns (temp_dir_path, staged_package_paths).
     """
     staging_dir = tempfile.mkdtemp(prefix="ae-staging-")
-    for pkg_path in extra_packages:
-        dest = os.path.join(staging_dir, pkg_path)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if os.path.isfile(pkg_path):
-            shutil.copy2(pkg_path, dest)
-        elif os.path.isdir(pkg_path):
-            shutil.copytree(pkg_path, dest, ignore=_staging_ignore)
-        else:
-            print(f"   Skipping non-existent path: {pkg_path}")
-            continue
-    staged_paths = sorted(os.listdir(staging_dir))
-    return staging_dir, staged_paths
+    try:
+        for pkg_path in extra_packages:
+            dest = os.path.join(staging_dir, pkg_path)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.isfile(pkg_path):
+                shutil.copy2(pkg_path, dest)
+            elif os.path.isdir(pkg_path):
+                shutil.copytree(pkg_path, dest, ignore=_staging_ignore)
+            else:
+                raise FileNotFoundError(f"Required package path does not exist: {pkg_path}")
+        staged_paths = sorted(os.listdir(staging_dir))
+        return staging_dir, staged_paths
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
 
 def _read_requirements():
     """Read project dependencies from pyproject.toml for Agent Engine."""
-    try:
-        import tomllib
+    import tomllib
 
-        with open("pyproject.toml", "rb") as f:
-            data = tomllib.load(f)
-        return data.get("project", {}).get("dependencies", [])
-    except Exception as e:
-        print(f"   Could not read pyproject.toml: {e}")
-        return []
+    with open("pyproject.toml", "rb") as f:
+        data = tomllib.load(f)
+    deps = data.get("project", {}).get("dependencies")
+    if not isinstance(deps, list):
+        raise ValueError("pyproject.toml missing [project].dependencies list")
+    return deps
 
 
 # Cloudpickle bytes embed class definitions and state-dict shapes from
@@ -708,7 +722,9 @@ def deploy_agent_engine(service_name: str, cfg: dict, *, tf: dict, force_create:
         print(f"  {service_name}: missing 'module', 'attr', or 'path' in SERVICES config")
         sys.exit(1)
 
-    project_id = tf["project_id"]
+    project_id = (tf.get("project_id") or "").strip()
+    if not project_id:
+        raise ValueError("project_id is required (missing from Terraform outputs and PROJECT_ID env var)")
     ae_location = os.getenv("AGENT_ENGINE_LOCATION", tf["region"])
     staging_bucket = tf.get("staging_bucket") or os.getenv("STAGING_BUCKET", f"gs://{project_id}-staging")
 
@@ -723,222 +739,229 @@ def deploy_agent_engine(service_name: str, cfg: dict, *, tf: dict, force_create:
     # (requires real region, not ``global``).
     saved_location = os.environ.get("GOOGLE_CLOUD_LOCATION")
     os.environ["GOOGLE_CLOUD_LOCATION"] = ae_location
-    vertexai.init(
-        project=project_id,
-        location=ae_location,
-        staging_bucket=staging_bucket,
-    )
-
-    # Read requirements.
-    requirements = _read_requirements()
-    ae_req = "google-cloud-aiplatform[agent_engines,adk]>=1.121.0"
-    if not any("google-cloud-aiplatform" in r for r in requirements):
-        requirements.append(ae_req)
-    requirements = _pin_all_requirements(requirements)
-    print(f"   {len(requirements)} dependencies")
-
-    # Stage source packages.
-    raw_packages = [
-        agent_path,
-        "agents/utils",
-        "agents/__init__.py",
-        "agents/skills",
-        "gen_proto",
-        *cfg.get("extra_packages", []),
-    ]
-    staging_dir, staged_packages = _stage_extra_packages(raw_packages)
-    print(f"   Staged {len(staged_packages)} packages to {staging_dir}")
-
-    build_fingerprint = _compute_staging_fingerprint(staging_dir)
-    print(f"   Build fingerprint: {build_fingerprint}")
-
-    # Import the agent module.
-    os.environ["DISPATCH_MODE"] = "callable"
-    os.environ["BUILD_FINGERPRINT"] = build_fingerprint
-    print(f"   Importing {module_path}:{attr_name}...")
-    mod = importlib.import_module(module_path)
-    a2a_agent = getattr(mod, attr_name)
-
-    # Create vs. update. Location for AE list/get is implicit from the
-    # vertexai.init(project=..., location=ae_location) call earlier in
-    # this function -- no per-helper parameter needed.
-    mode, existing_resource = _determine_deploy_mode(service_name, force_create=force_create)
-
-    previous_fingerprint = None
-    if mode == "update" and existing_resource:
-        previous_fingerprint = _fetch_current_card_version(existing_resource, ae_location)
-        if previous_fingerprint:
-            if previous_fingerprint == build_fingerprint:
-                print(f"   Code unchanged (fingerprint {build_fingerprint} already serving)")
-            else:
-                print(f"   Previous fingerprint: {previous_fingerprint}")
-
-    # Build env vars for Agent Engine.
-    redis_addr = f"{tf['redis_host']}:{tf['redis_port']}" if tf["redis_host"] else ""
-    # Construct gateway URL deterministically from project_number + region.
-    # See _construct_gateway_url() for the rationale (the slim Cloud Build
-    # image has no gcloud and the gateway Cloud Run service doesn't exist
-    # yet at deploy-ae time -- both ruled out a runtime gcloud lookup).
-    gateway_url = _construct_gateway_url(tf.get("project_number", ""), tf["region"])
-    ae_env_vars = {
-        "PROJECT_ID": project_id,
-        "VERTEXAI_PROJECT": project_id,
-        "VERTEXAI_LOCATION": ae_location,
-        "DISPATCH_MODE": "callable",
-        "GATEWAY_URL": gateway_url,
-        "GATEWAY_INTERNAL_URL": gateway_url,
-        "REDIS_ADDR": redis_addr,
-        "REDIS_MAX_CONNECTIONS": "10",
-        "PUBSUB_PROJECT_ID": project_id,
-        # PUBSUB_TOPIC_ID drives the DashLog plugin's telemetry publisher
-        # (agents/utils/plugins.py RedisDashLogPlugin). It MUST be a separate
-        # topic from ORCHESTRATION_TOPIC_ID -- the orchestration topic has a
-        # push subscription to the gateway that strictly parses messages as
-        # gateway.Wrapper proto and HTTP-400s anything else.
-        "PUBSUB_TOPIC_ID": tf["telemetry_topic"],
-        "ORCHESTRATION_TOPIC_ID": tf["orchestration_topic"],
-        "GOOGLE_CLOUD_LOCATION": "global",
-        "GOOGLE_GENAI_USE_ENTERPRISE": "true",
-        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
-        "LITELLM_TELEMETRY": "False",
-        "BUILD_FINGERPRINT": build_fingerprint,
-    }
-
-    # Simulation defaults.
-    for sim_key in (
-        "SIM_DEFAULT_DURATION_SECONDS",
-        "SIM_DEFAULT_TICK_INTERVAL_SECONDS",
-    ):
-        val = os.getenv(sim_key)
-        if val:
-            ae_env_vars[sim_key] = val
-
-    # Propagate peer AE agent URLs.
-    for svc_key, svc_cfg in SERVICES.items():
-        if svc_cfg["type"] == "reasoning-engine":
-            url = os.getenv(f"{svc_key.upper()}_INTERNAL_URL", "")
-            if url:
-                ae_env_vars[f"{svc_key.upper()}_INTERNAL_URL"] = url
-
-    # Database wiring for planner_with_memory's route store + rules tools.
-    # The agent code reads env vars named ``ALLOYDB_*`` regardless of the
-    # actual backend; in OSS those are wired to the Cloud SQL instance
-    # provisioned by Terraform (``database_ip`` resolves to the Cloud SQL
-    # private IP because ``enable_alloydb`` defaults to false). The
-    # ``USE_ALLOYDB=false`` switch flips the agent's tool layer to its
-    # Cloud SQL + Vertex AI embedding code path
-    # (see agents/planner_with_memory/memory/tools.py:_resolve_embedding_backend).
-    db_host = tf.get("database_ip") or ""
-    db_type = tf.get("database_type") or "cloud-sql"
-    db_secret_id = tf.get("database_password_secret_id") or ""
-    # cloud-sql-postgres module names its database "agent_memory" by
-    # default. Tracked as a tf output for forward-compat in case the
-    # name becomes configurable.
-    db_name = tf.get("database_name") or "agent_memory"
-    if db_host:
-        ae_env_vars["USE_ALLOYDB"] = "true" if db_type == "alloydb" else "false"
-        ae_env_vars["ALLOYDB_HOST"] = db_host
-        ae_env_vars["ALLOYDB_USER"] = "postgres"
-        ae_env_vars["ALLOYDB_DATABASE"] = db_name
-        ae_env_vars["ALLOYDB_SCHEMA"] = "public"
-        if db_secret_id:
-            # Vertex AI Agent Engine env supports Secret Manager refs as
-            # dicts: ``{"secret": "<secret-id>", "version": "latest"}``.
-            ae_env_vars["ALLOYDB_PASSWORD"] = {
-                "secret": db_secret_id,
-                "version": "latest",
-            }
-
-    # Strip empty values: Vertex AI's reasoning_engine.spec.deployment_spec.env
-    # validator rejects "Required field is not set" when an env var has an
-    # empty value (e.g. GATEWAY_URL during the bootstrap phase, before the
-    # Cloud Run gateway has been deployed by tf-apply-services). Missing keys
-    # are accepted; empty values are not. Any vars stripped here can be
-    # populated post-bootstrap by an explicit AE update. Secret-ref dict
-    # values pass through (the != "" comparison is False for non-strings).
-    ae_env_vars = {k: v for k, v in ae_env_vars.items() if v != ""}
-
-    # PSC network attachment (from Terraform or env).
-    psc_attachment = tf.get("psc_network_attachment")
-    psc_config = None
-    if psc_attachment:
-        psc_config = {"network_attachment": psc_attachment}
-
-    # Service account from Terraform.
-    sa = tf.get("agent_engine_sa_email", "")
-
-    # Deploy.
-    from vertexai import agent_engines
-
-    original_dir = os.getcwd()
-    os.chdir(staging_dir)
+    staging_dir: str | None = None
     try:
-        # Resource floor: 2Gi/1CPU per-service in the SERVICES dict
-        # (the AE container is mostly waiting on Gemini API responses).
-        resource_limits = cfg.get("resource_limits", {"memory": "2Gi", "cpu": "1"})
-
-        # min_instances/max_instances intentionally not set unless the
-        # SERVICES cfg overrides: AE's defaults give scale-to-zero
-        # between simulations and a sensible burst cap.
-        deploy_kwargs = dict(
-            agent_engine=a2a_agent,
-            display_name=service_name,
-            description=f"{service_name} agent",
-            requirements=requirements,
-            extra_packages=staged_packages,
-            env_vars=ae_env_vars,
-            min_instances=cfg.get("min_instances", 0),
-            resource_limits=resource_limits,
-            container_concurrency=5,
-            gcs_dir_name=f"agent_engine/{service_name}",
+        vertexai.init(
+            project=project_id,
+            location=ae_location,
+            staging_bucket=staging_bucket,
         )
-        if "max_instances" in cfg:
-            deploy_kwargs["max_instances"] = cfg["max_instances"]
-        if psc_config:
-            deploy_kwargs["psc_interface_config"] = psc_config
-        if sa:
-            deploy_kwargs["service_account"] = sa
-        if mode == "update":
-            assert existing_resource is not None
-            print(f"\n   Updating existing Agent Engine ({existing_resource})...")
-            deploy_kwargs["resource_name"] = existing_resource
-            deployed = agent_engines.update(**deploy_kwargs)
-        else:
-            print("\n   Creating new Agent Engine...")
-            deployed = agent_engines.create(**deploy_kwargs)
+
+        # Read requirements.
+        requirements = _read_requirements()
+        ae_req = "google-cloud-aiplatform[agent_engines,adk]>=1.121.0"
+        if not any("google-cloud-aiplatform" in r for r in requirements):
+            requirements.append(ae_req)
+        requirements = _pin_all_requirements(requirements)
+        print(f"   {len(requirements)} dependencies")
+
+        # Stage source packages.
+        raw_packages = [
+            agent_path,
+            "agents/utils",
+            "agents/__init__.py",
+            "agents/skills",
+            "gen_proto",
+            *cfg.get("extra_packages", []),
+        ]
+        staging_dir, staged_packages = _stage_extra_packages(raw_packages)
+        print(f"   Staged {len(staged_packages)} packages to {staging_dir}")
+
+        build_fingerprint = _compute_staging_fingerprint(staging_dir)
+        print(f"   Build fingerprint: {build_fingerprint}")
+
+        # Import the agent module.
+        os.environ["DISPATCH_MODE"] = "callable"
+        os.environ["BUILD_FINGERPRINT"] = build_fingerprint
+        print(f"   Importing {module_path}:{attr_name}...")
+        mod = importlib.import_module(module_path)
+        a2a_agent = getattr(mod, attr_name)
+
+        # Create vs. update. Location for AE list/get is implicit from the
+        # vertexai.init(project=..., location=ae_location) call earlier in
+        # this function -- no per-helper parameter needed.
+        mode, existing_resource = _determine_deploy_mode(service_name, force_create=force_create)
+
+        previous_fingerprint = None
+        if mode == "update" and existing_resource:
+            previous_fingerprint = _fetch_current_card_version(existing_resource, ae_location)
+            if previous_fingerprint:
+                if previous_fingerprint == build_fingerprint:
+                    print(f"   Code unchanged (fingerprint {build_fingerprint} already serving)")
+                else:
+                    print(f"   Previous fingerprint: {previous_fingerprint}")
+
+        # Build env vars for Agent Engine.
+        redis_addr = f"{tf['redis_host']}:{tf['redis_port']}" if tf["redis_host"] else ""
+        # Construct gateway URL deterministically from project_number + region.
+        # See _construct_gateway_url() for the rationale (the slim Cloud Build
+        # image has no gcloud and the gateway Cloud Run service doesn't exist
+        # yet at deploy-ae time -- both ruled out a runtime gcloud lookup).
+        gateway_url = _construct_gateway_url(tf.get("project_number", ""), tf["region"])
+        ae_env_vars = {
+            "PROJECT_ID": project_id,
+            "VERTEXAI_PROJECT": project_id,
+            "VERTEXAI_LOCATION": ae_location,
+            "DISPATCH_MODE": "callable",
+            "GATEWAY_URL": gateway_url,
+            "GATEWAY_INTERNAL_URL": gateway_url,
+            "REDIS_ADDR": redis_addr,
+            "REDIS_MAX_CONNECTIONS": "10",
+            "PUBSUB_PROJECT_ID": project_id,
+            # PUBSUB_TOPIC_ID drives the DashLog plugin's telemetry publisher
+            # (agents/utils/plugins.py RedisDashLogPlugin). It MUST be a separate
+            # topic from ORCHESTRATION_TOPIC_ID -- the orchestration topic has a
+            # push subscription to the gateway that strictly parses messages as
+            # gateway.Wrapper proto and HTTP-400s anything else.
+            "PUBSUB_TOPIC_ID": tf["telemetry_topic"],
+            "ORCHESTRATION_TOPIC_ID": tf["orchestration_topic"],
+            "GOOGLE_CLOUD_LOCATION": "global",
+            "GOOGLE_GENAI_USE_ENTERPRISE": "true",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+            "LITELLM_TELEMETRY": "False",
+            "BUILD_FINGERPRINT": build_fingerprint,
+        }
+
+        # Simulation defaults.
+        for sim_key in (
+            "SIM_DEFAULT_DURATION_SECONDS",
+            "SIM_DEFAULT_TICK_INTERVAL_SECONDS",
+        ):
+            val = os.getenv(sim_key)
+            if val:
+                ae_env_vars[sim_key] = val
+
+        # Propagate peer AE agent URLs.
+        for svc_key, svc_cfg in SERVICES.items():
+            if svc_cfg["type"] == "reasoning-engine":
+                url = os.getenv(f"{svc_key.upper()}_INTERNAL_URL", "")
+                if url:
+                    ae_env_vars[f"{svc_key.upper()}_INTERNAL_URL"] = url
+
+        # Database wiring for planner_with_memory's route store + rules tools.
+        # The agent code reads env vars named ``ALLOYDB_*`` regardless of the
+        # actual backend; in OSS those are wired to the Cloud SQL instance
+        # provisioned by Terraform (``database_ip`` resolves to the Cloud SQL
+        # private IP because ``enable_alloydb`` defaults to false). The
+        # ``USE_ALLOYDB=false`` switch flips the agent's tool layer to its
+        # Cloud SQL + Vertex AI embedding code path
+        # (see agents/planner_with_memory/memory/tools.py:_resolve_embedding_backend).
+        db_host = tf.get("database_ip") or ""
+        db_type = tf.get("database_type") or "cloud-sql"
+        db_secret_id = tf.get("database_password_secret_id") or ""
+        # cloud-sql-postgres module names its database "agent_memory" by
+        # default. Tracked as a tf output for forward-compat in case the
+        # name becomes configurable.
+        db_name = tf.get("database_name") or "agent_memory"
+        if db_host:
+            ae_env_vars["USE_ALLOYDB"] = "true" if db_type == "alloydb" else "false"
+            ae_env_vars["ALLOYDB_HOST"] = db_host
+            ae_env_vars["ALLOYDB_USER"] = "postgres"
+            ae_env_vars["ALLOYDB_DATABASE"] = db_name
+            ae_env_vars["ALLOYDB_SCHEMA"] = "public"
+            if db_secret_id:
+                # Vertex AI Agent Engine env supports Secret Manager refs as
+                # dicts: ``{"secret": "<secret-id>", "version": "latest"}``.
+                ae_env_vars["ALLOYDB_PASSWORD"] = {
+                    "secret": db_secret_id,
+                    "version": "latest",
+                }
+
+        # Strip empty values: Vertex AI's reasoning_engine.spec.deployment_spec.env
+        # validator rejects "Required field is not set" when an env var has an
+        # empty value (e.g. GATEWAY_URL during the bootstrap phase, before the
+        # Cloud Run gateway has been deployed by tf-apply-services). Missing keys
+        # are accepted; empty values are not. Any vars stripped here can be
+        # populated post-bootstrap by an explicit AE update. Secret-ref dict
+        # values pass through (the != "" comparison is False for non-strings).
+        ae_env_vars = {k: v for k, v in ae_env_vars.items() if v != ""}
+
+        # PSC network attachment (from Terraform or env).
+        psc_attachment = tf.get("psc_network_attachment")
+        psc_config = None
+        if psc_attachment:
+            psc_config = {"network_attachment": psc_attachment}
+
+        # Service account from Terraform.
+        sa = tf.get("agent_engine_sa_email", "")
+
+        # Deploy.
+        from vertexai import agent_engines
+
+        original_dir = os.getcwd()
+        os.chdir(staging_dir)
+        try:
+            # Resource floor: 2Gi/1CPU per-service in the SERVICES dict
+            # (the AE container is mostly waiting on Gemini API responses).
+            resource_limits = cfg.get("resource_limits", {"memory": "2Gi", "cpu": "1"})
+
+            # min_instances/max_instances intentionally not set unless the
+            # SERVICES cfg overrides: AE's defaults give scale-to-zero
+            # between simulations and a sensible burst cap.
+            deploy_kwargs = dict(
+                agent_engine=a2a_agent,
+                display_name=service_name,
+                description=f"{service_name} agent",
+                requirements=requirements,
+                extra_packages=staged_packages,
+                env_vars=ae_env_vars,
+                min_instances=cfg.get("min_instances", 0),
+                resource_limits=resource_limits,
+                container_concurrency=5,
+                gcs_dir_name=f"agent_engine/{service_name}",
+            )
+            if "max_instances" in cfg:
+                deploy_kwargs["max_instances"] = cfg["max_instances"]
+            if psc_config:
+                deploy_kwargs["psc_interface_config"] = psc_config
+            if sa:
+                deploy_kwargs["service_account"] = sa
+            if mode == "update":
+                assert existing_resource is not None
+                print(f"\n   Updating existing Agent Engine ({existing_resource})...")
+                deploy_kwargs["resource_name"] = existing_resource
+                deployed = agent_engines.update(**deploy_kwargs)
+            else:
+                print("\n   Creating new Agent Engine...")
+                deployed = agent_engines.create(**deploy_kwargs)
+        finally:
+            os.chdir(original_dir)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+        resource_name = deployed.resource_name
+        agent_engine_id = resource_name.split("/")[-1]
+        a2a_url = _build_resource_url(resource_name, ae_location)
+
+        print("\n  Agent Engine deployed.")
+        print(f"   Resource:     {resource_name}")
+        print(f"   Engine ID:    {agent_engine_id}")
+        print(f"   A2A Endpoint: {a2a_url}")
+        print("\n   Set this env var for gateway discovery:")
+        print(f"   {service_name.upper()}_INTERNAL_URL={a2a_url}")
+
+        # Apply labels post-create (the SDK doesn't accept them on create/update).
+        # Mirrors the tf provider's default_labels so AE engines and Cloud Run
+        # services end up with the same label set.
+        _apply_labels_to_engine(resource_name, ae_location, _resolve_ae_labels())
+
+        verified = _verify_deployed_agent(
+            service_name,
+            resource_name,
+            ae_location,
+            expected_fingerprint=build_fingerprint,
+            previous_fingerprint=previous_fingerprint,
+        )
+        if verified is not True:
+            raise RuntimeError(
+                f"Agent Engine verification failed for {service_name} ({resource_name}): verified={verified!r}"
+            )
     finally:
-        os.chdir(original_dir)
-        shutil.rmtree(staging_dir, ignore_errors=True)
-
-    resource_name = deployed.resource_name
-    agent_engine_id = resource_name.split("/")[-1]
-    a2a_url = _build_resource_url(resource_name, ae_location)
-
-    print("\n  Agent Engine deployed.")
-    print(f"   Resource:     {resource_name}")
-    print(f"   Engine ID:    {agent_engine_id}")
-    print(f"   A2A Endpoint: {a2a_url}")
-    print("\n   Set this env var for gateway discovery:")
-    print(f"   {service_name.upper()}_INTERNAL_URL={a2a_url}")
-
-    # Apply labels post-create (the SDK doesn't accept them on create/update).
-    # Mirrors the tf provider's default_labels so AE engines and Cloud Run
-    # services end up with the same label set.
-    _apply_labels_to_engine(resource_name, ae_location, _resolve_ae_labels())
-
-    _verify_deployed_agent(
-        service_name,
-        resource_name,
-        ae_location,
-        expected_fingerprint=build_fingerprint,
-        previous_fingerprint=previous_fingerprint,
-    )
-
-    # Restore GOOGLE_CLOUD_LOCATION.
-    if saved_location is not None:
-        os.environ["GOOGLE_CLOUD_LOCATION"] = saved_location
-    else:
-        os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
+        if staging_dir:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        if saved_location is not None:
+            os.environ["GOOGLE_CLOUD_LOCATION"] = saved_location
+        else:
+            os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
 
     return a2a_url
 

@@ -6,8 +6,7 @@ communication, telemetry, session management, dispatching, and serving.
 
 ## What's in here
 
-This package has 27 modules. Rather than listing them alphabetically, here's
-how they group by responsibility:
+Here is how the modules in `agents/utils/` group by responsibility:
 
 ### Agent wiring
 
@@ -73,8 +72,17 @@ how they group by responsibility:
 
 | Module | What it does |
 |:-------|:-------------|
-| `a2ui.py` | A2UI v1.0 component builder. 18 primitive property builders + `Surface` class for composing UI component trees that agents deliver to the frontend. |
+| `a2ui_helpers.py` | Markdown-to-A2UI conversion helpers for agent outputs. |
 | `deployment.py` | `create_a2a_deployment()` -- factory for Agent Engine deployment artifacts. |
+| `gateway.py` | Canonical Gateway port (`9101`) and URL resolution helper (`get_gateway_url()`). |
+| `local_ai.py` | Local Google AI Engine adapter (`LocalGemmaOllama`, `EmbeddingGemma`, `get_ai_settings()`). |
+| `loop_agent_ext.py` | `TenantSafeLoopAgent` -- loop agent respecting session-scoped iteration overrides. |
+| `metering.py` | Per-user token metering (`MeteringPlugin`, `SqliteSink`, `PubSubSink`, `StdoutSink`, `NullSink`). |
+| `models.py` | Canonical Gemini model constants (`DEFAULT_PLANNER_MODEL`, `DEFAULT_EVALUATOR_MODEL`, `DEFAULT_FLASH_LITE_MODEL`, `DEFAULT_EMBEDDING_MODEL`). |
+| `station_index.py` | Station coordinate indexing helpers for route lookup. |
+| `tenant_keys.py` | Tenant-namespaced Redis key composition (`key()`, `key_for_user()`). |
+| `tenant_paths.py` | Tenant-namespaced filesystem path helpers for simulation run artifacts. |
+| `user_auth_context.py` | Process-local session-scoped bearer token store for user-authenticated gateway calls. |
 
 ## How agents are assembled
 
@@ -179,16 +187,22 @@ in the environment:
 agents/utils/
 ├── __init__.py                # Skill/tool discovery and loading
 ├── a2a.py                     # AgentCard generation, A2A route registration
-├── a2ui.py                    # A2UI v1.0 component builders
+├── a2ui_helpers.py            # Markdown-to-A2UI conversion helpers
+├── auth.py                    # Shared OIDC ID token helper
 ├── communication.py           # SimulationA2AClient, call_agent() tool
 ├── communication_plugin.py    # Per-invocation A2A client lifecycle
 ├── config.py                  # .env loading, require/optional helpers
 ├── deployment.py              # Agent Engine deployment factory
-├── dispatcher.py              # RedisOrchestratorDispatcher (~700 lines)
+├── dispatcher.py              # RedisOrchestratorDispatcher
 ├── env.py                     # GCP project env var normalization
 ├── factory.py                 # create_simulation_runner() agent wiring
+├── gateway.py                 # Canonical Gateway port (9101) & URL helper
 ├── global_gemini.py           # GlobalGemini model (global endpoint)
-├── plugins.py                 # DashLogPlugin telemetry (~660 lines)
+├── local_ai.py                # Local Gemma + EmbeddingGemma adapter
+├── loop_agent_ext.py          # Tenant-safe LoopAgent subclass
+├── metering.py                # Per-user token metering plugin and sinks
+├── models.py                  # Canonical Gemini model constants
+├── plugins.py                 # DashLogPlugin telemetry
 ├── prompt_builder.py          # Section-based prompt composition
 ├── pruned_session_service.py  # Capped Redis session storage
 ├── pulses.py                  # Batched protobuf emission via worker pool
@@ -201,11 +215,15 @@ agents/utils/
 ├── session_manager.py         # Vertex AI session ID mapping with L1/L2 cache
 ├── sim_defaults.py            # Default simulation parameters
 ├── simdata.py                 # Redis side-channel for large data
-├── simulation_executor.py     # Custom A2A executor (~500 lines)
+├── simulation_executor.py     # Custom A2A executor
 ├── simulation_plugin.py       # Dispatcher lifecycle plugin
 ├── simulation_registry.py     # Session-to-simulation distributed mapping
+├── station_index.py           # Station coordinate indexing helpers
+├── tenant_keys.py             # Tenant-namespaced Redis key helpers
+├── tenant_paths.py            # Tenant-namespaced simulation run paths
 ├── traffic.py                 # Route analysis and congestion computation
-└── tests/                     # 23 test files
+├── user_auth_context.py       # Session-scoped user bearer token store
+└── tests/                     # Unit and regression test suites
 ```
 
 ## Further reading

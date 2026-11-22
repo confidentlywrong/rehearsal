@@ -6,23 +6,17 @@ part of. The gateway uses this to make routing decisions: which agents to poke
 during a broadcast, which sessions to include in a spawn batch, and which
 simulation a response belongs to.
 
-## Two interfaces, two concerns
+## Registry interface and implementations
 
-The package defines two separate interfaces because session tracking operates
-at two different levels:
+The package defines **`DistributedRegistry`**, which maps session IDs to agent
+types and simulation IDs so the gateway and switchboard can route broadcasts and
+enforce per-tenant concurrency quotas across horizontally scaled instances.
 
-**`Service`** is a local, in-process mapping between ECS entity IDs and session
-strings. It's synchronous, returns no errors, and is used when the simulation
-engine needs to look up a session by entity or vice versa.
-
-**`DistributedRegistry`** is a cross-process, Redis-backed registry that maps
-session IDs to agent types and simulation IDs. It's context-aware, returns
-errors, and is designed for horizontal scaling across multiple gateway
-instances. This is the interface the gateway and switchboard actually depend on.
-
-`InMemorySessionService` implements both interfaces, making it a convenient
-all-in-one for local development and tests. `RedisSessionRegistry` implements
-only `DistributedRegistry` and is used in production.
+- **`RedisSessionRegistry`** is the production Redis-backed implementation
+  using per-user key namespacing (`account.KeyPrefix(ctx)`).
+- **`InMemorySessionService`** is the in-memory implementation used for local
+  development and tests, maintaining the same per-user namespace isolation and
+  TTL eviction semantics.
 
 ## Redis data model
 
@@ -136,29 +130,30 @@ via TTL. It runs two sweeps:
    all member sessions. Removes stale entries. If the SET is now empty, removes
    the agent type from the active-agents index.
 
-2. **Simulation sweep**: SCANs for all simulation SET keys, checks each member
-   session, removes stale entries, and cleans up empty simulation SETs.
+2. **Simulation sweep**: SCANs for `simulation:*:sessions` SET keys AND inspects
+   `active-simulations`, checks each member session, removes stale entries, and
+   cleans up empty or expired simulation entries from `active-simulations`.
 
-The gateway runs `Reap()` on a 30-minute interval. This means SET entries can
-be stale for up to 30 minutes after their STRING key expires, which is
-acceptable since the SETs are only used for optimization (broadcast skip) and
-listing, not for correctness-critical routing.
+Cleanup runs opportunistically on read paths (`ListSessions` calls `Reap`, and
+`ListSimulations` verifies live simulation sets in O(M)) rather than in a
+background goroutine.
 
 ## File layout
 
 ```
 internal/session/
-├── service.go             # Service + DistributedRegistry interfaces, InMemorySessionService
+├── service.go             # DistributedRegistry interface, InMemorySessionService
 ├── redis_registry.go      # RedisSessionRegistry (production implementation)
 ├── service_test.go        # InMemorySessionService tests
-└── redis_registry_test.go # Redis tests using miniredis
+├── redis_registry_test.go # Redis tests using miniredis
+└── r2_audit_test.go       # Regression tests
 ```
 
 ## Configuration
 
 | Parameter | Production value | Description |
 |:----------|:-----------------|:------------|
-| `prefix` | `"n26"` | Redis key prefix for namespace isolation |
+| `prefix` | `"rehearsal"` (or configured `REDIS_PREFIX`) | Redis key prefix for namespace isolation |
 | `ttl` | `2 * time.Hour` | Expiry for session STRING keys |
 | `REDIS_ADDR` | (from `.env`) | Redis connection address |
 
@@ -168,17 +163,16 @@ internal/session/
 session-to-agent-type mapping is a simple STRING that auto-expires. Reverse
 indexes (SETs) track membership for efficient queries like "which agent types
 are active?" but don't auto-expire because Redis SET TTL would delete all
-members at once. Instead, individual entries are cleaned lazily by `Reap()`.
+members at once. Instead, individual entries are cleaned lazily by `Reap()` and
+`ListSimulations()`.
 
-**Pipeline everything.** Every write operation, whether single or batch, uses a
-Redis pipeline. `TrackSession` pipelines 6 commands into 1 round-trip.
-`BatchTrackSessions` pipelines `6*N` commands for N sessions. This is the
-difference between a 100-runner spawn taking 600 round-trips vs 1.
+**Pipeline everything.** Write operations (`TrackSession`, `BatchTrackSessions`)
+use Redis pipelines for minimal round-trips while still cleaning up stale
+reverse indexes when an existing session ID is overwritten.
 
-**InMemorySessionService for both interfaces.** Local development doesn't need
-Redis. The in-memory implementation satisfies both `Service` (ECS entity
-mapping) and `DistributedRegistry` (session tracking), so tests and local dev
-can use a single object without mocking.
+**InMemorySessionService for local dev and tests.** Local development doesn't
+need Redis. The in-memory implementation satisfies `DistributedRegistry` with
+matching per-user namespace isolation (`SAAS_MODE`) and TTL eviction.
 
 ## Further reading
 
@@ -189,4 +183,3 @@ can use a single object without mocking.
 - The hub package ([internal/hub/](../hub/)) consumes the registry through the
   switchboard for broadcast routing
 - The gateway ([cmd/gateway/](../../cmd/gateway/)) instantiates the registry
-  and runs the reap interval

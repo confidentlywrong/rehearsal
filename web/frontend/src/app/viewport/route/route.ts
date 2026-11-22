@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: clean up routeDraw and iconPickMeshes on removeRoute, deduplicate disposed Three.js resources and reset cached zone materials, guard zero-duration animations and null 2D canvas contexts, and reuse setError material.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -200,18 +202,43 @@ async function _initRouteImpl(
 export function removeRoute(ctx: Context): void {
   _routeGeneration++;
   _initRouteChain = Promise.resolve();
+  for (const zone of ctx.zones) {
+    zone.mesh.traverse((child: any) => {
+      const idx = ctx.iconPickMeshes.indexOf(child);
+      if (idx !== -1) ctx.iconPickMeshes.splice(idx, 1);
+    });
+  }
   if (ctx.currentRoute) {
+    const disposedGeos = new Set<THREE.BufferGeometry>();
+    const disposedMats = new Set<THREE.Material>();
     ctx.currentRoute.traverse((child: any) => {
-      if (child.geometry) child.geometry.dispose();
+      const idx = ctx.iconPickMeshes.indexOf(child);
+      if (idx !== -1) ctx.iconPickMeshes.splice(idx, 1);
+      if (child.geometry && !disposedGeos.has(child.geometry)) {
+        disposedGeos.add(child.geometry);
+        child.geometry.dispose();
+      }
       if (child.material) {
         const mats = Array.isArray(child.material) ? child.material : [child.material];
-        for (const m of mats) m?.dispose();
+        for (const m of mats) {
+          if (m && !disposedMats.has(m)) {
+            disposedMats.add(m);
+            m.dispose();
+          }
+        }
       }
     });
     ctx.scene.remove(ctx.currentRoute);
     ctx.currentRoute = null;
     ctx.currentRouteGoal = null;
   }
+  ctx.causticsCylinderMaterial = null;
+  ctx.causticsParticleMaterial = null;
+  ctx.medicalCylinderMaterial = null;
+  ctx.medicalParticleMaterial = null;
+  ctx.toiletCylinderMaterial = null;
+  ctx.crowdParticleMaterial = null;
+  ctx.routeDraw = null;
   if (ctx.oldRoute) {
     ctx.scene.remove(ctx.oldRoute);
     ctx.oldRoute.geometry?.dispose();
@@ -618,7 +645,15 @@ function animateInRoute(ctx: Context, splineLength: number, onComplete?: () => v
   const full =
     ctx.currentRoute.geometry.index?.count ??
     ctx.currentRoute.geometry.attributes['position'].count;
-  const duration = splineLength / 12000;
+  const duration = splineLength > 0 ? splineLength / 12000 : 0;
+
+  if (duration <= 0) {
+    ctx.currentRoute.geometry.setDrawRange(0, full);
+    if (ctx.currentRouteGoal) ctx.currentRouteGoal.visible = true;
+    ctx.routeDraw = null;
+    onComplete?.();
+    return;
+  }
 
   ctx.currentRoute.geometry.setDrawRange(0, 0);
   ctx.routeDraw = { active: true, elapsed: 0, duration, full, onComplete };
@@ -626,12 +661,18 @@ function animateInRoute(ctx: Context, splineLength: number, onComplete?: () => v
 
 /** Called every frame from the Angular component's animate loop. */
 export function tickRouteDraw(ctx: Context, delta: number): void {
+  if (!Number.isFinite(delta) || delta < 0) return;
+
   if (ctx.routeLightFade?.active) {
+    const lt =
+      ctx.routeLightFade.duration > 0
+        ? Math.min(ctx.routeLightFade.elapsed + delta, ctx.routeLightFade.duration) /
+          ctx.routeLightFade.duration
+        : 1;
     ctx.routeLightFade.elapsed = Math.min(
       ctx.routeLightFade.elapsed + delta,
       ctx.routeLightFade.duration,
     );
-    const lt = ctx.routeLightFade.elapsed / ctx.routeLightFade.duration;
     const easedLT = lt * lt * (3 - 2 * lt); // Smoothstep
     (ctx.ground.material as THREE.MeshStandardMaterial).emissiveIntensity = easedLT * 0.15;
     ctx.heightFogLightUpMaterial.uniforms['routeLightUp'].value = easedLT * 0.45;
@@ -641,8 +682,11 @@ export function tickRouteDraw(ctx: Context, delta: number): void {
   }
 
   if (!ctx.routeDraw?.active || !ctx.currentRoute) return;
+  const t =
+    ctx.routeDraw.duration > 0
+      ? Math.min(ctx.routeDraw.elapsed + delta, ctx.routeDraw.duration) / ctx.routeDraw.duration
+      : 1;
   ctx.routeDraw.elapsed = Math.min(ctx.routeDraw.elapsed + delta, ctx.routeDraw.duration);
-  const t = ctx.routeDraw.elapsed / ctx.routeDraw.duration;
   const easedT = Math.sin(t * Math.PI * 0.5); // Sinusoidal.Out
   ctx.currentRoute.geometry.setDrawRange(0, Math.round(easedT * ctx.routeDraw.full));
 
@@ -676,9 +720,10 @@ function drawSplineToTexture(ctx: Context, spline: THREE.CatmullRomCurve3): void
   const reuseCanvas =
     img instanceof HTMLCanvasElement && img.width === SPLINE_SIZE && img.height === SPLINE_SIZE;
 
-  let c: CanvasRenderingContext2D;
+  let c: CanvasRenderingContext2D | null;
   if (reuseCanvas) {
-    c = img.getContext('2d')!;
+    c = img.getContext('2d');
+    if (!c) return;
     c.fillStyle = 'black';
     c.fillRect(0, 0, SPLINE_SIZE, SPLINE_SIZE);
   } else {
@@ -686,20 +731,27 @@ function drawSplineToTexture(ctx: Context, spline: THREE.CatmullRomCurve3): void
     const canvas = document.createElement('canvas');
     canvas.width = SPLINE_SIZE;
     canvas.height = SPLINE_SIZE;
-    c = canvas.getContext('2d')!;
+    c = canvas.getContext('2d');
+    if (!c) return;
     c.fillStyle = 'black';
     c.fillRect(0, 0, SPLINE_SIZE, SPLINE_SIZE);
     ctx.routeCanvasTexture = new THREE.CanvasTexture(canvas);
     configureRoadMaskCanvasTexture(ctx.routeCanvasTexture);
     const texture = ctx.routeCanvasTexture;
-    const groundMat = ctx.ground.material as THREE.MeshStandardMaterial;
-    groundMat.emissiveMap = texture;
-    groundMat.emissive = new THREE.Color(0xffffff);
-    groundMat.emissiveIntensity = 0;
-    groundMat.needsUpdate = true;
-    ctx.heightFogLightUpMaterial.uniforms['routeMap'].value = texture;
-    ctx.heightFogLightUpMaterial.uniforms['routeLightUp'].value = 0;
-    ctx.roadsMaterial.uniforms['maskMap1'].value = texture;
+    if (ctx.ground?.material) {
+      const groundMat = ctx.ground.material as THREE.MeshStandardMaterial;
+      groundMat.emissiveMap = texture;
+      groundMat.emissive = new THREE.Color(0xffffff);
+      groundMat.emissiveIntensity = 0;
+      groundMat.needsUpdate = true;
+    }
+    if (ctx.heightFogLightUpMaterial?.uniforms) {
+      ctx.heightFogLightUpMaterial.uniforms['routeMap'].value = texture;
+      ctx.heightFogLightUpMaterial.uniforms['routeLightUp'].value = 0;
+    }
+    if (ctx.roadsMaterial?.uniforms) {
+      ctx.roadsMaterial.uniforms['maskMap1'].value = texture;
+    }
     ctx.routeLightFade = { active: true, elapsed: 0, duration: 2.0 };
   }
 
@@ -729,33 +781,40 @@ function worldToRouteSuppressCanvas(worldX: number, worldZ: number): { x: number
   return { x: c + worldX * ROUTE_MASK_SCALE, y: c + worldZ * ROUTE_MASK_SCALE };
 }
 
-function ensureRouteMaskCanvasCtx(ctx: Context): CanvasRenderingContext2D {
+function ensureRouteMaskCanvasCtx(ctx: Context): CanvasRenderingContext2D | null {
   if (!ctx.routeCanvasTexture) {
     const canvas = document.createElement('canvas');
     canvas.width = ROUTE_MASK_SIZE;
     canvas.height = ROUTE_MASK_SIZE;
-    const c = canvas.getContext('2d')!;
+    const c = canvas.getContext('2d');
+    if (!c) return null;
     c.fillStyle = 'black';
     c.fillRect(0, 0, ROUTE_MASK_SIZE, ROUTE_MASK_SIZE);
     ctx.routeCanvasTexture = new THREE.CanvasTexture(canvas);
     configureRoadMaskCanvasTexture(ctx.routeCanvasTexture);
     const texture = ctx.routeCanvasTexture;
-    const groundMat = ctx.ground.material as THREE.MeshStandardMaterial;
-    groundMat.emissiveMap = texture;
-    groundMat.emissive = new THREE.Color(0xffffff);
-    groundMat.emissiveIntensity = 0;
-    groundMat.needsUpdate = true;
-    ctx.heightFogLightUpMaterial.uniforms['routeMap'].value = texture;
-    ctx.heightFogLightUpMaterial.uniforms['routeLightUp'].value = 0;
-    ctx.roadsMaterial.uniforms['maskMap1'].value = texture;
+    if (ctx.ground?.material) {
+      const groundMat = ctx.ground.material as THREE.MeshStandardMaterial;
+      groundMat.emissiveMap = texture;
+      groundMat.emissive = new THREE.Color(0xffffff);
+      groundMat.emissiveIntensity = 0;
+      groundMat.needsUpdate = true;
+    }
+    if (ctx.heightFogLightUpMaterial?.uniforms) {
+      ctx.heightFogLightUpMaterial.uniforms['routeMap'].value = texture;
+      ctx.heightFogLightUpMaterial.uniforms['routeLightUp'].value = 0;
+    }
+    if (ctx.roadsMaterial?.uniforms) {
+      ctx.roadsMaterial.uniforms['maskMap1'].value = texture;
+    }
     ctx.routeLightFade = { active: true, elapsed: 0, duration: 2.0 };
     return c;
   }
   const img = ctx.routeCanvasTexture.image;
   if (img instanceof HTMLCanvasElement) {
-    return img.getContext('2d')!;
+    return img.getContext('2d');
   }
-  throw new Error('routeCanvasTexture.image is not a canvas');
+  return null;
 }
 
 function closedSegmentMaskId(worldPoints: Array<{ x: number; z: number }>): string {
@@ -771,6 +830,7 @@ function strokeRouteSuppressPolyline(
   color: 'white' | 'black',
 ): void {
   const c = ensureRouteMaskCanvasCtx(ctx);
+  if (!c) return;
   c.strokeStyle = color;
   c.lineWidth = 4;
   c.lineCap = 'round';
@@ -816,7 +876,9 @@ export async function drawRouteSuppressSegmentToTexture(
 
   strokeRouteSuppressPolyline(ctx, worldPoints, color);
 
-  ctx.routeCanvasTexture!.needsUpdate = true;
+  if (ctx.routeCanvasTexture) {
+    ctx.routeCanvasTexture.needsUpdate = true;
+  }
 }
 
 // ── Trafficjam-to-texture mask ────────────────────────────────────────────────
@@ -831,25 +893,29 @@ function worldToTrafficCanvas(worldX: number, worldZ: number): { x: number; y: n
   };
 }
 
-function ensureTrafficjamCanvas(ctx: Context): CanvasRenderingContext2D {
+function ensureTrafficjamCanvas(ctx: Context): CanvasRenderingContext2D | null {
   if (!ctx.trafficjamCanvas) {
     ctx.trafficjamCanvas = document.createElement('canvas');
     ctx.trafficjamCanvas.width = TRAFFIC_TEX_SIZE;
     ctx.trafficjamCanvas.height = TRAFFIC_TEX_SIZE;
-    const init = ctx.trafficjamCanvas.getContext('2d')!;
+    const init = ctx.trafficjamCanvas.getContext('2d');
+    if (!init) return null;
     init.fillStyle = 'black';
     init.fillRect(0, 0, TRAFFIC_TEX_SIZE, TRAFFIC_TEX_SIZE);
   }
-  return ctx.trafficjamCanvas.getContext('2d')!;
+  return ctx.trafficjamCanvas.getContext('2d');
 }
 
 function syncTrafficjamTexture(ctx: Context): void {
+  if (!ctx.trafficjamCanvas) return;
   if (ctx.trafficjamCanvasTexture) {
     ctx.trafficjamCanvasTexture.needsUpdate = true;
   } else {
-    ctx.trafficjamCanvasTexture = new THREE.CanvasTexture(ctx.trafficjamCanvas!);
+    ctx.trafficjamCanvasTexture = new THREE.CanvasTexture(ctx.trafficjamCanvas);
     configureRoadMaskCanvasTexture(ctx.trafficjamCanvasTexture);
-    ctx.roadsMaterial.uniforms['maskMap2'].value = ctx.trafficjamCanvasTexture;
+    if (ctx.roadsMaterial?.uniforms) {
+      ctx.roadsMaterial.uniforms['maskMap2'].value = ctx.trafficjamCanvasTexture;
+    }
   }
 }
 
@@ -860,6 +926,7 @@ export async function drawTrafficjamToTexture(
   color = 'white',
 ): Promise<void> {
   const c = ensureTrafficjamCanvas(ctx);
+  if (!c) return;
   const { x: texX, y: texY } = worldToTrafficCanvas(worldX, worldZ);
 
   c.shadowBlur = 2;
@@ -881,6 +948,7 @@ export async function drawTrafficjamSegmentToTexture(
   if (worldPoints.length < 2) return;
 
   const c = ensureTrafficjamCanvas(ctx);
+  if (!c) return;
   c.shadowBlur = 2;
   c.shadowColor = color;
   c.strokeStyle = color;
@@ -901,6 +969,14 @@ export async function drawTrafficjamSegmentToTexture(
 
 // ── Error ─────────────────────────────────────────────────────────────────────────
 
+let _errorWindowMaterial: THREE.MeshStandardMaterial | null = null;
+
+/** Dispose and reset module-level shared route materials on viewport teardown. */
+export function disposeSharedRouteResources(): void {
+  _errorWindowMaterial?.dispose();
+  _errorWindowMaterial = null;
+}
+
 export function setError(ctx: Context, error: boolean) {
   ctx.errorState = error;
   let vignetteColor = 0x000000;
@@ -917,14 +993,16 @@ export function setError(ctx: Context, error: boolean) {
     foilageColor = 0x666666;
   }
 
-  const redMaterial = new THREE.MeshStandardMaterial({
-    color: 0x000000,
-    emissive: 0xe76666,
-    emissiveIntensity: 1.5,
-  });
+  if (error && !_errorWindowMaterial) {
+    _errorWindowMaterial = new THREE.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xe76666,
+      emissiveIntensity: 1.5,
+    });
+  }
   for (let i = 0; i < ctx.windowMeshes.length; i++) {
-    if (error) {
-      ctx.windowMeshes[i].mesh.material = redMaterial;
+    if (error && _errorWindowMaterial) {
+      ctx.windowMeshes[i].mesh.material = _errorWindowMaterial;
     } else {
       ctx.windowMeshes[i].mesh.material = ctx.windowMeshes[i].originalMaterial;
     }
@@ -939,9 +1017,11 @@ export function setError(ctx: Context, error: boolean) {
   ctx.vignettePass.uniforms['offset'].value = vignetteOffset;
   drawTrafficjamToTexture(ctx, 0, 0);
   if (ctx.trafficjamCanvasTexture && ctx.trafficjamCanvas) {
-    const c = ctx.trafficjamCanvas.getContext('2d')!;
-    c.fillStyle = trafficColor;
-    c.fillRect(0, 0, TRAFFIC_TEX_SIZE, TRAFFIC_TEX_SIZE);
-    ctx.trafficjamCanvasTexture.needsUpdate = true;
+    const c = ctx.trafficjamCanvas.getContext('2d');
+    if (c) {
+      c.fillStyle = trafficColor;
+      c.fillRect(0, 0, TRAFFIC_TEX_SIZE, TRAFFIC_TEX_SIZE);
+      ctx.trafficjamCanvasTexture.needsUpdate = true;
+    }
   }
 }

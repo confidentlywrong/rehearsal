@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: guarded rolling congestion calculations against non-positive max_congestion_ticks.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,6 +58,32 @@ def validate_route_geojson(route: object) -> tuple[bool, str]:
     for i, f in enumerate(feats):
         if not isinstance(f, dict):
             return False, f"features[{i}] must be a Feature object, got {type(f).__name__}"
+        if "geometry" in f:
+            geom = f["geometry"]
+            if not isinstance(geom, dict):
+                return (
+                    False,
+                    f"features[{i}].geometry must be a dict, got {type(geom).__name__}",
+                )
+            if geom.get("type") == "LineString" and "coordinates" in geom:
+                coords = geom["coordinates"]
+                if not isinstance(coords, list):
+                    return (
+                        False,
+                        f"features[{i}].geometry.coordinates must be a list, got {type(coords).__name__}",
+                    )
+                for j, coord in enumerate(coords):
+                    if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+                        return (
+                            False,
+                            f"features[{i}].geometry.coordinates[{j}] must be a coordinate pair",
+                        )
+                    for val in coord:
+                        if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                            return (
+                                False,
+                                f"features[{i}].geometry.coordinates[{j}] must contain finite numbers",
+                            )
     return True, ""
 
 
@@ -64,19 +92,37 @@ def validate_route_geojson(route: object) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_valid_coord(coord: object) -> bool:
+    """Return True if *coord* is a [lon, lat, ...] sequence of finite numbers."""
+    if not isinstance(coord, (list, tuple)) or len(coord) < 2:
+        return False
+    return all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) for v in coord)
+
+
+def _finite_float(value: object, default: float) -> float:
+    """Coerce *value* to a finite float, rejecting bools and non-finite numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        fv = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return fv if math.isfinite(fv) else default
+
+
 def _haversine(coord1: list[float], coord2: list[float]) -> float:
     """Great-circle distance in miles between two [lon, lat] coordinates.
 
-    Uses Earth radius of 3958.8 miles, matching the canonical implementation
-    in ``agents/planner/skills/gis-spatial-engineering/tools.py:194``.
+    Uses Earth radius of 3958.8 miles (mean Earth radius).
     """
-    lon1, lat1 = coord1
-    lon2, lat2 = coord2
+    lon1, lat1 = coord1[0], coord1[1]
+    lon2, lat2 = coord2[0], coord2[1]
     R = 3958.8  # Earth radius in miles
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    a = min(1.0, max(0.0, a))
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
@@ -101,11 +147,19 @@ def _find_network_junctions(network_geojson: dict) -> set[tuple[float, float]]:
     coord_roads: dict[tuple[float, float], set[str]] = {}
 
     for feature in network_geojson.get("features", []):
-        geom = feature.get("geometry", {})
-        if geom.get("type") != "LineString":
+        if not isinstance(feature, dict):
             continue
-        name = feature.get("properties", {}).get("name", "")
-        for coord in geom["coordinates"]:
+        geom = feature.get("geometry")
+        if not isinstance(geom, dict) or geom.get("type") != "LineString":
+            continue
+        coords = geom.get("coordinates")
+        if not isinstance(coords, list):
+            continue
+        props = feature.get("properties")
+        name = props.get("name", "") if isinstance(props, dict) else ""
+        for coord in coords:
+            if not _is_valid_coord(coord):
+                continue
             key = (round(coord[0], 6), round(coord[1], 6))
             coord_roads.setdefault(key, set()).add(name)
 
@@ -350,23 +404,27 @@ def build_segment_distance_index(route_geojson: dict) -> list[dict]:
     cumulative = 0.0
 
     for feature in route_geojson.get("features", []):
-        geom = feature.get("geometry", {})
-        if geom.get("type") != "LineString":
+        geom = feature.get("geometry")
+        if not isinstance(geom, dict) or geom.get("type") != "LineString":
             continue
 
-        coords = geom["coordinates"]
+        coords = geom.get("coordinates")
+        if not isinstance(coords, list):
+            continue
+        valid_coords = [c for c in coords if _is_valid_coord(c)]
         segment_dist = 0.0
-        for i in range(len(coords) - 1):
-            segment_dist += _haversine(coords[i], coords[i + 1])
+        for i in range(len(valid_coords) - 1):
+            segment_dist += _haversine(valid_coords[i], valid_coords[i + 1])
 
         start_mi = cumulative
         end_mi = cumulative + segment_dist
+        props = feature.get("properties")
         index.append(
             {
                 "start_mi": start_mi,
                 "end_mi": end_mi,
-                "coordinates": coords,
-                "road_name": feature.get("properties", {}).get("name", ""),
+                "coordinates": valid_coords,
+                "road_name": props.get("name", "") if isinstance(props, dict) else "",
             }
         )
         cumulative = end_mi
@@ -405,13 +463,16 @@ def identify_closed_segments(route_geojson: dict, network_geojson: dict) -> dict
     route_coords: list[list[float]] = []
     route_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
     for feature in route_geojson.get("features", []):
-        geom = feature.get("geometry", {})
-        if geom.get("type") == "LineString":
-            coords = geom["coordinates"]
-            route_coords.extend(coords)
-            for i in range(len(coords) - 1):
-                a = (round(coords[i][0], 6), round(coords[i][1], 6))
-                b = (round(coords[i + 1][0], 6), round(coords[i + 1][1], 6))
+        geom = feature.get("geometry")
+        if isinstance(geom, dict) and geom.get("type") == "LineString":
+            coords = geom.get("coordinates")
+            if not isinstance(coords, list):
+                continue
+            valid_coords = [c for c in coords if _is_valid_coord(c)]
+            route_coords.extend(valid_coords)
+            for i in range(len(valid_coords) - 1):
+                a = (round(valid_coords[i][0], 6), round(valid_coords[i][1], 6))
+                b = (round(valid_coords[i + 1][0], 6), round(valid_coords[i + 1][1], 6))
                 route_edges.add((a, b))
                 route_edges.add((b, a))
 
@@ -427,12 +488,17 @@ def identify_closed_segments(route_geojson: dict, network_geojson: dict) -> dict
     split_originals: set[int] = set()
 
     for feature in network_geojson.get("features", []):
-        geom = feature.get("geometry", {})
-        if geom.get("type") != "LineString":
+        if not isinstance(feature, dict):
+            continue
+        geom = feature.get("geometry")
+        if not isinstance(geom, dict) or geom.get("type") != "LineString":
             continue
 
-        seg_coords = geom["coordinates"]
-        road_name = feature.get("properties", {}).get("name", "")
+        seg_coords = geom.get("coordinates")
+        if not isinstance(seg_coords, list) or not seg_coords:
+            continue
+        props = feature.get("properties")
+        road_name = props.get("name", "") if isinstance(props, dict) else ""
 
         # Build per-coordinate match flags.
         matched: list[bool] = []
@@ -472,6 +538,8 @@ def identify_closed_segments(route_geojson: dict, network_geojson: dict) -> dict
     closed_endpoints: list[list[float]] = []
     for feature in closed:
         coords = feature["geometry"]["coordinates"]
+        if not coords:
+            continue
         closed_endpoints.append(coords[0])
         closed_endpoints.append(coords[-1])
 
@@ -480,6 +548,8 @@ def identify_closed_segments(route_geojson: dict, network_geojson: dict) -> dict
     affected: list[dict] = list(split_affected)
     for feature in open_segments:
         coords = feature["geometry"]["coordinates"]
+        if not coords:
+            continue
         endpoints = [coords[0], coords[-1]]
         is_affected = False
         for ep in endpoints:
@@ -510,14 +580,19 @@ def identify_closed_segments(route_geojson: dict, network_geojson: dict) -> dict
         # Find all segments that touch this endpoint.
         touching_streets: list[str] = []
         for seg in all_segments:
-            geom = seg.get("geometry", {})
-            if geom.get("type") != "LineString":
+            if not isinstance(seg, dict):
                 continue
-            seg_coords = geom["coordinates"]
+            geom = seg.get("geometry")
+            if not isinstance(geom, dict) or geom.get("type") != "LineString":
+                continue
+            seg_coords = geom.get("coordinates")
+            if not isinstance(seg_coords, list) or not seg_coords:
+                continue
             seg_endpoints = [seg_coords[0], seg_coords[-1]]
             for sep in seg_endpoints:
                 if _coords_match(sep, cep):
-                    name = seg.get("properties", {}).get("name", "Unknown")
+                    props = seg.get("properties")
+                    name = props.get("name", "Unknown") if isinstance(props, dict) else "Unknown"
                     if name not in touching_streets:
                         touching_streets.append(name)
                     break
@@ -588,24 +663,59 @@ def compute_tick_traffic(
         ``ticks_closed`` – updated state dict.
     """
     segments_out: list[dict] = []
+    default_max_ticks = 10
+    if isinstance(max_congestion_ticks, bool) or not isinstance(max_congestion_ticks, (int, float)):
+        raw_max_ticks: int | float = default_max_ticks
+    else:
+        try:
+            fv = float(max_congestion_ticks)
+            raw_max_ticks = max_congestion_ticks if math.isfinite(fv) else default_max_ticks
+        except OverflowError:
+            raw_max_ticks = default_max_ticks
+
+    non_positive_max = raw_max_ticks <= 0
+    safe_max_ticks = max(1, int(raw_max_ticks)) if not non_positive_max else 1
+    safe_decay_rate = _finite_float(congestion_decay_rate, 0.3)
+    decay_factor = max(0.0, min(1.0, 1.0 - safe_decay_rate))
+    safe_sweep = _finite_float(sweep_distance_mi, 0.0)
+    _ = _finite_float(current_tick, 0.0)
 
     for seg in segment_index:
         name = seg["road_name"]
-        midpoint_mi = (seg["start_mi"] + seg["end_mi"]) / 2
-        state = ticks_closed.get(name, {"closed": 0, "peak": None})
+        start_mi = _finite_float(seg.get("start_mi"), 0.0)
+        end_mi = _finite_float(seg.get("end_mi"), 0.0)
+        midpoint_mi = (start_mi + end_mi) / 2
+        raw_state = ticks_closed.get(name)
+        if isinstance(raw_state, dict):
+            raw_closed = raw_state.get("closed", 0)
+            if isinstance(raw_closed, bool) or not isinstance(raw_closed, (int, float)):
+                safe_closed = 0
+            else:
+                try:
+                    cfv = float(raw_closed)
+                    safe_closed = max(0, int(cfv)) if math.isfinite(cfv) else 0
+                except OverflowError:
+                    safe_closed = 0
+            raw_peak = raw_state.get("peak")
+            safe_peak = None if raw_peak is None else max(0.0, min(1.0, _finite_float(raw_peak, 0.0)))
+            state: dict = {"closed": safe_closed, "peak": safe_peak}
+        else:
+            state = {"closed": 0, "peak": None}
 
         # Determine if segment is behind the sweep (reopening) or ahead (closed).
-        if midpoint_mi <= sweep_distance_mi:
+        if midpoint_mi <= safe_sweep:
             if state["closed"] > 0:
                 # Transitioning from closed -> reopening this tick.
                 # Record peak congestion at the moment of reopening.
-                state["peak"] = min(1.0, state["closed"] / max_congestion_ticks)
+                state["peak"] = (
+                    1.0 if non_positive_max else min(1.0, state["closed"] / safe_max_ticks)
+                )
                 state["closed"] = 0
 
             # Decay from peak each tick.  peak stores the *current* decayed
             # congestion level; each tick multiplies by (1 - decay_rate).
             peak = state["peak"] if state["peak"] is not None else 0.0
-            congestion = peak * max(0.0, 1.0 - congestion_decay_rate)
+            congestion = peak * decay_factor
             state["peak"] = congestion
 
             if congestion <= 0.01:
@@ -626,7 +736,7 @@ def compute_tick_traffic(
             ticks_closed[name] = state
             ticks_since_reopened = 0
             # Congestion builds proportionally, capped at 1.0.
-            congestion = min(1.0, new_closed / max_congestion_ticks)
+            congestion = 1.0 if non_positive_max else min(1.0, new_closed / safe_max_ticks)
 
         segments_out.append(
             {

@@ -40,6 +40,17 @@ CREATE TABLE IF NOT EXISTS rules (
     embedding   VECTOR(3072)
 );
 
+-- Deduplicate any legacy rows from pre-constraint seed_rules.sql re-runs
+-- before enforcing the natural (source_file, chunk_id) uniqueness key.
+DELETE FROM rules a
+USING rules b
+WHERE a.ctid < b.ctid
+  AND a.source_file = b.source_file
+  AND a.chunk_id = b.chunk_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_source_chunk
+    ON rules (source_file, chunk_id);
+
 -- ============================================================
 -- 2. PLANNED ROUTES TABLE  (full fidelity locally)
 -- ============================================================

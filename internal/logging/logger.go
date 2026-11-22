@@ -72,6 +72,9 @@ func Setup() {
 // writing to w. Exposed for tests (which use a bytes.Buffer to assert
 // on output) and for binaries that want a non-default writer.
 func NewLogger(f Format, lvl slog.Level, w io.Writer) *slog.Logger {
+	if w == nil {
+		w = os.Stderr
+	}
 	opts := &slog.HandlerOptions{Level: lvl}
 	switch f {
 	case FormatJSON:
@@ -90,7 +93,10 @@ func NewLogger(f Format, lvl slog.Level, w io.Writer) *slog.Logger {
 // Cloud Logging expects on stdout/stderr when no logging agent
 // processes the line. See:
 // https://cloud.google.com/logging/docs/structured-logging
-func gcpReplaceAttr(_ []string, a slog.Attr) slog.Attr {
+func gcpReplaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) > 0 {
+		return a
+	}
 	switch a.Key {
 	case slog.LevelKey:
 		// slog levels: DEBUG / INFO / WARN / ERROR.

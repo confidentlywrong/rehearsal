@@ -17,6 +17,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
 	"github.com/GoogleCloudPlatform/race-condition/internal/logging"
@@ -56,14 +57,23 @@ type PlansLister interface {
 //
 // allowedBaseURL is the trusted base URL the success/cancel URLs
 // must share an origin with (typically STRIPE_RETURN_BASE_URL).
-// When empty (stub creator path / tests) the origin check is
-// skipped — the stub never actually redirects users.
+// Fails closed with 503 checkout_unavailable when empty.
 func CheckoutHandler(users UserLookup, creator CheckoutCreator, allowedBaseURL string) gin.HandlerFunc {
+	trimmedBase := strings.TrimSpace(allowedBaseURL)
 	return func(c *gin.Context) {
 		uc, ok := account.FromContextOK(c.Request.Context())
 		if !ok || uc.UserID == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
+		}
+		if users == nil || creator == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "billing not configured", "code": "checkout_unavailable",
+			})
+			return
+		}
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 		}
 		var req struct {
 			Tier       string `json:"tier"`
@@ -71,9 +81,23 @@ func CheckoutHandler(users UserLookup, creator CheckoutCreator, allowedBaseURL s
 			CancelURL  string `json:"cancel_url"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body exceeds 1 MiB limit"})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 			return
 		}
+		if trimmedBase == "" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "billing not configured", "code": "checkout_unavailable",
+			})
+			return
+		}
+		req.Tier = strings.TrimSpace(req.Tier)
+		req.SuccessURL = strings.TrimSpace(req.SuccessURL)
+		req.CancelURL = strings.TrimSpace(req.CancelURL)
 		tier := account.PlanTier(req.Tier)
 		// Reject free (downgrade, not a checkout target) and comp
 		// (superadmin-granted; checkout would replace the grant with
@@ -91,7 +115,7 @@ func CheckoutHandler(users UserLookup, creator CheckoutCreator, allowedBaseURL s
 		// URLs must share an origin with allowedBaseURL — without
 		// this, any signed-in user can craft a Checkout whose
 		// success_url is an attacker-controlled phishing page.
-		if err := ValidateRedirectURL(req.SuccessURL, allowedBaseURL); err != nil {
+		if err := ValidateRedirectURL(req.SuccessURL, trimmedBase); err != nil {
 			logging.FromContext(c.Request.Context()).Warn("billing.checkout.bad_success_url",
 				slog.String("user_id", uc.UserID),
 				slog.String("url", req.SuccessURL),
@@ -99,7 +123,7 @@ func CheckoutHandler(users UserLookup, creator CheckoutCreator, allowedBaseURL s
 			c.JSON(http.StatusBadRequest, gin.H{"error": "success_url not allowed"})
 			return
 		}
-		if err := ValidateRedirectURL(req.CancelURL, allowedBaseURL); err != nil {
+		if err := ValidateRedirectURL(req.CancelURL, trimmedBase); err != nil {
 			logging.FromContext(c.Request.Context()).Warn("billing.checkout.bad_cancel_url",
 				slog.String("user_id", uc.UserID),
 				slog.String("url", req.CancelURL),
@@ -167,6 +191,10 @@ func UsageHandler(quota QuotaChecker, drainer OnDemandDrainer) gin.HandlerFunc {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
 		}
+		if quota == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage quota store unavailable"})
+			return
+		}
 		if drainer != nil {
 			if _, err := drainer.DrainOnce(c.Request.Context()); err != nil {
 				logging.FromContext(c.Request.Context()).Warn("billing.usage.drain_on_read_failed",
@@ -175,6 +203,12 @@ func UsageHandler(quota QuotaChecker, drainer OnDemandDrainer) gin.HandlerFunc {
 		}
 		state, err := quota.CheckQuota(c.Request.Context(), uc.UserID)
 		if err != nil {
+			if errors.Is(err, ErrPlanNotFound) {
+				logging.FromContext(c.Request.Context()).Error("billing.usage.plan_not_found",
+					slog.String("user_id", uc.UserID), slog.String("error", err.Error()))
+				c.JSON(http.StatusNotFound, gin.H{"error": "plan not found"})
+				return
+			}
 			if errors.Is(err, ErrUserNotFound) {
 				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 				return
@@ -192,12 +226,19 @@ func UsageHandler(quota QuotaChecker, drainer OnDemandDrainer) gin.HandlerFunc {
 // (read-only). 200 with []Plan on success.
 func PlansHandler(lister PlansLister) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if lister == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "plans catalog unavailable"})
+			return
+		}
 		plans, err := lister.ListPlans(c.Request.Context())
 		if err != nil {
 			logging.FromContext(c.Request.Context()).Error("billing.plans.list_failed",
 				slog.String("error", err.Error()))
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
 			return
+		}
+		if plans == nil {
+			plans = []Plan{}
 		}
 		c.JSON(http.StatusOK, gin.H{"plans": plans})
 	}

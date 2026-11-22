@@ -16,7 +16,7 @@
 
 output "service_urls" {
   description = "Map of service name -> .run.app URL."
-  value = {
+  value = merge({
     gateway                     = google_cloud_run_v2_service.gateway.uri
     admin                       = google_cloud_run_v2_service.admin.uri
     dash                        = google_cloud_run_v2_service.dash.uri
@@ -29,12 +29,14 @@ output "service_urls" {
     ai_echo                     = google_cloud_run_v2_service.ai_echo.uri
     ai_echo_reactive            = google_cloud_run_v2_service.ai_echo_reactive.uri
     ai_echo_autopilot           = google_cloud_run_v2_service.ai_echo_autopilot.uri
-  }
+    }, var.enable_billing_service ? {
+    billing = google_cloud_run_v2_service.billing[0].uri
+  } : {})
 }
 
 output "service_names" {
   description = "Map of service key -> Cloud Run service name (used by cloud-run-iam for service-level IAM bindings)."
-  value = {
+  value = merge({
     gateway                     = google_cloud_run_v2_service.gateway.name
     admin                       = google_cloud_run_v2_service.admin.name
     dash                        = google_cloud_run_v2_service.dash.name
@@ -47,7 +49,9 @@ output "service_names" {
     ai_echo                     = google_cloud_run_v2_service.ai_echo.name
     ai_echo_reactive            = google_cloud_run_v2_service.ai_echo_reactive.name
     ai_echo_autopilot           = google_cloud_run_v2_service.ai_echo_autopilot.name
-  }
+    }, var.enable_billing_service ? {
+    billing = google_cloud_run_v2_service.billing[0].name
+  } : {})
 }
 
 output "gateway_url" {

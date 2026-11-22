@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: preserve user-spawned sessions across simulation unsubscribes, clean up WebSocket reconnect timers and stale socket close callbacks, handle environment_reset and model_error events, guard protocol-relative WS URLs and leadership velocity sampling, and reset raceComplete across replays and restarts.
  */
 
 /**
@@ -132,7 +135,7 @@ function resolveGatewayWsUrl(): string {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${window.location.host}/ws`;
   }
-  if (configured.startsWith('/')) {
+  if (configured.startsWith('/') && !configured.startsWith('//') && !configured.startsWith('/\\')) {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${window.location.host}${configured}`;
   }
@@ -153,12 +156,14 @@ function resolveGatewayHttpBase(): string {
 
 // ── AgentGateway ────────────────────────────────────────────────────────────
 
-class AgentGateway {
+export class AgentGateway {
   private Wrapper: protobuf.Type | null = null;
   private BroadcastRequest: protobuf.Type | null = null;
 
   private reconnectDelay = 2000;
   private readonly MAX_RECONNECT_DELAY = 30000;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
 
   /** Single global observer WebSocket. */
   private monitorSocket: WebSocket | null = null;
@@ -216,6 +221,8 @@ class AgentGateway {
   private firstPaceVelocities: number[] = [];
 
   private userSpawnedAgents = new Set<string>();
+  /** Most recent target session IDs sent via broadcast/action, used as fallback eviction target on global /ws session_not_owned errors. */
+  private lastBroadcastTargetGuids: string[] = [];
 
   /**
    * Agent type from the user-spawned session (first resolved). Used so pipeline / sub-session
@@ -237,9 +244,26 @@ class AgentGateway {
 
   private _preProtoQueue: MessageEvent[] | null = null;
   private protoLoadPromise: Promise<void> | null = null;
+  private readonly handleWindowResume = (): void => {
+    if (this.disposed) return;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+    if (!this.Wrapper) return;
+    const state = this.monitorSocket?.readyState;
+    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+    this.reconnectDelay = 2000;
+    this.connectMonitor();
+  };
 
-  constructor() {
-    this.protoLoadPromise = this.loadProto();
+  constructor(options?: { autoConnect?: boolean }) {
+    if (options?.autoConnect !== false) {
+      this.protoLoadPromise = this.loadProto();
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleWindowResume);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.handleWindowResume);
+    }
     // Listen for broadcast requests from the viewport to send RunnerEvents
     // window.addEventListener('sim:broadcastToRunner', (e: Event) => {
     //   const detail = (e as CustomEvent).detail as { sessionId: string; payload: string };
@@ -266,8 +290,10 @@ class AgentGateway {
     const BASE_DELAY_MS = 1000;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      if (this.disposed) return;
       try {
         const root = await protobuf.load('/gateway.proto');
+        if (this.disposed) return;
         this.Wrapper = root.lookupType('gateway.Wrapper');
         this.BroadcastRequest = root.lookupType('gateway.BroadcastRequest');
 
@@ -281,6 +307,7 @@ class AgentGateway {
         this.connectMonitor();
         return;
       } catch (e) {
+        if (this.disposed) return;
         console.error(
           `AgentGateway: proto load attempt ${attempt}/${MAX_RETRIES} failed`,
           e,
@@ -292,6 +319,8 @@ class AgentGateway {
         }
       }
     }
+
+    if (this.disposed) return;
 
     // All retries exhausted — connect monitor in degraded mode
     console.error(
@@ -305,6 +334,12 @@ class AgentGateway {
   // ── Monitor WebSocket ───────────────────────────────────────────────────────
 
   private connectMonitor(): void {
+    if (this.disposed) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     const wsUrl = resolveGatewayWsUrl();
     console.debug('AgentGateway: connecting monitor to', wsUrl);
 
@@ -315,6 +350,18 @@ class AgentGateway {
     ws.onopen = () => {
       console.debug('AgentGateway: monitor connected');
       this.reconnectDelay = 2000;
+
+      // Restore connected flags on existing sessions after transient disconnects.
+      let restoredConnection = false;
+      for (const session of this.sessions.values()) {
+        if (!session.connected) {
+          session.connected = true;
+          restoredConnection = true;
+        }
+      }
+      if (restoredConnection) {
+        this.emitSessions();
+      }
 
       // Re-subscribe to active simulation after reconnect
       if (this.subscribedSimulationId) {
@@ -339,8 +386,7 @@ class AgentGateway {
     };
 
     ws.onclose = () => {
-      const delay = this.reconnectDelay + Math.random() * 1000;
-      console.warn(`AgentGateway: monitor disconnected — reconnecting in ${Math.round(delay)}ms`);
+      if (this.monitorSocket !== ws) return;
       this.monitorSocket = null;
 
       // Bug #35: Mark all sessions as disconnected so UI doesn't show ghost agents
@@ -349,7 +395,14 @@ class AgentGateway {
       }
       this.emitSessions();
 
-      setTimeout(() => this.connectMonitor(), delay);
+      if (this.disposed) return;
+
+      const delay = this.reconnectDelay + Math.random() * 1000;
+      console.warn(`AgentGateway: monitor disconnected — reconnecting in ${Math.round(delay)}ms`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connectMonitor();
+      }, delay);
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.MAX_RECONNECT_DELAY);
     };
 
@@ -382,10 +435,16 @@ class AgentGateway {
   unsubscribeSimulation(simulationId: string): void {
     if (this.subscribedSimulationId === simulationId) {
       this.subscribedSimulationId = null;
-      // M13 fix: Clear sessions from the prior simulation to prevent stale
-      // auto-registered entries persisting across simulation switches.
-      this.sessions.clear();
+      // Preserve user-spawned planner/organizer sessions so post-simulation
+      // planning prompts and Organizer actions are not dropped after run_end,
+      // while removing auto-registered simulation NPC/sub-agent sessions.
+      for (const id of Array.from(this.sessions.keys())) {
+        if (!this.userSpawnedAgents.has(id)) {
+          this.sessions.delete(id);
+        }
+      }
       this.seenRequests.clear();
+      this.emitSessions();
     }
 
     this._sendTextFrame({ type: 'unsubscribe_simulation', simulation_id: simulationId });
@@ -465,6 +524,7 @@ class AgentGateway {
       this.userSpawnedAgents.delete(guid);
       this.primaryChatAgentType = null;
     }
+    this.lastBroadcastTargetGuids = this.lastBroadcastTargetGuids.filter((sid) => sid !== guid);
     this.sessions.delete(guid);
     this.emitSessions();
   }
@@ -507,6 +567,9 @@ class AgentGateway {
     this.seenRequests.clear();
     this.firstPaceVelocities = [];
     this.firstPaceSampleTarget = 0;
+    this.raceComplete = false;
+    this.isSpinningUpSubAgent = false;
+    this.lastBroadcastTargetGuids = [];
   }
 
   // ── Broadcast ──────────────────────────────────────────────────────────────
@@ -527,6 +590,7 @@ class AgentGateway {
    */
   beginNdjsonReplay(): void {
     this.ndjsonReplayActive = true;
+    this.raceComplete = false;
   }
 
   endNdjsonReplay(): void {
@@ -609,20 +673,143 @@ class AgentGateway {
     return new Uint8Array(fin).buffer;
   }
 
+  private handleTextMessage(rawText: string): void {
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      const value = JSON.parse(rawText);
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        parsed = value as Record<string, unknown>;
+      }
+    } catch {
+      console.warn('AgentGateway: ignoring non-JSON text frame', rawText);
+      return;
+    }
+    if (!parsed) return;
+
+    const status = typeof parsed['status'] === 'string' ? parsed['status'] : '';
+    const msgType = typeof parsed['type'] === 'string' ? parsed['type'] : '';
+    const event = typeof parsed['event'] === 'string' ? parsed['event'] : '';
+    const dataObj =
+      parsed['data'] && typeof parsed['data'] === 'object' && !Array.isArray(parsed['data'])
+        ? (parsed['data'] as Record<string, unknown>)
+        : null;
+    const errorCode =
+      typeof dataObj?.['error'] === 'string'
+        ? dataObj['error']
+        : typeof parsed['error'] === 'string'
+          ? parsed['error']
+          : '';
+    const details =
+      typeof dataObj?.['details'] === 'string'
+        ? dataObj['details']
+        : typeof dataObj?.['message'] === 'string'
+          ? dataObj['message']
+          : typeof parsed['message'] === 'string'
+            ? parsed['message']
+            : '';
+
+    const isError = status === 'error' || msgType === 'error' || Boolean(errorCode);
+    if (!isError) return;
+
+    const destinations = Array.isArray(parsed['destination'])
+      ? parsed['destination'].filter((d): d is string => typeof d === 'string' && d.length > 0)
+      : [];
+    const dataSessionId =
+      typeof dataObj?.['session_id'] === 'string' && dataObj['session_id'].length > 0
+        ? dataObj['session_id']
+        : typeof dataObj?.['sessionId'] === 'string' && dataObj['sessionId'].length > 0
+          ? dataObj['sessionId']
+          : '';
+    const targetCandidates = Array.from(
+      new Set([...destinations, ...(dataSessionId ? [dataSessionId] : [])]),
+    );
+    const originObj =
+      parsed['origin'] && typeof parsed['origin'] === 'object' && !Array.isArray(parsed['origin'])
+        ? (parsed['origin'] as Record<string, unknown>)
+        : null;
+    const speaker =
+      (typeof originObj?.['id'] === 'string' && originObj['id'].length > 0
+        ? originObj['id']
+        : null) ?? 'gateway';
+
+    const errorText = details || errorCode || event || 'Gateway WebSocket error';
+    const evictionTargets =
+      errorCode === 'session_not_owned'
+        ? targetCandidates.length > 0
+          ? targetCandidates
+          : this.lastBroadcastTargetGuids
+        : targetCandidates;
+    const targetGuid = evictionTargets[0] || '';
+
+    if (errorCode === 'session_not_owned') {
+      let evicted = false;
+      for (const sid of evictionTargets) {
+        if (this.sessions.has(sid) || this.userSpawnedAgents.has(sid) || this.workingSessions.has(sid)) {
+          this.userSpawnedAgents.delete(sid);
+          this.sessions.delete(sid);
+          this.workingSessions.delete(sid);
+          evicted = true;
+        }
+      }
+      if (evicted) {
+        this.lastBroadcastTargetGuids = this.lastBroadcastTargetGuids.filter(
+          (sid) => !evictionTargets.includes(sid),
+        );
+        if (this.primaryChatAgentType) {
+          const stillHasPrimary = Array.from(this.sessions.values()).some(
+            (s) => s.agentType === this.primaryChatAgentType && this.userSpawnedAgents.has(s.guid),
+          );
+          if (!stillHasPrimary) {
+            this.primaryChatAgentType = null;
+          }
+        }
+        this.emitSessions();
+      }
+    }
+
+    this.emitChat({
+      guid: targetGuid,
+      speaker,
+      text: errorText,
+      isUser: false,
+      timestamp: new Date(),
+      msgType: AgentMessageType.MODEL_ERROR,
+      title: errorCode || event || 'Gateway Error',
+    });
+  }
+
   handleMessage(messageEvent: MessageEvent) {
+    if (typeof messageEvent.data === 'string') {
+      this.handleTextMessage(messageEvent.data);
+      return;
+    }
+
     if (!this.Wrapper) {
       if (!this._preProtoQueue) this._preProtoQueue = [];
       this._preProtoQueue.push(messageEvent);
       return;
     }
 
+    let binaryBytes: Uint8Array;
+    const rawData = messageEvent.data;
+    if (rawData instanceof ArrayBuffer) {
+      binaryBytes = new Uint8Array(rawData);
+    } else if (typeof SharedArrayBuffer !== 'undefined' && rawData instanceof SharedArrayBuffer) {
+      binaryBytes = new Uint8Array(rawData);
+    } else if (ArrayBuffer.isView(rawData)) {
+      binaryBytes = new Uint8Array(rawData.buffer, rawData.byteOffset, rawData.byteLength);
+    } else {
+      console.warn('AgentGateway: ignoring unsupported WebSocket payload type', typeof rawData);
+      return;
+    }
+
     try {
-      const wrapper = this.Wrapper.decode(new Uint8Array(messageEvent.data)) as any;
+      const wrapper = this.Wrapper.decode(binaryBytes) as any;
 
       let replaySpeakerFromMeta: string | undefined;
       try {
-        const md = wrapper.metadata as Uint8Array | undefined;
-        if (md?.length) {
+        const md = wrapper.metadata;
+        if (md instanceof Uint8Array && md.length > 0) {
           const parsed = JSON.parse(new TextDecoder().decode(md)) as { _csReplaySpeaker?: string };
           if (typeof parsed._csReplaySpeaker === 'string' && parsed._csReplaySpeaker.length > 0) {
             replaySpeakerFromMeta = parsed._csReplaySpeaker;
@@ -635,7 +822,10 @@ class AgentGateway {
       const wrapperType: string = wrapper.type || '';
       const event: string = wrapper.event || '';
 
-      const rawPayload: Uint8Array | null = wrapper.payload?.length ? wrapper.payload : null;
+      const rawPayload: Uint8Array | null =
+        wrapper.payload instanceof Uint8Array && wrapper.payload.length > 0
+          ? wrapper.payload
+          : null;
       const decodedText = rawPayload ? new TextDecoder().decode(rawPayload) : '';
       let data: Record<string, unknown> = {};
       try {
@@ -650,7 +840,7 @@ class AgentGateway {
       simLog.log(
         'recv',
         wrapper.origin?.sessionId || '?',
-        `type=${wrapperType} event=${event} payload=${new TextDecoder().decode(wrapper.payload ?? new Uint8Array())}`,
+        `type=${wrapperType} event=${event} payload=${decodedText}`,
       );
 
       // Resolve session identity from origin (preferred) or legacy fields
@@ -726,7 +916,11 @@ class AgentGateway {
           'agent';
       }
 
-      const speaker = origin.id; //replaySpeakerFromMeta ?? `${label} (${sessionId.substring(0, 6)})`;
+      const speaker =
+        (typeof origin.id === 'string' && origin.id.length > 0 ? origin.id : null) ??
+        replaySpeakerFromMeta ??
+        roleForSpeaker ??
+        'agent';
 
       const skillName = (data as LoadSkillData)['tool_hints']?.skill_name;
 
@@ -749,7 +943,16 @@ class AgentGateway {
         return;
       }
 
+      const isSystemControlOrError =
+        wrapperType === 'environment_reset' ||
+        (origin.type === 'system' &&
+          (event === 'model_error' ||
+            event === 'tool_error' ||
+            event === 'error' ||
+            event === 'forbidden'));
+
       if (
+        !isSystemControlOrError &&
         !this.ndjsonReplayActive &&
         this.subscribedSimulationId &&
         wrapper.simulationId !== this.subscribedSimulationId
@@ -757,7 +960,7 @@ class AgentGateway {
         return;
       }
 
-      if (!this.ndjsonReplayActive && !this.subscribedSimulationId && !session) {
+      if (!isSystemControlOrError && !this.ndjsonReplayActive && !this.subscribedSimulationId && !session) {
         // Drop messages from unknown sessions when no simulation is active.
         // Do NOT call unsubscribeSimulation here — the simulation_id on
         // this message may be reused later by start_simulation, and
@@ -979,21 +1182,26 @@ class AgentGateway {
                   return;
                 }
 
-                case TOOLS.START_SIMULATION:
-                  if (wrapper.simulationId && wrapper.simulationId !== this.subscribedSimulationId) {
+                case TOOLS.START_SIMULATION: {
+                  this.raceComplete = false;
+                  const startSimId =
+                    wrapper.simulationId ||
+                    (typeof result['simulation_id'] === 'string' ? result['simulation_id'] : '') ||
+                    (typeof result['simulationId'] === 'string' ? result['simulationId'] : '');
+                  if (startSimId && startSimId !== this.subscribedSimulationId) {
                     if (this.subscribedSimulationId) {
                       this.unsubscribeSimulation(this.subscribedSimulationId);
                     }
-                    this.subscribeSimulation(wrapper.simulationId as string);
-                    this.raceComplete = false;
+                    this.subscribeSimulation(startSimId);
                   }
                   break;
+                }
                 case TOOLS.GET_LAWS:
                   this.emitChat({
                     guid: sessionId,
                     speaker: speaker,
 
-                    text: result.message,
+                    text: result.message || '',
 
                     isUser: false,
                     timestamp: new Date(),
@@ -1050,12 +1258,13 @@ class AgentGateway {
                   const rc = result['runner_count'] as number | undefined;
                   this.firstPaceSampleTarget = typeof rc === 'number' && rc > 0 ? rc : 0;
                   this.firstPaceVelocities = [];
+                  this.raceComplete = false;
 
                   this.emitChat({
                     guid: sessionId,
                     speaker: speaker,
 
-                    text: result.message,
+                    text: result.message || '',
 
                     isUser: false,
                     timestamp: new Date(),
@@ -1071,7 +1280,7 @@ class AgentGateway {
                     guid: sessionId,
                     speaker: speaker,
 
-                    text: result.message,
+                    text: result.message || '',
                     result,
 
                     isUser: false,
@@ -1089,7 +1298,9 @@ class AgentGateway {
 
                   if (
                     this.firstPaceSampleTarget > 0 &&
-                    this.firstPaceVelocities.length < this.firstPaceSampleTarget
+                    this.firstPaceVelocities.length < this.firstPaceSampleTarget &&
+                    typeof effectiveVelocity === 'number' &&
+                    Number.isFinite(effectiveVelocity)
                   ) {
                     this.firstPaceVelocities.push(effectiveVelocity);
                     if (this.firstPaceVelocities.length === this.firstPaceSampleTarget) {
@@ -1238,7 +1449,17 @@ class AgentGateway {
               return;
             }
 
-            case 'tool_error':
+            case 'tool_error': {
+              const rawErr =
+                typeof data['text'] === 'string'
+                  ? data['text']
+                  : typeof (data['error'] as Record<string, unknown> | undefined)?.['message'] === 'string'
+                    ? String((data['error'] as Record<string, unknown>)['message'])
+                    : typeof data['error'] === 'string'
+                      ? data['error']
+                      : typeof data['message'] === 'string'
+                        ? data['message']
+                        : 'Tool execution failed';
               this.emitChat({
                 guid: sessionId,
                 speaker,
@@ -1248,9 +1469,10 @@ class AgentGateway {
 
                 msgType: AgentMessageType.TOOL_ERROR,
                 toolName: data['tool_name'] as string,
-                text: `${data['text']}`,
+                text: rawErr,
               });
               break;
+            }
 
             case 'model_start':
               // M7: when a sub-agent starts emitting events for a *new*
@@ -1273,6 +1495,28 @@ class AgentGateway {
               return;
             case 'model_end':
               break;
+
+            case 'model_error': {
+              const rawModelErr =
+                typeof data['text'] === 'string'
+                  ? data['text']
+                  : typeof (data['error'] as Record<string, unknown> | undefined)?.['message'] === 'string'
+                    ? String((data['error'] as Record<string, unknown>)['message'])
+                    : typeof data['error'] === 'string'
+                      ? data['error']
+                      : typeof data['message'] === 'string'
+                        ? data['message']
+                        : 'Model error occurred';
+              this.emitChat({
+                guid: sessionId,
+                speaker,
+                isUser: false,
+                timestamp: new Date(),
+                msgType: AgentMessageType.MODEL_ERROR,
+                text: rawModelErr,
+              });
+              break;
+            }
 
             case 'json':
               const result = (data['result'] ?? {}) as {
@@ -1334,7 +1578,7 @@ class AgentGateway {
 
             case 'tick:advance':
               break;
-            case 'text':
+            case 'text': {
               // Emit narrative text alongside any preceding A2UI tile. Previously
               // this branch silently dropped text-after-A2UI, which lost
               // step-detail narration. Financial-planner mode keeps its
@@ -1344,16 +1588,24 @@ class AgentGateway {
                 this.previousMessageIsFinancialPlanner = false;
                 break;
               }
+              const narrativeText =
+                typeof data['text'] === 'string'
+                  ? data['text']
+                  : data['text'] != null
+                    ? String(data['text'])
+                    : '';
+              if (!narrativeText) break;
               this.emitChat({
                 guid: sessionId,
                 speaker: speaker,
                 isUser: false,
                 timestamp: new Date(),
                 msgType: AgentMessageType.TEXT,
-                text: `${data['text']}`,
+                text: narrativeText,
               });
 
               break;
+            }
             default:
               break;
           }
@@ -1420,9 +1672,14 @@ class AgentGateway {
               // payload: { "text": "[Agent] Model End\n\n<response>" }
               break;
             case 'model_error':
-              console.warn('missing :: text model_error', decodedText);
-              // When an LLM call fails
-              // payload: { "text": "[Agent] Model Error\n\nError: <msg>" }
+              this.emitChat({
+                guid: sessionId,
+                speaker: speaker,
+                text: decodedText || 'Model error occurred',
+                isUser: false,
+                timestamp: new Date(),
+                msgType: AgentMessageType.MODEL_ERROR,
+              });
               break;
 
             case 'text':
@@ -1447,7 +1704,13 @@ class AgentGateway {
         // Each RedisOrchestratorDispatcher cancels background tasks, clears
         // active sessions, dedup caches, and the simulation registry.
         case 'environment_reset': {
-          console.warn('missing :: environment_reset');
+          this.subscribedSimulationId = null;
+          this.sessions.clear();
+          this.userSpawnedAgents.clear();
+          this.workingSessions.clear();
+          this.primaryChatAgentType = null;
+          this.resetDemoChatPipelineState();
+          this.emitSessions();
           break;
         }
         default:
@@ -1516,6 +1779,8 @@ class AgentGateway {
       return;
     }
 
+    this.lastBroadcastTargetGuids = [...validTargetGuids];
+
     if (!silent) {
       this.emitChat({
         guid: '',
@@ -1553,11 +1818,17 @@ class AgentGateway {
 
   /** Actually encode and send a broadcast over the wire. */
   private sendBroadcastNow(text: string, targetGuids: string[]): void {
+    this.lastBroadcastTargetGuids = [...targetGuids];
     if (!this.Wrapper || !this.BroadcastRequest) return;
 
-    let jsonPayload: unknown;
+    let jsonPayload: Record<string, unknown>;
     try {
-      jsonPayload = JSON.parse(text);
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        jsonPayload = parsed as Record<string, unknown>;
+      } else {
+        jsonPayload = { text };
+      }
     } catch {
       jsonPayload = { text };
     }
@@ -1607,7 +1878,23 @@ class AgentGateway {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.lastBroadcastTargetGuids = [];
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleWindowResume);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.handleWindowResume);
+    }
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.monitorSocket) {
+      this.monitorSocket.onopen = null;
+      this.monitorSocket.onmessage = null;
+      this.monitorSocket.onclose = null;
+      this.monitorSocket.onerror = null;
       this.monitorSocket.close();
       this.monitorSocket = null;
     }
@@ -1616,4 +1903,6 @@ class AgentGateway {
 
 // ── Singleton export ──────────────────────────────────────────────────────────
 
-export const agentGateway = new AgentGateway();
+export const agentGateway = new AgentGateway({
+  autoConnect: typeof (globalThis as Record<string, unknown>)['__vitest_worker__'] === 'undefined',
+});

@@ -28,8 +28,9 @@ AlloyDBRouteStore, and returns a structured dict for A2A compliance.
 from __future__ import annotations
 
 import asyncio
-import json
+from collections.abc import Mapping
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,15 @@ from google.adk.tools.tool_context import ToolContext  # noqa: E402
 
 from agents.planner_with_memory.memory import embeddings as _embeddings  # noqa: E402
 from agents.planner_with_memory.memory.schemas import PlannedRoute  # noqa: E402
-from agents.planner_with_memory.memory.store_alloydb import AlloyDBRouteStore, _get_dsn  # noqa: E402
+from agents.planner_with_memory.memory.store_alloydb import (  # noqa: E402
+    AlloyDBRouteStore,
+    _decode_jsonb,
+    _get_dsn,
+    _json_dumps,
+    _validate_schema_name,
+)
+from agents.utils import simulation_registry  # noqa: E402
+from agents.utils import tenant_keys  # noqa: E402
 from agents.utils.local_ai import is_local_gemma_active  # noqa: E402
 
 # Module-level singleton, shared across all tool invocations within the same
@@ -76,15 +85,63 @@ def _route_to_dict(route: PlannedRoute) -> dict:
 #   - "vertex_ai": compute client-side via google-genai and pass as $N::vector.
 #     Required for OSS Cloud SQL / local Postgres (no ai.embedding extension).
 # Auto-derived to "vertex_ai" when USE_ALLOYDB=false.
-def _resolve_embedding_backend() -> str:
-    from agents.utils.local_ai import is_local_gemma_active
+def _use_alloydb_flag() -> str:
+    """Return the normalized USE_ALLOYDB env var string (defaults to 'true')."""
+    return os.environ.get("USE_ALLOYDB", "true").strip().lower()
 
+
+def _clamp_non_negative_limit(raw: object, default: int, max_limit: int) -> int:
+    """Safely coerce and clamp a limit parameter to [0, max_limit].
+
+    Falls back to ``default`` on ``None``, ``bool``, non-numeric strings,
+    and non-finite floats (NaN/Inf) instead of raising ValueError/OverflowError.
+    """
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
+            return default
+        val = int(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return default
+        try:
+            val = int(s)
+        except (ValueError, OverflowError):
+            try:
+                fv = float(s)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            if not math.isfinite(fv):
+                return default
+            if fv <= 0:
+                return 0
+            if fv >= max_limit:
+                return max_limit
+            val = int(fv)
+    else:
+        return default
+    if val <= 0:
+        return 0
+    return min(val, max_limit)
+
+
+def _resolve_embedding_backend() -> str:
     if is_local_gemma_active():
         return "vertex_ai"
-    backend = os.environ.get("EMBEDDING_BACKEND", "").lower()
+    backend = os.environ.get("EMBEDDING_BACKEND", "").strip().lower()
+    if backend == "vertexai":
+        return "vertex_ai"
     if backend:
+        if backend not in ("alloydb_ai", "vertex_ai"):
+            raise ValueError(
+                f"Invalid EMBEDDING_BACKEND: {backend!r}. Expected 'alloydb_ai' or 'vertex_ai'."
+            )
         return backend
-    return "vertex_ai" if os.environ.get("USE_ALLOYDB", "true").lower() == "false" else "alloydb_ai"
+    return "vertex_ai" if _use_alloydb_flag() == "false" else "alloydb_ai"
 
 
 def _to_pgvector(values: list[float]) -> str:
@@ -96,49 +153,81 @@ def _to_pgvector(values: list[float]) -> str:
     registration (callers come from short-lived connections where
     ``register_vector(conn)`` would add per-call overhead).
     """
-    return "[" + ",".join(str(v) for v in values) + "]"
+    if not values:
+        raise ValueError("Embedding vector must not be empty.")
+    clean: list[str] = []
+    for v in values:
+        if isinstance(v, bool):
+            raise ValueError("Embedding vector values must be finite numbers, got bool.")
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Embedding vector contains invalid value: {v!r}") from exc
+        if not math.isfinite(f):
+            raise ValueError(f"Embedding vector contains non-finite value: {v!r}")
+        clean.append(str(f))
+    return "[" + ",".join(clean) + "]"
 
 
 # Anonymous / fixture user_ids that should NEVER be treated as a real
 # tenant owner. If session.user_id matches one of these, owner_id
 # resolution falls back to None (legacy single-tenant path).
-_ANONYMOUS_USER_IDS = frozenset({"anonymous", "default", "user", "local-dev", ""})
+_ANONYMOUS_USER_IDS = frozenset(
+    {"anonymous", "default", "user", "local-dev", "simulation", "simulation_user", ""}
+)
 
 
 def _resolve_owner_id(tool_context: ToolContext | None) -> str | None:
     """Return the per-user owner_id for the current tool invocation.
 
-    Per-user isolation is opt-in via the ``PLANNER_PER_USER_ISOLATION``
-    env var. This mirrors the leadership agent's
-    ``LEADERSHIP_PER_USER_ISOLATION`` switch -- when the flag is off (the
-    default for ``make start``), every store call uses ``owner_id=None``
-    and `make start` behaves byte-identically. When on, the resolved
-    ``user_id`` from the ADK session is used as the owner.
+    Per-user isolation is enabled whenever ``SAAS_MODE=on`` OR
+    ``PLANNER_PER_USER_ISOLATION=on``. When both flags are off, every
+    store call uses ``owner_id=None`` (legacy single-tenant path).
 
-    Returns ``None`` (legacy single-tenant fall-through) when any of the
-    following hold:
+    Resolution order when isolation is enabled:
+      1. ``tool_context.session.user_id``
+      2. ``tool_context.state`` (``user_id``, ``acting_user_id``, ``userId``,
+         ``tenant.user_id``)
+      3. ``simulation_registry.get_current_user_id()``
 
-    * ``PLANNER_PER_USER_ISOLATION`` is unset / not "on".
-    * ``tool_context`` is ``None`` (some tools accept it as optional).
-    * ``tool_context.session`` is missing.
-    * ``session.user_id`` is empty or matches a known anonymous fixture
-      value (``"anonymous"``, ``"default"``, ``"local-dev"``, ``"user"``).
-      This prevents a generic ADK demo user from accidentally locking
-      data behind a shared owner key.
+    When ``SAAS_MODE=on`` and no valid non-anonymous ``user_id`` can be
+    resolved (or component validation fails), raises ``PermissionError`` /
+    ``ValueError`` instead of returning ``None`` (fail closed). When
+    ``SAAS_MODE=off`` and only ``PLANNER_PER_USER_ISOLATION=on``, returns
+    ``None`` for missing/anonymous sessions to preserve legacy compatibility.
     """
-    if os.environ.get("PLANNER_PER_USER_ISOLATION", "").lower() != "on":
+    saas_on = tenant_keys._saas_mode_enabled()
+    flag_on = os.environ.get("PLANNER_PER_USER_ISOLATION", "").strip().lower() == "on"
+    if not saas_on and not flag_on:
         return None
-    if tool_context is None:
-        return None
-    session = getattr(tool_context, "session", None)
-    if session is None:
-        return None
-    uid = getattr(session, "user_id", None)
-    if not isinstance(uid, str):
-        return None
-    if uid.strip().lower() in _ANONYMOUS_USER_IDS:
-        return None
-    return uid
+
+    candidates: list[object] = []
+    if tool_context is not None:
+        session = getattr(tool_context, "session", None)
+        if session is not None:
+            candidates.append(getattr(session, "user_id", None))
+        state = getattr(tool_context, "state", None)
+        if state is not None and hasattr(state, "get"):
+            for key in ("user_id", "acting_user_id", "userId"):
+                candidates.append(state.get(key))
+            tenant = state.get("tenant")
+            if isinstance(tenant, Mapping):
+                candidates.append(tenant.get("user_id"))
+    candidates.append(simulation_registry.get_current_user_id())
+
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip()
+        if not cleaned or cleaned.lower() in _ANONYMOUS_USER_IDS:
+            continue
+        if saas_on:
+            tenant_keys._validate_component(cleaned, "user_id")
+        return cleaned
+
+    if saas_on:
+        raise PermissionError("Authenticated user_id is required for memory access when SAAS_MODE=on")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -167,12 +256,13 @@ async def _auto_store_summary(
 
     logger = logging.getLogger(__name__)
 
-    host = os.environ.get("ALLOYDB_HOST")
+    host = os.environ.get("ALLOYDB_HOST", "").strip()
     if not host:
         return True  # No database host configured
 
     # Extract context from session state (set by the agent during planning)
-    state = getattr(tool_context, "state", {}) or {}
+    raw_state = getattr(tool_context, "state", None) if tool_context is not None else None
+    state = raw_state if raw_state is not None and hasattr(raw_state, "get") else {}
     prompt = state.get("user_prompt", state.get("prompt", ""))
     city = state.get("city", "")
 
@@ -180,22 +270,22 @@ async def _auto_store_summary(
     if not prompt:
         prompt = parsed_result.get("prompt", parsed_result.get("description", "simulation run"))
 
-    # Build a combined summary for embedding
-    result_summary = json.dumps(parsed_result, default=str)[:500]
-    summary_text = f"Prompt: {prompt}. City: {city or 'unknown'}. Result: {result_summary}"
-
-    dsn = _get_dsn()
-    schema = os.environ.get("ALLOYDB_SCHEMA", "local_dev")
-
-    backend = _resolve_embedding_backend()
-    embedding_vec: list[float] | None = None
-    if backend == "vertex_ai":
-        try:
-            embedding_vec = await _embeddings.compute_embedding(summary_text)
-        except Exception as exc:
-            logger.debug("Auto-store embedding failed (non-fatal): %s", exc)
-
     try:
+        # Build a combined summary for embedding
+        result_summary = _json_dumps(parsed_result, default=str)[:500]
+        summary_text = f"Prompt: {prompt}. City: {city or 'unknown'}. Result: {result_summary}"
+
+        schema = _validate_schema_name(os.environ.get("ALLOYDB_SCHEMA"), default="public")
+        dsn = _get_dsn()
+
+        backend = _resolve_embedding_backend()
+        embedding_vec: list[float] | None = None
+        if backend == "vertex_ai":
+            try:
+                embedding_vec = await _embeddings.compute_embedding(summary_text)
+            except Exception as exc:
+                logger.debug("Auto-store embedding failed (non-fatal): %s", exc)
+
         conn = await asyncpg.connect(dsn, server_settings={"search_path": f"{schema}, public"})
         try:
             owner_id = _resolve_owner_id(tool_context)
@@ -211,7 +301,7 @@ async def _auto_store_summary(
                     prompt,
                     summary_text,
                     route_id,
-                    json.dumps(parsed_result, default=str),
+                    _json_dumps(parsed_result, default=str),
                     _to_pgvector(embedding_vec),
                     owner_id,
                 )
@@ -227,7 +317,7 @@ async def _auto_store_summary(
                     prompt,
                     summary_text,
                     route_id,
-                    json.dumps(parsed_result, default=str),
+                    _json_dumps(parsed_result, default=str),
                     owner_id,
                 )
             logger.info("Auto-stored simulation summary for route %s", route_id)
@@ -256,7 +346,13 @@ async def store_route(tool_context: ToolContext) -> dict:
         ``{"status": "success", "route_id": "<uuid>"}`` on success, or
         ``{"status": "error", "message": "..."}`` if the required state is missing.
     """
-    route_data = tool_context.state.get("marathon_route")
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is None or not hasattr(state, "get"):
+        return {
+            "status": "error",
+            "message": "No session state available.",
+        }
+    route_data = state.get("marathon_route")
     if not isinstance(route_data, dict) or not route_data:
         return {
             "status": "error",
@@ -266,21 +362,31 @@ async def store_route(tool_context: ToolContext) -> dict:
             ),
         }
 
-    eval_result = tool_context.state.get("evaluation_result")
+    eval_result = state.get("evaluation_result")
     eval_result_dict: dict | None = eval_result if isinstance(eval_result, dict) else None
     eval_score: float | None = None
     if eval_result_dict is not None:
         score = eval_result_dict.get("overall_score")
-        if isinstance(score, (int, float)):
-            eval_score = float(score)
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            try:
+                parsed_score = float(score)
+            except (TypeError, ValueError, OverflowError):
+                parsed_score = float("nan")
+            if math.isfinite(parsed_score):
+                eval_score = parsed_score
+
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
 
     route_id = await _store.store_route(
         route_data=route_data,
         evaluation_score=eval_score,
         evaluation_result=eval_result_dict,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
-    tool_context.state["active_route_id"] = route_id
+    state["active_route_id"] = route_id
     return {"status": "success", "route_id": route_id}
 
 
@@ -301,7 +407,13 @@ async def record_simulation(route_id: str, tool_context: ToolContext) -> dict:
         ``{"status": "success", "simulation_id": "<uuid>"}`` on success,
         ``{"status": "error", ...}`` if state is missing or route_id unknown.
     """
-    parsed_result = tool_context.state.get("simulation_result")
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is None or not hasattr(state, "get"):
+        return {
+            "status": "error",
+            "message": "No session state available.",
+        }
+    parsed_result = state.get("simulation_result")
     if not isinstance(parsed_result, dict):
         return {
             "status": "error",
@@ -310,10 +422,15 @@ async def record_simulation(route_id: str, tool_context: ToolContext) -> dict:
             ),
         }
 
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
     sim_id = await _store.record_simulation(
         route_id=route_id,
         simulation_result=parsed_result,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
     if sim_id is None:
         return {
@@ -352,10 +469,16 @@ async def recall_routes(
     Returns:
         ``{"status": "success", "count": N, "routes": [...]}``.
     """
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc), "count": 0, "routes": []}
+
+    safe_count = _clamp_non_negative_limit(count, default=10, max_limit=500)
     routes = await _store.recall_routes(
-        count=count,
+        count=safe_count,
         sort_by=sort_by,
-        owner_id=_resolve_owner_id(tool_context),
+        owner_id=owner_id,
     )
     serialised = [_route_to_dict(r) for r in routes]
     return {"status": "success", "count": len(serialised), "routes": serialised}
@@ -378,25 +501,31 @@ async def get_route(
         ``{"status": "success", "route": {...}}`` or
         ``{"status": "error", "message": "..."}``.
     """
-    route = await _store.get_route(route_id, owner_id=_resolve_owner_id(tool_context))
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    route = await _store.get_route(route_id, owner_id=owner_id)
     if route is None:
         return {"status": "error", "message": f"Route not found: {route_id}"}
 
     result = {"status": "success", "route": _route_to_dict(route)}
 
-    if activate_route:
-        tool_context.state["marathon_route"] = route.route_data
-        tool_context.state["active_route_id"] = route.route_id
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if activate_route and state is not None and hasattr(state, "__setitem__"):
+        state["marathon_route"] = route.route_data
+        state["active_route_id"] = route.route_id
         if isinstance(route.route_data, dict):
-            tool_context.state["route_name"] = route.route_data.get(
+            state["route_name"] = route.route_data.get(
                 "name", route.route_data.get("theme", "Stored Route")
             )
         else:
-            tool_context.state["route_name"] = "Stored Route"
+            state["route_name"] = "Stored Route"
         if route.evaluation_score is not None:
-            tool_context.state["evaluation_score"] = route.evaluation_score
+            state["evaluation_score"] = route.evaluation_score
         if route.evaluation_result is not None:
-            tool_context.state["evaluation_result"] = route.evaluation_result
+            state["evaluation_result"] = route.evaluation_result
         result["activated"] = True
 
     return result
@@ -412,7 +541,12 @@ async def get_best_route(tool_context: ToolContext) -> dict:
         ``{"status": "success", "route": {...}}`` or
         ``{"status": "error", "message": "..."}``.
     """
-    route = await _store.get_best_route(owner_id=_resolve_owner_id(tool_context))
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    route = await _store.get_best_route(owner_id=owner_id)
     if route is None:
         return {
             "status": "error",
@@ -441,15 +575,20 @@ async def get_planned_routes_data(
         ``{"status": "success", "count": N, "routes": [...]}``
         or ``{"status": "error", "message": "..."}``.
     """
-    if route_ids:
+    try:
         owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    if route_ids:
         routes = list(await asyncio.gather(*(_store.get_route(rid, owner_id=owner_id) for rid in route_ids)))
         routes = [r for r in routes if r]
     else:
+        safe_limit = _clamp_non_negative_limit(limit, default=5, max_limit=500)
         routes = await _store.recall_routes(
-            count=limit,
+            count=safe_limit,
             sort_by="recent",
-            owner_id=_resolve_owner_id(tool_context),
+            owner_id=owner_id,
         )
 
     if not routes:
@@ -491,10 +630,10 @@ async def get_local_and_traffic_rules(
     Performs a vector similarity search on the AlloyDB ``rules`` table
     using the query text.  Optionally filters by city.
 
-    When running against a local Postgres container (``USE_ALLOYDB=false`` or
-    when the ``ai.embedding`` function is unavailable), the tool falls back to
-    returning two sample rule chunks so the agent can continue planning
-    without interruption.
+    Returns an explicit error if ``ALLOYDB_HOST`` is unset, if running
+    in local Postgres mode (``USE_ALLOYDB=false``) without
+    ``EMBEDDING_BACKEND=vertex_ai``, or if the database / embedding call
+    fails.
 
     Args:
         query: Natural-language description of what you are looking for, e.g.
@@ -509,72 +648,37 @@ async def get_local_and_traffic_rules(
     """
     import asyncpg
 
-    # ------------------------------------------------------------------
-    # Sample chunks used when the AlloyDB AI extension is unavailable.
-    # Sourced from alloydb/seed_regulations.sql, two real rule chunks.
-    # ------------------------------------------------------------------
-    _SAMPLE_RULES = [
-        {
-            "city": "Las Vegas",
-            "text": (
-                "LAS VEGAS MUNICIPAL CODE - SIDEWALK VENDORS (CHAPTER 6.96)\n"
-                "6.96.070 - Operating Requirements and Prohibitions.\n"
-                "(A) It is unlawful for a sidewalk vendor to:\n"
-                "(1) Vend at locations where it will impede pedestrian traffic, "
-                "normal use of the sidewalk, or hinder access or accessibility "
-                "required by the Americans with Disabilities Act.\n"
-                "(5) Vend within 1,500 feet of a resort hotel.\n"
-                "(6) Vend within 1,000 feet of non-restricted gaming establishments, "
-                "the Fremont Street Experience, the Downtown Entertainment Overlay "
-                "District, city recreation facilities, pools, and schools."
-            ),
-        },
-        {
-            "city": "Las Vegas",
-            "text": (
-                "LAS VEGAS MUNICIPAL CODE - OBSTRUCTING PUBLIC RIGHTS-OF-WAY "
-                "(SECTION 10.86.010)\n"
-                "10.86.010 - Pedestrian interference—Prohibited locations.\n"
-                "(A) It is unlawful for any person to sit, lie, sleep, camp, or "
-                "otherwise lodge in the public right-of-way in the following locations:\n"
-                "(1) Any public street or sidewalk next to a residential property.\n"
-                "(2) Any public street or sidewalk within specific downtown districts.\n"
-                "(B) It is a misdemeanor to obstruct the sidewalk during designated "
-                "cleaning times."
-            ),
-        },
-    ]
-
-    host = os.environ.get("ALLOYDB_HOST")
+    host = os.environ.get("ALLOYDB_HOST", "").strip()
     if not host:
         return {
             "status": "error",
             "message": "ALLOYDB_HOST is not configured. Cannot query rules.",
         }
 
-    backend_explicit = bool(os.environ.get("EMBEDDING_BACKEND")) or is_local_gemma_active()
     backend = _resolve_embedding_backend()
-    use_alloydb = os.environ.get("USE_ALLOYDB", "true").lower()
+    use_alloydb = _use_alloydb_flag()
 
-    def _samples_response(note: str) -> dict:
+    if use_alloydb == "false" and backend != "vertex_ai":
         return {
-            "status": "success",
-            "count": len(_SAMPLE_RULES),
-            "rules": _SAMPLE_RULES,
-            "message": "Found the following rules (Sample Mode):\n"
-            + "\n\n".join([f"- {r['city']}:\n{r['text']}" for r in _SAMPLE_RULES]),
-            "note": note,
+            "status": "error",
+            "message": (
+                "Cannot query rules in local Postgres mode (USE_ALLOYDB=false) "
+                "without EMBEDDING_BACKEND=vertex_ai; ai.embedding() is unavailable."
+            ),
         }
 
-    # Local Postgres container mode without Vertex AI: ai.embedding() extension
-    # is not available, so return sample chunks so the agent can continue
-    # planning gracefully. EMBEDDING_BACKEND=vertex_ai bypasses this since
-    # Vertex AI is always available.
-    if use_alloydb == "false" and backend != "vertex_ai":
-        return _samples_response("Sample rules returned (local Postgres mode — ai.embedding not available).")
+    schema = _validate_schema_name(os.environ.get("ALLOYDB_SCHEMA"), default="public")
+
+    safe_limit = _clamp_non_negative_limit(limit, default=5, max_limit=100)
+    if safe_limit == 0:
+        return {
+            "status": "success",
+            "count": 0,
+            "rules": [],
+            "message": "No rules requested (limit=0).",
+        }
 
     dsn = _get_dsn()
-    schema = os.environ.get("ALLOYDB_SCHEMA", "local_dev")
 
     try:
         conn = await asyncpg.connect(dsn, server_settings={"search_path": f"{schema}, public"})
@@ -595,7 +699,7 @@ async def get_local_and_traffic_rules(
                         """,
                         query_vec,
                         city,
-                        limit,
+                        safe_limit,
                     )
                 else:
                     rows = await conn.fetch(
@@ -607,7 +711,7 @@ async def get_local_and_traffic_rules(
                         LIMIT $2
                         """,
                         query_vec,
-                        limit,
+                        safe_limit,
                     )
             else:
                 if city:
@@ -622,7 +726,7 @@ async def get_local_and_traffic_rules(
                         """,
                         query,
                         city,
-                        limit,
+                        safe_limit,
                     )
                 else:
                     rows = await conn.fetch(
@@ -634,23 +738,20 @@ async def get_local_and_traffic_rules(
                         LIMIT $2
                         """,
                         query,
-                        limit,
+                        safe_limit,
                     )
         finally:
             await conn.close()
     except Exception as exc:
         exc_str = str(exc)
-        # The ai.embedding() function is an AlloyDB-only extension.  When
-        # targeting a plain Postgres instance (e.g. during local testing with
-        # USE_ALLOYDB=true but without the extension), fall back to samples.
         if backend != "vertex_ai" and ("ai.embedding" in exc_str or "function ai." in exc_str):
-            return _samples_response("Sample rules returned (ai.embedding extension unavailable).")
-        # Auto-derived vertex_ai (USE_ALLOYDB=false without explicit
-        # EMBEDDING_BACKEND): preserve dev's "always graceful" contract by
-        # falling back to samples on embedding/DB errors. Explicit vertex_ai
-        # callers (OSS deploys) get the real error so they can debug.
-        if backend == "vertex_ai" and not backend_explicit:
-            return _samples_response("Sample rules returned (local Postgres mode — Vertex AI embedding unavailable).")
+            return {
+                "status": "error",
+                "message": (
+                    "ai.embedding() is unavailable on this PostgreSQL instance; "
+                    f"set EMBEDDING_BACKEND=vertex_ai for client-side embeddings. ({exc})"
+                ),
+            }
         return {"status": "error", "message": f"Failed to query rules: {exc}"}
 
     rules = [{"city": r["city"], "text": r["text"]} for r in rows]
@@ -685,8 +786,10 @@ async def recall_past_simulations(
     using the query text.  Returns the top N most similar past simulation
     summaries so the agent can reference prior runs.
 
-    When running against a local Postgres container (``USE_ALLOYDB=false`` or
-    when ``ai.embedding`` is unavailable), returns an empty list gracefully.
+    Returns an explicit error if ``ALLOYDB_HOST`` is unset, if running
+    in local Postgres mode (``USE_ALLOYDB=false``) without
+    ``EMBEDDING_BACKEND=vertex_ai``, or if the database / embedding call
+    fails.
 
     Args:
         query: Natural-language description of what you are planning, e.g.
@@ -698,51 +801,59 @@ async def recall_past_simulations(
     Returns:
         ``{"status": "success", "count": N, "simulations": [...]}`` where each
         simulation contains ``city``, ``prompt``, ``summary``, ``sim_result``,
-        and ``created_at``.
+        and ``created_at``, or ``{"status": "error", "message": "..."}``.
     """
     import asyncpg
 
     # Persist the user's prompt and city in session state so that
     # _auto_store_summary (inside record_simulation) can build a
     # summary later.
-    tool_context.state["user_prompt"] = query
-    if city:
-        tool_context.state["city"] = city
+    state = getattr(tool_context, "state", None) if tool_context is not None else None
+    if state is not None and hasattr(state, "__setitem__"):
+        state["user_prompt"] = query
+        if city:
+            state["city"] = city
 
-    host = os.environ.get("ALLOYDB_HOST")
+    host = os.environ.get("ALLOYDB_HOST", "").strip()
     if not host:
+        return {
+            "status": "error",
+            "message": "ALLOYDB_HOST is not configured. Cannot query past simulations.",
+        }
+
+    backend = _resolve_embedding_backend()
+    use_alloydb = _use_alloydb_flag()
+
+    if use_alloydb == "false" and backend != "vertex_ai":
+        return {
+            "status": "error",
+            "message": (
+                "Cannot query past simulations in local Postgres mode (USE_ALLOYDB=false) "
+                "without EMBEDDING_BACKEND=vertex_ai; ai.embedding() is unavailable."
+            ),
+        }
+
+    schema = _validate_schema_name(os.environ.get("ALLOYDB_SCHEMA"), default="public")
+
+    safe_limit = _clamp_non_negative_limit(limit, default=2, max_limit=100)
+    if safe_limit == 0:
         return {
             "status": "success",
             "count": 0,
             "simulations": [],
-            "message": "ALLOYDB_HOST not configured. No past simulations available.",
+            "message": "No past simulations requested (limit=0).",
         }
 
-    backend_explicit = bool(os.environ.get("EMBEDDING_BACKEND")) or is_local_gemma_active()
-    backend = _resolve_embedding_backend()
-    use_alloydb = os.environ.get("USE_ALLOYDB", "true").lower()
-
-    _empty_response = {
-        "status": "success",
-        "count": 0,
-        "simulations": [],
-        "message": "No past simulations available (local Postgres mode, ai.embedding not available).",
-    }
-
-    # Local Postgres container mode without Vertex AI: ai.embedding() is
-    # unavailable, so return empty results. EMBEDDING_BACKEND=vertex_ai
-    # bypasses this since Vertex AI is always available.
-    if use_alloydb == "false" and backend != "vertex_ai":
-        return _empty_response
-
     dsn = _get_dsn()
-    schema = os.environ.get("ALLOYDB_SCHEMA", "local_dev")
 
     # Per-user tenancy: when an owner_id is resolved, fold an extra
     # `owner_id = $N` predicate into every branch. When owner_id is None
     # (legacy single-tenant path), the queries are byte-identical to the
     # pre-tenancy version.
-    owner_id = _resolve_owner_id(tool_context)
+    try:
+        owner_id = _resolve_owner_id(tool_context)
+    except (PermissionError, ValueError) as exc:
+        return {"status": "error", "message": str(exc), "count": 0, "simulations": []}
 
     try:
         conn = await asyncpg.connect(dsn, server_settings={"search_path": f"{schema}, public"})
@@ -764,7 +875,7 @@ async def recall_past_simulations(
                         query_vec,
                         city,
                         owner_id,
-                        limit,
+                        safe_limit,
                     )
                 elif city:
                     rows = await conn.fetch(
@@ -778,7 +889,7 @@ async def recall_past_simulations(
                         """,
                         query_vec,
                         city,
-                        limit,
+                        safe_limit,
                     )
                 elif owner_id is not None:
                     rows = await conn.fetch(
@@ -792,7 +903,7 @@ async def recall_past_simulations(
                         """,
                         query_vec,
                         owner_id,
-                        limit,
+                        safe_limit,
                     )
                 else:
                     rows = await conn.fetch(
@@ -804,7 +915,7 @@ async def recall_past_simulations(
                         LIMIT $2
                         """,
                         query_vec,
-                        limit,
+                        safe_limit,
                     )
             else:
                 if city and owner_id is not None:
@@ -820,7 +931,7 @@ async def recall_past_simulations(
                         query,
                         city,
                         owner_id,
-                        limit,
+                        safe_limit,
                     )
                 elif city:
                     rows = await conn.fetch(
@@ -834,7 +945,7 @@ async def recall_past_simulations(
                         """,
                         query,
                         city,
-                        limit,
+                        safe_limit,
                     )
                 elif owner_id is not None:
                     rows = await conn.fetch(
@@ -848,7 +959,7 @@ async def recall_past_simulations(
                         """,
                         query,
                         owner_id,
-                        limit,
+                        safe_limit,
                     )
                 else:
                     rows = await conn.fetch(
@@ -860,7 +971,7 @@ async def recall_past_simulations(
                         LIMIT $2
                         """,
                         query,
-                        limit,
+                        safe_limit,
                     )
         finally:
             await conn.close()
@@ -868,29 +979,25 @@ async def recall_past_simulations(
         exc_str = str(exc)
         if backend != "vertex_ai" and ("ai.embedding" in exc_str or "function ai." in exc_str):
             return {
-                "status": "success",
-                "count": 0,
-                "simulations": [],
-                "message": "No past simulations available (ai.embedding extension unavailable).",
+                "status": "error",
+                "message": (
+                    "ai.embedding() is unavailable on this PostgreSQL instance; "
+                    f"set EMBEDDING_BACKEND=vertex_ai for client-side embeddings. ({exc})"
+                ),
             }
-        # Auto-derived vertex_ai (USE_ALLOYDB=false without explicit
-        # EMBEDDING_BACKEND): preserve dev's "always graceful" contract by
-        # returning empty results on embedding/DB errors. Explicit vertex_ai
-        # callers (OSS deploys) get the real error so they can debug.
-        if backend == "vertex_ai" and not backend_explicit:
-            return _empty_response
         return {"status": "error", "message": f"Failed to query past simulations: {exc}"}
 
     simulations = []
     sim_parts = []
     for i, r in enumerate(rows, 1):
         date_str = r["created_at"].isoformat() if r["created_at"] else "Unknown"
+        sim_result = _decode_jsonb(r["sim_result"])
         simulations.append(
             {
                 "city": r["city"],
                 "prompt": r["prompt"],
                 "summary": r["summary"],
-                "sim_result": r["sim_result"],
+                "sim_result": sim_result,
                 "created_at": date_str,
             }
         )
@@ -899,7 +1006,7 @@ async def recall_past_simulations(
             f"  City: {r['city']}\n"
             f"  Prompt: {r['prompt']}\n"
             f"  Summary: {r['summary']}\n"
-            f"  Result: {r['sim_result']}\n"
+            f"  Result: {sim_result}\n"
             f"  Date: {date_str}"
         )
     simulations_text = "\n\n".join(sim_parts)

@@ -322,14 +322,15 @@ export class A2uiControllerComponent {
       return;
     }
 
-    this.loadingButtonIds.update((s) => {
-      const n = new Set(s);
-      n.add(this.getId(node));
-      return n;
-    });
-
     if (this.actions.isRegisteredAction(actionName)) {
-      this.actions.dispatchRegisteredAction(actionName, payload, this.actionCtx());
+      const dispatched = this.actions.dispatchRegisteredAction(actionName, payload, this.actionCtx());
+      if (dispatched) {
+        this.loadingButtonIds.update((s) => {
+          const n = new Set(s);
+          n.add(this.getId(node));
+          return n;
+        });
+      }
     } else {
       console.warn(`Action "${actionName}" is not defined in the registry.`);
     }

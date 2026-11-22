@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +16,7 @@
 
 """ADK tool loader for planner_with_memory.
 
-Combines all inherited planner_with_eval tools with the 6 memory-specific
+Combines all inherited planner_with_eval tools with the 8 memory-specific
 tools from the memory sub-package.
 """
 
@@ -25,8 +27,9 @@ from agents.planner_with_memory.memory.adk_tools import get_memory_tools
 def get_tools() -> list:
     """Return all tools for the planner_with_memory agent.
 
-    Inherits every tool from planner_with_eval and adds the 6 memory
+    Inherits every tool from planner_with_eval and adds the 8 memory
     tools (store_route, record_simulation, recall_routes, get_route,
-    get_best_route, get_local_and_traffic_rules).
+    get_best_route, get_local_and_traffic_rules, get_planned_routes_data,
+    recall_past_simulations).
     """
     return get_eval_tools() + get_memory_tools()

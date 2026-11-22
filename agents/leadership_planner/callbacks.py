@@ -75,7 +75,8 @@ def leadership_guardrail_callback(
     Returns a refusal LlmResponse if the guardrail triggers, or None to let
     the LLM handle the request normally.
     """
-    locked = callback_context.state.get("simulation_locked", False)
+    state = getattr(callback_context, "state", None) if callback_context is not None else None
+    locked = state.get("simulation_locked", False) if state is not None and hasattr(state, "get") else False
     if not locked:
         return None
 

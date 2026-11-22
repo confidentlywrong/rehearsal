@@ -17,17 +17,28 @@ package billing
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestInMemoryEventDedup_FirstSightThenRepeat(t *testing.T) {
 	d := NewInMemoryEventDedup(10)
-	if d.SeenOrMark("evt_1") {
+	seen, err := d.SeenOrMark("evt_1")
+	if err != nil {
+		t.Fatalf("first SeenOrMark unexpected err: %v", err)
+	}
+	if seen {
 		t.Errorf("first SeenOrMark must return false")
 	}
-	if !d.SeenOrMark("evt_1") {
+	seen, err = d.SeenOrMark("evt_1")
+	if err != nil {
+		t.Fatalf("second SeenOrMark unexpected err: %v", err)
+	}
+	if !seen {
 		t.Errorf("second SeenOrMark must return true")
 	}
 }
@@ -36,11 +47,13 @@ func TestInMemoryEventDedup_EmptyIDNeverDeduped(t *testing.T) {
 	d := NewInMemoryEventDedup(10)
 	// An event without an ID must not poison the LRU; the handler
 	// should already have rejected it but we defend in depth.
-	if d.SeenOrMark("") {
-		t.Errorf("empty id must always return false")
+	seen, err := d.SeenOrMark("")
+	if err != nil || seen {
+		t.Errorf("empty id must return (false, nil), got (%v, %v)", seen, err)
 	}
-	if d.SeenOrMark("") {
-		t.Errorf("empty id must always return false on repeat too")
+	seen, err = d.SeenOrMark("")
+	if err != nil || seen {
+		t.Errorf("empty id must return (false, nil) on repeat too, got (%v, %v)", seen, err)
 	}
 	if d.Len() != 0 {
 		t.Errorf("empty IDs must not consume capacity, len=%d", d.Len())
@@ -49,15 +62,20 @@ func TestInMemoryEventDedup_EmptyIDNeverDeduped(t *testing.T) {
 
 func TestInMemoryEventDedup_CapacityEviction(t *testing.T) {
 	d := NewInMemoryEventDedup(3)
-	d.SeenOrMark("a")
-	d.SeenOrMark("b")
-	d.SeenOrMark("c")
-	d.SeenOrMark("d") // evicts oldest = "a"
+	for _, id := range []string{"a", "b", "c", "d"} {
+		if _, err := d.SeenOrMark(id); err != nil {
+			t.Fatalf("SeenOrMark(%q): %v", id, err)
+		}
+	}
 
 	if d.Len() != 3 {
 		t.Errorf("len=%d, want 3", d.Len())
 	}
-	if d.SeenOrMark("a") {
+	seen, err := d.SeenOrMark("a")
+	if err != nil {
+		t.Fatalf("SeenOrMark(a): %v", err)
+	}
+	if seen {
 		t.Errorf("'a' should have been evicted, must be re-seen as new")
 	}
 }
@@ -66,16 +84,24 @@ func TestInMemoryEventDedup_LRURefreshes(t *testing.T) {
 	// Re-touching "a" must move it to the front so a subsequent
 	// eviction picks "b" instead.
 	d := NewInMemoryEventDedup(3)
-	d.SeenOrMark("a")
-	d.SeenOrMark("b")
-	d.SeenOrMark("c")
-	d.SeenOrMark("a") // moves "a" to front; LRU order: a, c, b
-	d.SeenOrMark("d") // evicts "b"
+	for _, id := range []string{"a", "b", "c", "a", "d"} {
+		if _, err := d.SeenOrMark(id); err != nil {
+			t.Fatalf("SeenOrMark(%q): %v", id, err)
+		}
+	}
 
-	if d.SeenOrMark("b") {
+	seen, err := d.SeenOrMark("b")
+	if err != nil {
+		t.Fatalf("SeenOrMark(b): %v", err)
+	}
+	if seen {
 		t.Errorf("'b' should have been evicted after LRU refresh of 'a'")
 	}
-	if !d.SeenOrMark("a") {
+	seen, err = d.SeenOrMark("a")
+	if err != nil {
+		t.Fatalf("SeenOrMark(a): %v", err)
+	}
+	if !seen {
 		t.Errorf("'a' should still be present")
 	}
 }
@@ -83,11 +109,48 @@ func TestInMemoryEventDedup_LRURefreshes(t *testing.T) {
 func TestInMemoryEventDedup_ZeroCapacityNoEviction(t *testing.T) {
 	d := NewInMemoryEventDedup(0)
 	for i := 0; i < 100; i++ {
-		d.SeenOrMark(string(rune('a' + i%26)))
+		if _, err := d.SeenOrMark(string(rune('a' + i%26))); err != nil {
+			t.Fatalf("SeenOrMark: %v", err)
+		}
 	}
 	// 26 distinct keys, no eviction.
 	if d.Len() != 26 {
 		t.Errorf("want all 26 retained without eviction, got %d", d.Len())
+	}
+}
+
+func TestInMemoryEventDedup_NilReceiverAndConcurrentRace(t *testing.T) {
+	var nilDedup *InMemoryEventDedup
+	seen, err := nilDedup.SeenOrMark("evt_nil")
+	if !errors.Is(err, ErrDedupUnavailable) || seen {
+		t.Fatalf("nil SeenOrMark = (%v, %v), want (false, ErrDedupUnavailable)", seen, err)
+	}
+	if nilDedup.Len() != 0 {
+		t.Fatalf("nil Len() = %d, want 0", nilDedup.Len())
+	}
+	nilDedup.Forget("evt_nil")
+
+	d := NewInMemoryEventDedup(32)
+	var wg sync.WaitGroup
+	firstSightCount := make(chan bool, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, derr := d.SeenOrMark("evt_shared")
+			if derr != nil {
+				t.Errorf("concurrent SeenOrMark err: %v", derr)
+				return
+			}
+			if !s {
+				firstSightCount <- true
+			}
+		}()
+	}
+	wg.Wait()
+	close(firstSightCount)
+	if len(firstSightCount) != 1 {
+		t.Fatalf("expected exactly 1 first-sight across 16 goroutines, got %d", len(firstSightCount))
 	}
 }
 
@@ -134,15 +197,27 @@ func (f *fakePgExec) Exec(_ context.Context, sql string, args ...any) (pgconn.Co
 func TestPostgresEventDedup_NilConnRejected(t *testing.T) {
 	// Operator must see a hard error rather than a silent
 	// fallback that re-introduces the multi-replica race.
-	d, err := NewPostgresEventDedup(nil)
-	if err == nil {
-		t.Fatal("expected ErrDedupUnavailable for nil conn")
+	conns := []struct {
+		name string
+		db   pgxExecer
+	}{
+		{"untyped nil", nil},
+		{"typed nil *pgxpool.Pool", (*pgxpool.Pool)(nil)},
+		{"typed nil *pgx.Conn", (*pgx.Conn)(nil)},
 	}
-	if !errors.Is(err, ErrDedupUnavailable) {
-		t.Errorf("want ErrDedupUnavailable, got %v", err)
-	}
-	if d != nil {
-		t.Errorf("expected nil dedup on error, got %v", d)
+	for _, tc := range conns {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := NewPostgresEventDedup(tc.db)
+			if err == nil {
+				t.Fatal("expected ErrDedupUnavailable for nil conn")
+			}
+			if !errors.Is(err, ErrDedupUnavailable) {
+				t.Errorf("want ErrDedupUnavailable, got %v", err)
+			}
+			if d != nil {
+				t.Errorf("expected nil dedup on error, got %v", d)
+			}
+		})
 	}
 }
 
@@ -152,11 +227,13 @@ func TestPostgresEventDedup_FirstSightThenRepeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ctor: %v", err)
 	}
-	if d.SeenOrMark("evt_1") {
-		t.Errorf("first SeenOrMark must return false (new event)")
+	seen, err := d.SeenOrMark("evt_1")
+	if err != nil || seen {
+		t.Errorf("first SeenOrMark must return (false, nil), got (%v, %v)", seen, err)
 	}
-	if !d.SeenOrMark("evt_1") {
-		t.Errorf("second SeenOrMark must return true (replay)")
+	seen, err = d.SeenOrMark("evt_1")
+	if err != nil || !seen {
+		t.Errorf("second SeenOrMark must return (true, nil), got (%v, %v)", seen, err)
 	}
 	if fake.callCount != 2 {
 		t.Errorf("expected 2 Exec calls, got %d", fake.callCount)
@@ -168,31 +245,50 @@ func TestPostgresEventDedup_EmptyIDNotPersisted(t *testing.T) {
 	d, _ := NewPostgresEventDedup(fake)
 	// Empty IDs short-circuit so the table isn't polluted with
 	// duplicate PK-empty rows on replay floods.
-	if d.SeenOrMark("") {
-		t.Errorf("empty id must return false")
+	seen, err := d.SeenOrMark("")
+	if err != nil || seen {
+		t.Errorf("empty id must return (false, nil), got (%v, %v)", seen, err)
 	}
-	if d.SeenOrMark("") {
-		t.Errorf("empty id must always return false")
+	seen, err = d.SeenOrMark("")
+	if err != nil || seen {
+		t.Errorf("empty id must always return (false, nil), got (%v, %v)", seen, err)
 	}
 	if fake.callCount != 0 {
 		t.Errorf("empty id must not hit the DB, got %d Exec calls", fake.callCount)
 	}
 }
 
-func TestPostgresEventDedup_DBErrorFailsOpen(t *testing.T) {
-	// On DB error we MUST fail open (return false → handler
-	// applies) so a transient DB hiccup doesn't 200 a real event
-	// we never applied. The handler's SetOrgPlan is idempotent
-	// so a Stripe retry that re-applies is safe.
+func TestPostgresEventDedup_DBErrorFailsClosedAndPropagatesError(t *testing.T) {
+	// On DB error we MUST fail closed and propagate the error so the
+	// webhook handler returns 503 and Stripe retries instead of
+	// double-applying events or silently dropping them.
 	fake := newFakePgExec()
 	fake.execErr = errors.New("connection reset by peer")
 	d, _ := NewPostgresEventDedup(fake)
 
-	if d.SeenOrMark("evt_x") {
-		t.Errorf("DB error must fail open (return false), not dedup")
+	seen, err := d.SeenOrMark("evt_x")
+	if err == nil {
+		t.Fatalf("DB error must propagate, got nil error")
+	}
+	if seen {
+		t.Errorf("DB error must return seen=false, got true")
 	}
 	if d.DBErrorCount() != 1 {
 		t.Errorf("DBErrorCount should track the failure, got %d", d.DBErrorCount())
+	}
+
+	var nilDedup *PostgresEventDedup
+	seen, err = nilDedup.SeenOrMark("evt_nil")
+	if !errors.Is(err, ErrDedupUnavailable) || seen {
+		t.Fatalf("nil receiver SeenOrMark = (%v, %v), want (false, ErrDedupUnavailable)", seen, err)
+	}
+	if nilDedup.DBErrorCount() != 0 {
+		t.Fatalf("nil DBErrorCount = %d, want 0", nilDedup.DBErrorCount())
+	}
+	uninit := &PostgresEventDedup{}
+	seen, err = uninit.SeenOrMark("evt_uninit")
+	if !errors.Is(err, ErrDedupUnavailable) || seen {
+		t.Fatalf("uninit SeenOrMark = (%v, %v), want (false, ErrDedupUnavailable)", seen, err)
 	}
 }
 
@@ -200,8 +296,9 @@ func TestPostgresEventDedup_DistinctIDsAllNew(t *testing.T) {
 	fake := newFakePgExec()
 	d, _ := NewPostgresEventDedup(fake)
 	for _, id := range []string{"evt_a", "evt_b", "evt_c"} {
-		if d.SeenOrMark(id) {
-			t.Errorf("first sight of %q must return false", id)
+		seen, err := d.SeenOrMark(id)
+		if err != nil || seen {
+			t.Errorf("first sight of %q must return (false, nil), got (%v, %v)", id, seen, err)
 		}
 	}
 	if len(fake.rows) != 3 {

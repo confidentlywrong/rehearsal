@@ -623,6 +623,41 @@ class TestSpawnRunners:
         assert posted_json["simulation_id"] == ""
 
     @pytest.mark.asyncio
+    async def test_defaults_to_canonical_9101_when_gateway_env_unset(self, monkeypatch):
+        """spawn_runners must default to http://127.0.0.1:9101 when gateway env vars are unset or blank."""
+        for var in ("GATEWAY_INTERNAL_URL", "GATEWAY_URL", "GATEWAY_ADDR"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("GATEWAY_URL", "   ")
+        ctx = _make_tool_context(state={"simulation_ready": True})
+        mock_session, _ = self._make_aiohttp_mocks(
+            200,
+            {"sessions": [{"sessionId": "r-1", "agentType": "runner_autopilot"}]},
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await spawn_runners(count=1, tool_context=ctx)
+
+        assert result["status"] == "success"
+        assert mock_session.post.call_args[0][0] == "http://127.0.0.1:9101/api/v1/spawn"
+
+    @pytest.mark.asyncio
+    async def test_strips_trailing_slash_from_gateway_url(self, monkeypatch):
+        """spawn_runners must strip trailing slashes when constructing /api/v1/spawn."""
+        monkeypatch.delenv("GATEWAY_INTERNAL_URL", raising=False)
+        monkeypatch.setenv("GATEWAY_URL", "http://127.0.0.1:9101/  ")
+        ctx = _make_tool_context(state={"simulation_ready": True})
+        mock_session, _ = self._make_aiohttp_mocks(
+            200,
+            {"sessions": [{"sessionId": "r-1", "agentType": "runner_autopilot"}]},
+        )
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = await spawn_runners(count=1, tool_context=ctx)
+
+        assert result["status"] == "success"
+        assert mock_session.post.call_args[0][0] == "http://127.0.0.1:9101/api/v1/spawn"
+
+    @pytest.mark.asyncio
     async def test_spawn_runners_returns_simulation_id(self):
         """spawn_runners should include simulation_id in success response."""
         ctx = _make_tool_context(
@@ -748,7 +783,10 @@ class TestFireStartGun:
         """fire_start_gun should broadcast a START_GUN signal without tick data."""
         ctx = _make_tool_context(state={"runner_session_ids": ["r-1", "r-2"]})
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish:
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish,
+        ):
             result = await fire_start_gun(tool_context=ctx)
 
         assert result["status"] == "success"
@@ -772,14 +810,17 @@ class TestFireStartGun:
 
     @pytest.mark.asyncio
     async def test_handles_broadcast_failure(self):
-        """fire_start_gun should handle publish errors gracefully."""
+        """fire_start_gun should return error if publish fails."""
         ctx = _make_tool_context(state={"runner_session_ids": ["r-1"]})
 
-        with patch.object(
-            tools_module,
-            "publish_to_runners",
-            new_callable=AsyncMock,
-            side_effect=Exception("Redis down"),
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(
+                tools_module,
+                "publish_to_runners",
+                new_callable=AsyncMock,
+                side_effect=Exception("Redis down"),
+            ),
         ):
             result = await fire_start_gun(tool_context=ctx)
 
@@ -795,7 +836,10 @@ class TestFireStartGun:
             }
         )
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish:
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish,
+        ):
             result = await fire_start_gun(tool_context=ctx)
 
         assert result["status"] == "success"
@@ -814,15 +858,23 @@ class TestFireStartGun:
                 "simulation_id": "sim-77",
             }
         )
-        with patch.object(tools_module, "publish_to_runners", AsyncMock()):
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", AsyncMock()),
+        ):
             result = await fire_start_gun(ctx)
         assert result["status"] == "success"
         assert result["simulation_id"] == "sim-77"
 
     @pytest.mark.asyncio
     async def test_auto_starts_collector_if_not_running(self):
-        """fire_start_gun should start the RaceCollector if not already running."""
-        ctx = _make_tool_context(state={"runner_session_ids": ["r-1", "r-2", "r-3"]})
+        """fire_start_gun should start the RaceCollector with skip_pubsub=False for LLM runners."""
+        ctx = _make_tool_context(
+            state={
+                "runner_session_ids": ["r-1", "r-2", "r-3"],
+                "simulation_config": {"runner_type": "leadership_runner"},
+            }
+        )
 
         mock_start = AsyncMock(return_value=MagicMock())
         with (
@@ -838,7 +890,55 @@ class TestFireStartGun:
         mock_start.assert_called_once_with(
             session_id="sim-session-1",
             runner_session_ids={"r-1", "r-2", "r-3"},
+            skip_pubsub=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_auto_starts_collector_with_skip_pubsub_for_autopilot(self):
+        """fire_start_gun must forward skip_pubsub=True when auto-starting collector for autopilot runners."""
+        ctx = _make_tool_context(
+            state={
+                "runner_session_ids": ["r-1", "r-2"],
+                "simulation_config": {"runner_type": "leadership_runner_autopilot"},
+            }
+        )
+
+        mock_start = AsyncMock(return_value=MagicMock())
+        with (
+            patch.object(tools_module, "publish_to_runners", AsyncMock()),
+            patch(
+                "agents.simulator.collector.RaceCollector.start",
+                mock_start,
+            ),
+        ):
+            result = await fire_start_gun(tool_context=ctx)
+
+        assert result["status"] == "success"
+        mock_start.assert_called_once_with(
+            session_id="sim-session-1",
+            runner_session_ids={"r-1", "r-2"},
+            skip_pubsub=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_error_when_collector_start_fails(self):
+        """fire_start_gun must fail explicitly without broadcasting when RaceCollector.start raises."""
+        ctx = _make_tool_context(state={"runner_session_ids": ["r-1"]})
+
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=False),
+            patch(
+                "agents.simulator.collector.RaceCollector.start",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("REDIS_ADDR not configured"),
+            ),
+            patch.object(tools_module, "publish_to_runners", AsyncMock()) as mock_publish,
+        ):
+            result = await fire_start_gun(tool_context=ctx)
+
+        assert result["status"] == "error"
+        assert "telemetry stream" in result["message"].lower()
+        mock_publish.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_skips_collector_start_if_already_running(self):
@@ -879,7 +979,10 @@ class TestFireStartGun:
             }
         )
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish:
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish,
+        ):
             result = await fire_start_gun(tool_context=ctx)
 
         assert result["status"] == "success"
@@ -909,7 +1012,10 @@ class TestFireStartGun:
             }
         )
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock):
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock),
+        ):
             await fire_start_gun(tool_context=ctx)
 
         assert ctx.state["current_tick"] == 0
@@ -929,7 +1035,10 @@ class TestFireStartGun:
             }
         )
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish:
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish,
+        ):
             await fire_start_gun(tool_context=ctx)
 
         mock_publish.assert_called_once()
@@ -949,7 +1058,10 @@ class TestFireStartGun:
             }
         )
 
-        with patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish:
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(tools_module, "publish_to_runners", new_callable=AsyncMock) as mock_publish,
+        ):
             result = await fire_start_gun(tool_context=ctx)
 
         assert result["status"] == "success"
@@ -1086,6 +1198,7 @@ class TestSpawnReadinessGate:
         mock_redis.mget = AsyncMock(side_effect=mock_mget)
 
         with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
             patch.object(tools_module, "publish_to_runners", AsyncMock()),
             patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis),
             patch("agents.simulator.broadcast.asyncio.sleep", AsyncMock()),
@@ -1106,6 +1219,7 @@ class TestSpawnReadinessGate:
         )
 
         with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
             patch.object(tools_module, "publish_to_runners", AsyncMock()),
             patch("agents.simulator.broadcast.get_shared_redis_client", return_value=None),
         ):
@@ -1131,6 +1245,7 @@ class TestSpawnReadinessGate:
         mock_redis.mget = AsyncMock(side_effect=mock_mget)
 
         with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
             patch.object(tools_module, "publish_to_runners", AsyncMock()),
             patch("agents.simulator.broadcast.get_shared_redis_client", return_value=mock_redis),
             patch("agents.simulator.broadcast.asyncio.sleep", AsyncMock()),
@@ -1140,6 +1255,33 @@ class TestSpawnReadinessGate:
 
         # Should still succeed (proceeds with partial runners after timeout)
         assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_fire_start_gun_returns_error_when_readiness_gate_fails(self):
+        """fire_start_gun must return error and skip publish if readiness gate raises."""
+        from agents.simulator.broadcast import BroadcastError
+
+        ctx = _make_tool_context(
+            state={
+                "runner_session_ids": ["r-1"],
+                "simulation_id": "sim-102",
+            }
+        )
+        with (
+            patch("agents.simulator.collector.RaceCollector.is_running", return_value=True),
+            patch.object(
+                tools_module,
+                "wait_for_runners_ready",
+                new_callable=AsyncMock,
+                side_effect=BroadcastError("registry poll failed"),
+            ),
+            patch.object(tools_module, "publish_to_runners", AsyncMock()) as mock_publish,
+        ):
+            result = await fire_start_gun(tool_context=ctx)
+
+        assert result["status"] == "error"
+        assert "registry poll failed" in result["message"]
+        mock_publish.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1221,3 +1363,63 @@ class TestPrepareSimulationShapeValidation:
         result = await prepare_simulation(plan_json=json.dumps(plan), tool_context=ctx)
 
         assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_prepare_simulation_deduplicates_load_simulation_data_and_handles_null_quest_id(self):
+        """prepare_simulation calls load_simulation_data once and falls back when quest_id is null."""
+        plan = {"action": "execute", "narrative": "x", "quest_id": None}
+        ctx = _make_tool_context(state={"simulation_id": "sim-dedup-1"})
+        mock_load = AsyncMock(return_value={})
+
+        with patch("agents.utils.simdata.load_simulation_data", mock_load):
+            result = await prepare_simulation(plan_json=json.dumps(plan), tool_context=ctx)
+
+        assert result["status"] == "success"
+        assert result["quest_id"] == "ai_powered_disruptor"
+        mock_load.assert_awaited_once_with("sim-dedup-1")
+
+    @pytest.mark.asyncio
+    async def test_prepare_simulation_returns_error_on_simdata_error(self):
+        """prepare_simulation surfaces SimDataError as explicit status='error'."""
+        from agents.utils.simdata import SimDataError
+
+        plan = {"action": "execute", "narrative": "x"}
+        ctx = _make_tool_context(state={"simulation_id": "sim-err-1"})
+
+        with patch(
+            "agents.utils.simdata.load_simulation_data",
+            new_callable=AsyncMock,
+            side_effect=SimDataError("redis hgetall failed"),
+        ):
+            result = await prepare_simulation(plan_json=json.dumps(plan), tool_context=ctx)
+
+        assert result["status"] == "error"
+        assert "redis hgetall failed" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_simulation_returns_error_on_station_index_failure(self):
+        """prepare_simulation must fail explicitly if extract_station_index raises."""
+        plan = {
+            "action": "execute",
+            "narrative": "x",
+            "route": {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"name": "Strip"},
+                        "geometry": {"type": "LineString", "coordinates": [[-115.17, 36.08]]},
+                    }
+                ],
+            },
+        }
+        ctx = _make_tool_context()
+
+        with patch(
+            "agents.utils.station_index.extract_station_index",
+            side_effect=RuntimeError("corrupt station geometry"),
+        ):
+            result = await prepare_simulation(plan_json=json.dumps(plan), tool_context=ctx)
+
+        assert result["status"] == "error"
+        assert "station index" in result["message"].lower()

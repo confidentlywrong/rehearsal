@@ -37,6 +37,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/GoogleCloudPlatform/race-condition/internal/account"
+	"github.com/GoogleCloudPlatform/race-condition/internal/auth"
+	"github.com/GoogleCloudPlatform/race-condition/internal/middleware"
 )
 
 // sessionCookieName is the cookie the FirebaseResolver reads when
@@ -91,6 +93,10 @@ func authExchangeHandler() gin.HandlerFunc {
 		token := bearerFromHeader(c.Request.Header.Get("Authorization"))
 		if token == "" {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing_bearer_token"})
+			return
+		}
+		if !auth.IsCookieSafeToken(token) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid_bearer_token"})
 			return
 		}
 
@@ -169,7 +175,7 @@ func clearSessionCookie(c *gin.Context) {
 // account middleware would have already 401'd).
 func refreshSessionCookieFullLifetime(c *gin.Context) {
 	token := bearerFromHeader(c.Request.Header.Get("Authorization"))
-	if token == "" {
+	if !auth.IsCookieSafeToken(token) {
 		return
 	}
 	http.SetCookie(c.Writer, &http.Cookie{
@@ -187,11 +193,7 @@ func refreshSessionCookieFullLifetime(c *gin.Context) {
 // header value formatted as "Bearer <token>". Returns "" for any
 // other shape (including empty input).
 func bearerFromHeader(h string) string {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(h, prefix) {
-		return ""
-	}
-	return strings.TrimSpace(h[len(prefix):])
+	return auth.ParseBearerHeader(h)
 }
 
 // rawUserBearer returns the raw user bearer token attached to the
@@ -207,27 +209,21 @@ func bearerFromHeader(h string) string {
 // per-user memory-gateway auth), without giving up on the cookie
 // auth path that the SPA also uses.
 func rawUserBearer(c *gin.Context) string {
-	if tok := bearerFromHeader(c.Request.Header.Get("Authorization")); tok != "" {
+	if tok := bearerFromHeader(c.Request.Header.Get("Authorization")); auth.IsCookieSafeToken(tok) {
 		return tok
 	}
 	if cookie, err := c.Cookie(sessionCookieName); err == nil {
-		return strings.TrimSpace(cookie)
+		tok := strings.TrimSpace(cookie)
+		if auth.IsCookieSafeToken(tok) {
+			return tok
+		}
 	}
 	return ""
 }
 
-// requestIsHTTPS mirrors internal/middleware/security_headers.go.
-// Duplicated (rather than exported) to avoid widening the
-// middleware package's public API for a 5-line helper. Cloud Run
-// + the E3 HTTPS LB both set X-Forwarded-Proto=https; locally
-// (HTTP only) we get false and the Secure attribute is omitted so
-// the cookie still works.
+// requestIsHTTPS delegates to middleware.RequestIsHTTPS so auth cookie Secure
+// handling stays aligned with HSTS proxy-header validation (multi-hop and
+// spoofing resistant).
 func requestIsHTTPS(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	if r.TLS != nil {
-		return true
-	}
-	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	return middleware.RequestIsHTTPS(r)
 }

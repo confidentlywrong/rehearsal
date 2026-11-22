@@ -102,8 +102,16 @@ async def test_evaluate_plan_does_not_crash_when_tool_context_missing(monkeypatc
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     request = json.dumps({"user_intent": "test", "proposed_plan": "test plan"})
 
-    fake_scores = {"safety_compliance": 80}
-    fake_details = {"safety_compliance": "stub"}
+    fake_scores = {
+        "safety_compliance": 80,
+        "logistics_completeness": 80,
+        "participant_experience": 80,
+        "community_impact": 80,
+        "financial_viability": 80,
+        "intent_alignment": 80,
+        "distance_compliance": 100,
+    }
+    fake_details = {k: "stub" for k in fake_scores}
 
     with (
         patch(

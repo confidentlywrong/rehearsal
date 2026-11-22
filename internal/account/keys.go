@@ -15,7 +15,7 @@ import (
 // format. This keeps Go and Python in sync: Python's tenant_keys.py
 // also gates on SAAS_MODE before prefixing.
 func saasModeEnabled() bool {
-	v := strings.ToLower(os.Getenv("SAAS_MODE"))
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SAAS_MODE")))
 	return v == "on" || v == "true" || v == "1" || v == "yes"
 }
 
@@ -69,7 +69,7 @@ func keyPrefixForUser(userID string) string {
 	if userID == "" {
 		return ""
 	}
-	rootPrefix := os.Getenv("ACCOUNT_KEY_PREFIX")
+	rootPrefix := strings.TrimSpace(os.Getenv("ACCOUNT_KEY_PREFIX"))
 	if rootPrefix == "" {
 		rootPrefix = "u"
 	}

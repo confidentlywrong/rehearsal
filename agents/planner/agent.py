@@ -32,6 +32,7 @@ from agents.planner.adk_tools import get_tools
 from agents.planner.callbacks import financial_guardrail_callback
 from agents.planner.prompts import PLANNER
 from agents.utils import config
+from agents.utils.models import DEFAULT_PLANNER_MODEL, get_model
 from agents.utils.retry import resilient_model
 from agents.utils.communication_plugin import SimulationCommunicationPlugin
 from agents.utils.deployment import create_a2a_deployment
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 AGENT_DIR = os.path.dirname(__file__)
 
 
-MODEL = os.getenv("PLANNER_MODEL", "gemini-3-flash-preview")
+MODEL = get_model("PLANNER_MODEL", DEFAULT_PLANNER_MODEL)
 
 
 # [START planner_agent]

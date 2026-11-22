@@ -1,7 +1,20 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Changed for The Rehearsal: populate stakeholder nodeLabels from emit_stakeholder_graph, clear dedup indices on financial mode reset, use immutable displayItems updates for raw tick_feed, guard undefined speaker fields, respect isSecuringAgent across surface/model updates, and resolve active tool spinners on tool/model errors.
  */
 
 import type { ChangeDetectorRef, ElementRef } from '@angular/core';
@@ -45,10 +58,14 @@ export class AgentChatDisplayService {
   displayItems: DisplayItem[] = [];
   expandedToolCalls = new Set<number>();
   activeToolCalls = new Map<string, number[]>();
+  /** Maps stakeholder node ID → human-readable label extracted from emit_stakeholder_graph. */
+  nodeLabels: Record<string, string> | null = null;
   /** Tracks the last TEXT message text per session to deduplicate MODEL_END echoes. */
   private _lastTextBySession = new Map<string, string>();
   /** Maps A2UI surfaceId → displayItems index for update-in-place dedup. */
   private _surfaceIndex = new Map<string, number>();
+  private _destroyed = false;
+  private _pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
   /** Emit-* artifact tools that should render as inline cards in the chat thread. */
   private static readonly _ARTIFACT_TOOLS = new Set([
@@ -68,12 +85,62 @@ export class AgentChatDisplayService {
     return !!toolName && AgentChatDisplayService._ARTIFACT_TOOLS.has(toolName);
   }
 
+  clearTimers(host?: AgentChatDisplayHost): void {
+    for (const t of this._pendingTimers) {
+      clearTimeout(t);
+    }
+    this._pendingTimers.clear();
+    if (host?.errorMessageInterval) {
+      clearInterval(host.errorMessageInterval);
+      host.errorMessageInterval = null;
+    }
+  }
+
+  dispose(host?: AgentChatDisplayHost): void {
+    this._destroyed = true;
+    this.clearTimers(host);
+  }
+
   clearForDemoReset(): void {
+    this.clearTimers();
     this.displayItems = [];
     this.expandedToolCalls.clear();
     this.activeToolCalls.clear();
+    this.nodeLabels = null;
     this._lastTextBySession.clear();
     this._surfaceIndex.clear();
+  }
+
+  private _extractNodeLabels(result: unknown): void {
+    let parsedResult = result;
+    if (typeof parsedResult === 'string') {
+      const trimmed = parsedResult.trim();
+      if (!trimmed) return;
+      try {
+        parsedResult = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+    }
+    if (!parsedResult || typeof parsedResult !== 'object') return;
+    const obj = parsedResult as Record<string, unknown>;
+    const graph =
+      (obj['stakeholder_graph'] as Record<string, unknown> | undefined) ?? obj;
+    const nodes = graph['nodes'];
+    if (!Array.isArray(nodes) || nodes.length === 0) return;
+    const next: Record<string, string> = { ...(this.nodeLabels ?? {}) };
+    let added = false;
+    for (const n of nodes) {
+      if (!n || typeof n !== 'object') continue;
+      const rec = n as Record<string, unknown>;
+      if (typeof rec['id'] === 'string' && typeof rec['label'] === 'string' && rec['id'].trim() && rec['label'].trim()) {
+        next[rec['id'].trim()] = rec['label'].trim();
+        added = true;
+      }
+    }
+    if (added) {
+      this.nodeLabels = next;
+    }
   }
 
   toggleToolCall(idx: number): void {
@@ -205,7 +272,7 @@ export class AgentChatDisplayService {
     const toolCallToWarn = this.displayItems.find((item) => {
       if (!('msg' in item)) return false;
       return (
-        item.msg.speaker.includes('simulation_pipeline') &&
+        (item.msg.speaker ?? '').includes('simulation_pipeline') &&
         item.msg.toolName === 'prepare_simulation'
       );
     });
@@ -231,6 +298,7 @@ export class AgentChatDisplayService {
    * instead of appending duplicate cards on every tick.
    */
   private _addOrReplaceSurface(host: AgentChatDisplayHost, item: DisplayItem & { kind: 'a2ui' }): void {
+    if (host.isSecuringAgent) return;
     const su = (item.node as Record<string, unknown>)?.['surfaceUpdate'] as Record<string, unknown> | undefined;
     const surfaceId = su?.['surfaceId'] as string | undefined;
 
@@ -252,8 +320,12 @@ export class AgentChatDisplayService {
 
   finishToolCall(host: AgentChatDisplayHost, msg: ChatMessage): void {
     if (!msg.toolName) return;
-    const key = msg.toolName === 'load_skill' ? (msg.skillName ?? msg.toolName) : msg.toolName;
-    const indices = this.activeToolCalls.get(key);
+    let key = msg.toolName === 'load_skill' ? (msg.skillName || msg.toolName) : msg.toolName;
+    let indices = this.activeToolCalls.get(key);
+    if ((!indices || indices.length === 0) && msg.toolName === 'load_skill') {
+      key = 'load_skill';
+      indices = this.activeToolCalls.get(key);
+    }
 
     if (!indices || indices.length === 0) return;
 
@@ -313,11 +385,16 @@ export class AgentChatDisplayService {
         return;
 
       case AgentMessageType.RUN_END:
-        if (host.currentAgent && msg.guid === host.agents[host.currentAgent.agentType]) {
+        if (
+          !host.currentAgent ||
+          !host.agents[host.currentAgent.agentType] ||
+          msg.guid === host.agents[host.currentAgent.agentType]
+        ) {
           host.isAgentWorking = false;
         }
 
         host.isSecuringAgent = false;
+        host.cdr.markForCheck();
 
         return;
 
@@ -325,9 +402,11 @@ export class AgentChatDisplayService {
         return;
 
       case AgentMessageType.MODEL_END:
+        if (host.isSecuringAgent) return;
         if (host.finalToolCallMessage) {
           this.displayItems = [...this.displayItems, host.finalToolCallMessage];
           host.finalToolCallMessage = null;
+          host.cdr.markForCheck();
         }
 
         // MODEL_END often duplicates the preceding TEXT event, but the backend
@@ -342,19 +421,16 @@ export class AgentChatDisplayService {
           msg.speaker &&
           !isDuplicate
         ) {
-          this.displayItems = [
-            ...this.displayItems,
-            {
-              msg,
-              kind: 'message',
-            },
-          ];
+          this.addDisplayItem(host, {
+            msg,
+            kind: 'message',
+          });
         }
 
         return;
 
       case AgentMessageType.TOOL_START:
-        if (host.filterSettings.showToolCalls && msg.toolName) {
+        if (host.filterSettings.showToolCalls && msg.toolName && !host.isSecuringAgent) {
           const idx = this.displayItems.length;
           this.addDisplayItem(host, {
             kind: 'tool_call',
@@ -364,7 +440,7 @@ export class AgentChatDisplayService {
               text: `tool start : ${msg.toolName}`,
             },
           });
-          const key = msg.toolName === 'load_skill' ? msg.skillName! : msg.toolName;
+          const key = msg.toolName === 'load_skill' ? (msg.skillName || msg.toolName) : msg.toolName;
           if (!this.activeToolCalls.has(key)) {
             this.activeToolCalls.set(key, []);
           }
@@ -390,6 +466,9 @@ export class AgentChatDisplayService {
         // The chat thread template renders these via dedicated card components
         // (same ones used in the Log tab).
         if (this._isArtifactTool(msg.toolName)) {
+          if (msg.toolName === 'emit_stakeholder_graph') {
+            this._extractNodeLabels(msg.result);
+          }
           // If tool calls are visible and we have an active card, finish it.
           // We STILL add a separate message item so the artifact card renders unconditionally.
           if (host.filterSettings.showToolCalls && msg.toolName && this.activeToolCalls.has(msg.toolName)) {
@@ -406,13 +485,18 @@ export class AgentChatDisplayService {
           host.chatMessages = [];
           this.expandedToolCalls.clear();
           this.activeToolCalls.clear();
+          this.nodeLabels = null;
+          this._lastTextBySession.clear();
+          this._surfaceIndex.clear();
 
           const activeDemoKey = host.demoService.activeDemo();
-          const activeDemo = DEMO_CONFIG[activeDemoKey] as {
-            promptPlaceholder?: string;
-          };
+          const activeDemo = DEMO_CONFIG[activeDemoKey] as
+            | {
+                promptPlaceholder?: string;
+              }
+            | undefined;
 
-          if (activeDemo.promptPlaceholder) {
+          if (!host.chatInput && activeDemo?.promptPlaceholder) {
             if (host.chatTextAreaRef) {
               host.chatTextAreaRef.nativeElement.value = activeDemo.promptPlaceholder;
             }
@@ -430,7 +514,7 @@ export class AgentChatDisplayService {
         }
 
         if (msg.toolName === 'advance_tick') {
-          const d = msg.result as Record<string, unknown>;
+          const d = (msg.result ?? {}) as Record<string, unknown>;
           host.handleTickUpdate(d);
 
           // tick_feed cards are only shown in 'raw' (debug) tier.
@@ -446,11 +530,11 @@ export class AgentChatDisplayService {
               other: string[];
             }) || { transitions: {}, echoes: [], other: [] };
 
-            this.displayItems.push({
+            this.addDisplayItem(host, {
               kind: 'tick_feed',
               tick,
               maxTicks: Number(d['max_ticks']) || 0,
-              voices: notable.filter((e: string) => e.startsWith('💭')),
+              voices: notable.filter((e: string) => typeof e === 'string' && e.startsWith('💭')),
               statusCounts: (d['status_counts'] as Record<string, number>) || {},
               microFeedback: micro,
               eventsSummary: summary,
@@ -460,17 +544,7 @@ export class AgentChatDisplayService {
                 name: string; current: number; delta: number;
                 critical_threshold: number; is_critical: boolean; is_warning: boolean;
               }>) || {},
-              infrastructure: (d['infrastructure'] as {
-                medical_saves_this_tick: number; medical_events: string[];
-                avg_comfort: number; comfort_warning: boolean;
-                active_gatekeepers: number; max_friction: number;
-                friction_level: string; friction_details: Array<{ role: string; severity: number }>;
-              }) || {
-                medical_saves_this_tick: 0, medical_events: [],
-                avg_comfort: 100, comfort_warning: false,
-                active_gatekeepers: 0, max_friction: 0,
-                friction_level: 'none', friction_details: [],
-              },
+              infrastructure: (d['infrastructure'] as Extract<DisplayItem, { kind: 'tick_feed' }>['infrastructure']) ?? undefined,
               activeAlertsCount: Number(d['active_alerts_count']) || 0,
             });
             host.scrollChatToBottom();
@@ -481,36 +555,45 @@ export class AgentChatDisplayService {
         if (host.filterSettings.showToolCalls) {
           if (
             (msg.toolName && this.activeToolCalls.has(msg.toolName)) ||
-            (msg.toolName === 'load_skill' && this.activeToolCalls.has(msg.skillName!))
+            (msg.toolName === 'load_skill' && this.activeToolCalls.has(msg.skillName || msg.toolName))
           )
             this.finishToolCall(host, msg);
           return;
         }
 
         return;
-      case AgentMessageType.TOOL_ERROR:
+      case AgentMessageType.TOOL_ERROR: {
+        const errSpeaker = msg.speaker ?? '';
         if (host.filterSettings.showToolCalls) {
-          if (msg.speaker.includes(demoFiveSpeaker)) {
-            const indices = this.activeToolCalls.get('prepare_simulation');
-            if (!indices || indices.length === 0) return;
-            const idx = indices.shift()!;
-            const item = this.displayItems[idx];
-            if (!item || item.kind !== 'tool_call') return;
-            if (host.demoService.activeDemo() === '5a') {
-              setTimeout(() => {
-                this.setToolCallToWarning(host);
-              }, 1000);
-
+          const targetKey = errSpeaker.includes(demoFiveSpeaker)
+            ? 'prepare_simulation'
+            : (msg.toolName === 'load_skill' ? (msg.skillName || msg.toolName) : msg.toolName);
+          if (targetKey) {
+            const indices = this.activeToolCalls.get(targetKey);
+            if (indices && indices.length > 0) {
+              const idx = indices.shift()!;
+              const item = this.displayItems[idx];
+              if (indices.length === 0) {
+                this.activeToolCalls.delete(targetKey);
+              }
+              if (item && item.kind === 'tool_call') {
+                if (errSpeaker.includes(demoFiveSpeaker) && host.demoService.activeDemo() === '5a') {
+                  const warnHandle = setTimeout(() => {
+                    this._pendingTimers.delete(warnHandle);
+                    if (this._destroyed) return;
+                    this.setToolCallToWarning(host);
+                  }, 1000);
+                  this._pendingTimers.add(warnHandle);
+                  return;
+                }
+                item.done = true;
+                item.error = true;
+                item.msg = { ...item.msg, text: this.displayText(msg) };
+                this.displayItems = [...this.displayItems];
+              }
+            } else if (errSpeaker.includes(demoFiveSpeaker) && host.demoService.activeDemo() === '5a') {
               return;
             }
-
-            item.done = true;
-            item.error = true;
-            item.msg = { ...item.msg, text: this.displayText(msg) };
-            if (indices.length === 0) {
-              this.activeToolCalls.delete('prepare_simulation');
-            }
-            this.displayItems = [...this.displayItems];
           }
         }
 
@@ -518,7 +601,7 @@ export class AgentChatDisplayService {
 
         this.addDisplayItem(host, { kind: 'message', msg });
 
-        if (msg.speaker.toLowerCase().includes(demoFiveSpeaker)) {
+        if (errSpeaker.toLowerCase().includes(demoFiveSpeaker)) {
           if (host.demoService.activeDemo() === '5a') {
             return;
           }
@@ -532,6 +615,13 @@ export class AgentChatDisplayService {
           let count = 0;
 
           host.errorMessageInterval = window.setInterval(() => {
+            if (this._destroyed) {
+              if (host.errorMessageInterval !== null) {
+                clearInterval(host.errorMessageInterval);
+                host.errorMessageInterval = null;
+              }
+              return;
+            }
             count++;
             if (count >= 5) {
               clearInterval(host.errorMessageInterval as number);
@@ -545,11 +635,16 @@ export class AgentChatDisplayService {
             }
 
             host.cdr.markForCheck();
-            setTimeout(() => host.scrollChatToBottom(), 0);
+            const scrollHandle = setTimeout(() => {
+              this._pendingTimers.delete(scrollHandle);
+              if (!this._destroyed) host.scrollChatToBottom();
+            }, 0);
+            this._pendingTimers.add(scrollHandle);
           }, 1000);
         }
 
         return;
+      }
 
       case AgentMessageType.INTER_AGENT:
         this.addDisplayItem(host, {
@@ -573,10 +668,14 @@ export class AgentChatDisplayService {
       case AgentMessageType.AGENT_END:
         return;
       case AgentMessageType.MODEL_ERROR:
-        this.displayItems = [...this.displayItems, { kind: 'message', msg }];
-        if (host.currentAgent && msg.guid === host.agents[host.currentAgent.agentType]) {
+        if (
+          !host.currentAgent ||
+          !host.agents[host.currentAgent.agentType] ||
+          msg.guid === host.agents[host.currentAgent.agentType]
+        ) {
           host.isAgentWorking = false;
         }
+        this.addDisplayItem(host, { kind: 'message', msg });
         return;
       default:
         console.warn('Message Type not implemented:', msg.msgType);

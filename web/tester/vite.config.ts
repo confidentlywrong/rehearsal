@@ -1,5 +1,7 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
+ * Changed for The Rehearsal: target canonical Gateway port 9101 and add /ws WebSocket proxy.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +24,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8101",
+        target: "http://127.0.0.1:9101",
+        changeOrigin: true,
+      },
+      "/ws": {
+        target: "http://127.0.0.1:9101",
+        ws: true,
         changeOrigin: true,
       },
     },

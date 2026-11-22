@@ -16,7 +16,7 @@
 
 """ADK FunctionTool registry for route memory tools.
 
-Provides :func:`get_memory_tools` which returns all six memory tools
+Provides :func:`get_memory_tools` which returns all eight memory tools
 wrapped as :class:`google.adk.tools.FunctionTool` instances, ready for
 registration on an ADK agent.
 """
@@ -36,7 +36,7 @@ from agents.planner_with_memory.memory.tools import (
 
 
 def get_memory_tools() -> list[FunctionTool]:
-    """Return all 9 memory tools as ADK FunctionTools."""
+    """Return all 8 memory tools as ADK FunctionTools."""
     return [
         FunctionTool(store_route),
         FunctionTool(record_simulation),

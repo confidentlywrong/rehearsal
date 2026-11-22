@@ -26,7 +26,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 @pytest.fixture
 def a2a_client():
-    return SimulationA2AClient(gateway_url="http://gateway:8101")
+    return SimulationA2AClient(gateway_url="http://gateway:9101")
 
 
 @respx.mock
@@ -46,7 +46,7 @@ async def test_registry_discovery(a2a_client):
             "skills": [],
         }
     }
-    respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json=mock_data))
+    respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json=mock_data))
 
     cards = await a2a_client._discover_agents()
     assert "runner_autopilot" in cards
@@ -71,7 +71,7 @@ async def test_registry_card_transport_normalized_to_jsonrpc(a2a_client):
             "skills": [],
         }
     }
-    respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json=mock_data))
+    respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json=mock_data))
 
     agent = await a2a_client.get_agent("simulator")
     # The card on the agent must be jsonrpc, not http_json
@@ -394,7 +394,7 @@ class TestDiscoveryCache:
         communication._discovery_cache = {}
         communication._discovery_cache_ts = {}
 
-        route = respx.get("http://gateway:8101/api/v1/agent-types").mock(
+        route = respx.get("http://gateway:9101/api/v1/agent-types").mock(
             return_value=httpx.Response(
                 200,
                 json={
@@ -429,7 +429,7 @@ class TestDiscoveryCache:
         communication._discovery_cache = {}
         communication._discovery_cache_ts = {}
 
-        route = respx.get("http://gateway:8101/api/v1/agent-types").mock(
+        route = respx.get("http://gateway:9101/api/v1/agent-types").mock(
             return_value=httpx.Response(
                 200,
                 json={
@@ -462,7 +462,7 @@ class TestClientCleanup:
     @pytest.mark.asyncio
     async def test_close_cleans_up_agents(self):
         """close() should clear the agents dict."""
-        client = SimulationA2AClient(gateway_url="http://gateway:8101")
+        client = SimulationA2AClient(gateway_url="http://gateway:9101")
         # Manually add a mock agent
         mock_agent = MagicMock()
         mock_agent.cleanup = AsyncMock()
@@ -544,7 +544,7 @@ class TestNonAEAgentUsesOIDCAuth:
         from agents.utils.communication import _OIDCAuth
 
         monkeypatch.setenv("PLANNER_URL", "https://planner-cloudrun.run.app")
-        respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json={}))
+        respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json={}))
 
         captured_auth = []
         original_async_client = httpx.AsyncClient
@@ -568,7 +568,7 @@ class TestDiscoveryAttachesOIDC:
     @pytest.mark.asyncio
     async def test_discovery_attaches_authorization_when_token_resolves(self, a2a_client, monkeypatch):
         """When get_id_token returns a token, discovery sends Authorization: Bearer."""
-        route = respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json={}))
+        route = respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json={}))
 
         with patch("agents.utils.auth.get_id_token", return_value="eyJfaketoken"):
             await a2a_client._discover_agents()
@@ -580,7 +580,7 @@ class TestDiscoveryAttachesOIDC:
     @pytest.mark.asyncio
     async def test_discovery_omits_authorization_when_token_unavailable(self, a2a_client, monkeypatch):
         """When get_id_token returns None (local dev / no ADC), discovery still works."""
-        route = respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json={}))
+        route = respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json={}))
 
         with patch("agents.utils.auth.get_id_token", return_value=None):
             await a2a_client._discover_agents()
@@ -602,7 +602,7 @@ class TestAEAgentKeepsGCPAuth:
             "SIMULATOR_URL",
             "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/reasoningEngines/123",
         )
-        respx.get("http://gateway:8101/api/v1/agent-types").mock(return_value=Response(200, json={}))
+        respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json={}))
 
         captured_auth = []
         original_async_client = httpx.AsyncClient
@@ -618,3 +618,36 @@ class TestAEAgentKeepsGCPAuth:
         assert any(isinstance(a, _GCPAuth) for a in captured_auth), (
             f"Expected at least one httpx.AsyncClient with _GCPAuth; got {captured_auth!r}"
         )
+
+
+def test_communication_defaults_to_9101(monkeypatch):
+    """SimulationA2AClient defaults to canonical Gateway port 9101 when env vars are unset."""
+    for var in ("GATEWAY_INTERNAL_URL", "GATEWAY_URL", "GATEWAY_ADDR"):
+        monkeypatch.delenv(var, raising=False)
+
+    client = SimulationA2AClient()
+    assert client.gateway_url == "http://127.0.0.1:9101"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_discover_agents_raises_runtime_error_on_http_failure_with_empty_cache():
+    """_discover_agents raises RuntimeError instead of returning {} on HTTP failure with cold cache."""
+    client = SimulationA2AClient(gateway_url="http://gateway:9101")
+    respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(503, text="unavailable"))
+
+    with pytest.raises(RuntimeError, match="Agent discovery failed"):
+        await client._discover_agents()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_agent_whitespace_url_does_not_shadow_internal_url(a2a_client, monkeypatch):
+    """Whitespace {NAME}_URL must not shadow {NAME}_INTERNAL_URL."""
+    monkeypatch.setenv("PLANNER_URL", "   ")
+    monkeypatch.setenv("PLANNER_INTERNAL_URL", "https://planner-internal.run.app")
+    respx.get("http://gateway:9101/api/v1/agent-types").mock(return_value=Response(200, json={}))
+
+    agent = await a2a_client.get_agent("planner")
+    assert agent._agent_card is not None
+    assert agent._agent_card.url == "https://planner-internal.run.app/a2a/planner/"

@@ -1,5 +1,7 @@
 <!--
  Copyright 2026 Google LLC
+ Modifications copyright 2026 Christian Haeussinger
+ Changed for The Rehearsal: disable textarea and show loading state while isSecuringAgent is active, and add accessible labels.
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -16,24 +18,26 @@
 
 <div
   class="agent-chat-composer__input"
-  [class.agent-chat-composer__input--loading]="isAgentWorking"
+  [class.agent-chat-composer__input--loading]="isAgentWorking || isSecuringAgent"
 >
   <textarea
     #chatTextArea
     class="agent-chat-composer__textarea"
     rows="1"
+    aria-label="Message input"
     [placeholder]="placeholder"
     [ngModel]="text"
     (ngModelChange)="onInput($event)"
-    [disabled]="isAgentWorking"
+    [disabled]="isAgentWorking || isSecuringAgent"
     (keydown.enter)="onChatEnter($event)"
   ></textarea>
   <button
     class="agent-chat-composer__send"
     type="button"
+    aria-label="Send message"
     (click)="send.emit()"
     [disabled]="!text.trim() || !canSend || isAgentWorking || isSecuringAgent"
   >
-    <span class="material-icons">send</span>
+    <span class="material-icons" aria-hidden="true">send</span>
   </button>
 </div>

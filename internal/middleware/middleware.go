@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,8 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"html/template"
 	"log"
 	"net/http"
 	"os"
@@ -29,14 +29,28 @@ import (
 	"sync"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
 )
 
 // emptyAudienceWarnOnce ensures the B-22 cloud-misconfiguration warning
 // from AttachOIDCTokenAs is logged at most once per process. Local dev
-// (no K_SERVICE) stays silent because empty audience is the intended
+// (not on GCP) stays silent because empty audience is the intended
 // no-op there.
 var emptyAudienceWarnOnce sync.Once
+
+// oidcTokenSourceCache caches oauth2.TokenSource per audience so we
+// do not recreate idtoken sources on every proxied HTTP request.
+var (
+	oidcTokenCacheMu sync.RWMutex
+	oidcTokenCache   = make(map[string]oauth2.TokenSource)
+)
+
+func resetOIDCTokenCacheForTest() {
+	oidcTokenCacheMu.Lock()
+	oidcTokenCache = make(map[string]oauth2.TokenSource)
+	oidcTokenCacheMu.Unlock()
+}
 
 // CORS returns a gin middleware that sets CORS headers.
 // allowedOrigin may be a single origin, a comma-separated list of origins,
@@ -54,12 +68,12 @@ var emptyAudienceWarnOnce sync.Once
 // promoting the .env.example default into a deployed environment.
 func CORS(allowedOrigin string) gin.HandlerFunc {
 	// Pre-parse once at init time so we don't split on every request.
-	raw := allowedOrigin
+	raw := strings.TrimSpace(allowedOrigin)
 	if raw == "" {
 		raw = "*"
 	}
-	onCloudRun := os.Getenv("K_SERVICE") != ""
-	refuseWildcard := onCloudRun || strings.EqualFold(os.Getenv("CORS_REFUSE_WILDCARD"), "true")
+	onCloudRun := looksLikeGCP()
+	refuseWildcard := onCloudRun || strings.EqualFold(strings.TrimSpace(os.Getenv("CORS_REFUSE_WILDCARD")), "true")
 	locked := raw == "*" && refuseWildcard
 	if locked {
 		log.Printf("CORS: refusing wildcard origin '*' (K_SERVICE=%q CORS_REFUSE_WILDCARD=%q); locking cross-origin off. Set CORS_ALLOWED_ORIGINS to an explicit https://... list.",
@@ -69,6 +83,10 @@ func CORS(allowedOrigin string) gin.HandlerFunc {
 	if raw != "*" && !locked {
 		for _, o := range strings.Split(raw, ",") {
 			if t := strings.TrimSpace(o); t != "" {
+				if t == "*" && refuseWildcard {
+					log.Printf("CORS: skipping wildcard entry '*' in CORS_ALLOWED_ORIGINS under refuseWildcard mode")
+					continue
+				}
 				allowed = append(allowed, t)
 			}
 		}
@@ -97,10 +115,11 @@ func CORS(allowedOrigin string) gin.HandlerFunc {
 			// responses are well-formed, but omit Allow-Origin so the
 			// browser blocks the request.
 			c.Writer.Header().Set("Access-Control-Allow-Methods",
-				"GET, POST, OPTIONS, PUT, DELETE")
+				"GET, POST, OPTIONS, PUT, PATCH, DELETE")
 			c.Writer.Header().Set("Access-Control-Allow-Headers",
 				"Content-Type, Content-Length, Accept-Encoding, "+
-					"X-CSRF-Token, Authorization, X-Local-Dev-Superadmin")
+					"X-CSRF-Token, Authorization, X-Local-Dev-Superadmin, "+
+					"X-Firebase-AppCheck, X-Request-ID")
 			c.Writer.Header().Add("Vary", "Origin")
 			if c.Request.Method == http.MethodOptions {
 				c.AbortWithStatus(204)
@@ -115,10 +134,11 @@ func CORS(allowedOrigin string) gin.HandlerFunc {
 			c.Writer.Header().Add("Vary", "Origin")
 		}
 		c.Writer.Header().Set("Access-Control-Allow-Methods",
-			"GET, POST, OPTIONS, PUT, DELETE")
+			"GET, POST, OPTIONS, PUT, PATCH, DELETE")
 		c.Writer.Header().Set("Access-Control-Allow-Headers",
 			"Content-Type, Content-Length, Accept-Encoding, "+
-				"X-CSRF-Token, Authorization, X-Local-Dev-Superadmin")
+				"X-CSRF-Token, Authorization, X-Local-Dev-Superadmin, "+
+				"X-Firebase-AppCheck, X-Request-ID")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(204)
 			return
@@ -128,13 +148,18 @@ func CORS(allowedOrigin string) gin.HandlerFunc {
 }
 
 // RenderConfigJS produces a safe `window.ENV = {...};` JS snippet.
-// All values are JS-escaped to prevent XSS via string injection.
+// Go's json.Marshal escapes `<`, `>`, `&`, `\u2028`, `\u2029`, `"`, `\`,
+// and control characters so values cannot break out of a `<script>` block
+// or corrupt URL query strings containing `=` or `&`.
 func RenderConfigJS(vars map[string]string) string {
-	safe := make(map[string]string, len(vars))
-	for k, v := range vars {
-		safe[k] = template.JSEscapeString(v)
+	if vars == nil {
+		vars = map[string]string{}
 	}
-	data, _ := json.Marshal(safe)
+	data, err := json.Marshal(vars)
+	if err != nil {
+		log.Printf("RenderConfigJS: json.Marshal failed: %v", err)
+		return "window.ENV = {};"
+	}
 	return fmt.Sprintf("window.ENV = %s;", string(data))
 }
 
@@ -153,10 +178,17 @@ func ConfigJSHandler(vars map[string]string) gin.HandlerFunc {
 var newTokenSource = idtoken.NewTokenSource
 
 // AttachOIDCToken fetches a Google OIDC token for the given audience
-// and sets the Authorization header on the request. Returns any error.
+// and sets the Authorization header on the request.
 // This is a no-op if audience is empty.
 func AttachOIDCToken(ctx context.Context, header http.Header, audience string) {
 	AttachOIDCTokenAs(ctx, header, audience, "Authorization")
+}
+
+// AttachOIDCTokenE fetches a Google OIDC token for the given audience
+// and sets the Authorization header on the request, returning an error
+// if header is nil or token acquisition fails (when audience is non-empty).
+func AttachOIDCTokenE(ctx context.Context, header http.Header, audience string) error {
+	return AttachOIDCTokenAsE(ctx, header, audience, "Authorization")
 }
 
 // AttachOIDCTokenAs is like AttachOIDCToken but writes the token to a
@@ -171,40 +203,64 @@ func AttachOIDCToken(ctx context.Context, header http.Header, audience string) {
 // `Authorization: Bearer <user-token>` reaches the application
 // untouched. See
 // https://cloud.google.com/run/docs/authenticating/service-to-service#use_the_authorization_header
-//
-// Bug 2026-06-22 (login loop): the SaaS frontend BFF used to call
-// AttachOIDCToken, which overwrites the Firebase ID token that the
-// /login page sends to /api/v1/auth/exchange. The gateway then could
-// not identify the user, returned 401, and the __session cookie was
-// never minted — so the browser's follow-on navigation to / bounced
-// straight back to /login with no error visible to the user.
 func AttachOIDCTokenAs(ctx context.Context, header http.Header, audience, headerName string) {
+	if err := AttachOIDCTokenAsE(ctx, header, audience, headerName); err != nil {
+		log.Printf("OIDC: %v", err)
+	}
+}
+
+// AttachOIDCTokenAsE is the error-returning counterpart of AttachOIDCTokenAs.
+// TokenSource instances are cached per audience using context.Background()
+// so a single cancelled request does not poison the cached TokenSource.
+func AttachOIDCTokenAsE(ctx context.Context, header http.Header, audience, headerName string) error {
+	if header == nil {
+		return errors.New("AttachOIDCTokenAs: nil http.Header")
+	}
+	audience = strings.TrimSpace(audience)
 	if audience == "" {
-		// B-22 (2026-06-23 audit): on Cloud Run an empty audience
-		// almost always indicates a missing env var (e.g.
-		// GATEWAY_AUDIENCE) rather than an intentional skip. The
-		// silent no-op masked production misconfigurations until
-		// downstream services 401'd with no upstream telemetry.
-		// Local dev (no K_SERVICE) intentionally stays silent.
-		if os.Getenv("K_SERVICE") != "" {
+		if looksLikeGCP() {
 			emptyAudienceWarnOnce.Do(func() {
-				log.Printf("OIDC: WARN AttachOIDCToken called with empty audience on Cloud Run (K_SERVICE=%q). Downstream IAM-protected calls will be unauthenticated. Check service env vars (GATEWAY_AUDIENCE, AGENT_AUDIENCE, etc.). This warning is logged once per process.", os.Getenv("K_SERVICE"))
+				log.Printf("OIDC: WARN AttachOIDCToken called with empty audience on GCP (K_SERVICE=%q). Downstream IAM-protected calls will be unauthenticated. Check service env vars (GATEWAY_AUDIENCE, AGENT_AUDIENCE, etc.). This warning is logged once per process.", os.Getenv("K_SERVICE"))
 			})
 		}
-		return
+		return nil
 	}
 	if headerName == "" {
 		headerName = "Authorization"
 	}
-	tokenSource, err := newTokenSource(ctx, audience)
+
+	ts, err := getOrCreateTokenSource(ctx, audience)
 	if err != nil {
-		log.Printf("OIDC: Failed to create token source for %s: %v", audience, err)
-		return
+		return fmt.Errorf("create token source for %s: %w", audience, err)
 	}
-	token, err := tokenSource.Token()
+	token, err := ts.Token()
 	if err != nil {
-		log.Printf("OIDC: Failed to get token for %s: %v", audience, err)
-		return
+		return fmt.Errorf("get token for %s: %w", audience, err)
 	}
 	header.Set(headerName, "Bearer "+token.AccessToken)
+	return nil
+}
+
+func getOrCreateTokenSource(_ context.Context, audience string) (oauth2.TokenSource, error) {
+	oidcTokenCacheMu.RLock()
+	cached := oidcTokenCache[audience]
+	oidcTokenCacheMu.RUnlock()
+	if cached != nil {
+		return cached, nil
+	}
+
+	oidcTokenCacheMu.Lock()
+	defer oidcTokenCacheMu.Unlock()
+	if cached = oidcTokenCache[audience]; cached != nil {
+		return cached, nil
+	}
+	ts, err := newTokenSource(context.Background(), audience)
+	if err != nil {
+		return nil, err
+	}
+	if ts == nil {
+		return nil, errors.New("token source constructor returned nil")
+	}
+	oidcTokenCache[audience] = ts
+	return ts, nil
 }

@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,8 +63,8 @@ def _load_skills_from_directory(
             if tools_py.exists():
                 skill_id = skill_path.name.replace("-", "_")
                 spec = importlib.util.spec_from_file_location(f"{skill_id}.tools", tools_py)
-                assert spec is not None, f"Could not find module spec for {tools_py}"
-                assert spec.loader is not None, f"Module spec has no loader for {tools_py}"
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Could not load module spec/loader for {tools_py}")
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 

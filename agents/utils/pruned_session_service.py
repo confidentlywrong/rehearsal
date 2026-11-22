@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: fix zero/negative max_events pruning and disconnect replaced Redis connection pool.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +27,8 @@ how many ticks have elapsed.  State (app_state/user_state) is unaffected --
 it's stored in separate Redis HASHes.
 """
 
+import asyncio
+import inspect
 import logging
 
 import redis.asyncio as redis
@@ -34,6 +38,43 @@ from google.adk.sessions.session import Session
 from google.adk_community.sessions import RedisSessionService
 
 logger = logging.getLogger(__name__)
+_background_cleanup_tasks: set[asyncio.Task[object]] = set()
+
+
+def _disconnect_replaced_pool(old_pool: object) -> None:
+    """Best-effort disconnect of a replaced Redis connection pool."""
+    disconnect = getattr(old_pool, "disconnect", None)
+    if not callable(disconnect):
+        return
+    try:
+        try:
+            result = disconnect(inuse_connections=False)
+        except TypeError:
+            result = disconnect()
+    except Exception:
+        logger.debug("PrunedRedisSessionService: failed to disconnect replaced pool", exc_info=True)
+        return
+
+    if not inspect.isawaitable(result):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        if inspect.iscoroutine(result):
+            result.close()
+        return
+
+    task: asyncio.Task[object] = loop.create_task(result)  # type: ignore[arg-type]
+    _background_cleanup_tasks.add(task)
+
+    def _on_done(done_task: asyncio.Task[object]) -> None:
+        _background_cleanup_tasks.discard(done_task)
+        if not done_task.cancelled():
+            exc = done_task.exception()
+            if exc is not None:
+                logger.warning("PrunedRedisSessionService: pool disconnect failed: %s", exc)
+
+    task.add_done_callback(_on_done)
 
 
 class PrunedRedisSessionService(RedisSessionService):
@@ -64,6 +105,7 @@ class PrunedRedisSessionService(RedisSessionService):
                     **pool_kwargs,
                 )
                 cache.connection_pool = new_pool
+                _disconnect_replaced_pool(old_pool)
                 logger.info(
                     "PrunedRedisSessionService: replaced ConnectionPool with "
                     "BlockingConnectionPool (max_connections=%d, timeout=10s)",
@@ -72,6 +114,8 @@ class PrunedRedisSessionService(RedisSessionService):
 
     async def append_event(self, session: Session, event: Event) -> Event:
         """Prune old events before the parent serializes the session blob."""
-        if len(session.events) > self.max_events:
+        if self.max_events <= 0:
+            session.events = []
+        elif len(session.events) > self.max_events:
             session.events = session.events[-self.max_events :]
         return await super().append_event(session=session, event=event)

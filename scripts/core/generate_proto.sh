@@ -20,10 +20,16 @@ set -euo pipefail
 echo "🔨 Generating Protobuf bindings..."
 
 # 1. Go Generation
-# Requires: protoc-gen-go
-if ! command -v protoc-gen-go &> /dev/null; then
-    echo "⚠️  Warning: protoc-gen-go not found. Skipping Go generation."
-    echo "   To install: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"
+# Requires: protoc and protoc-gen-go (unless ALLOW_SKIP_GO_PROTO=1 is explicitly set)
+if ! command -v protoc &> /dev/null || ! command -v protoc-gen-go &> /dev/null; then
+    if [ "${ALLOW_SKIP_GO_PROTO:-0}" = "1" ]; then
+        echo "⚠️  Warning: protoc or protoc-gen-go not found; skipping Go generation (ALLOW_SKIP_GO_PROTO=1)."
+    else
+        echo "❌ Error: protoc or protoc-gen-go not found." >&2
+        echo "   Install protoc and protoc-gen-go (go install google.golang.org/protobuf/cmd/protoc-gen-go@latest)," >&2
+        echo "   or set ALLOW_SKIP_GO_PROTO=1 to skip Go proto generation explicitly." >&2
+        exit 1
+    fi
 else
     protoc --go_out=. --go_opt=paths=source_relative gen_proto/gateway/gateway.proto
     # 2. Go Module Tidy (Ensures gen_proto is correctly indexed)

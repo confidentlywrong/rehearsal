@@ -34,8 +34,8 @@ The failing `prepare_simulation`:
 
 1. Logs that it's starting (failure variant)
 2. Sleeps 3 seconds (`asyncio.sleep(3)`)
-3. Raises `RuntimeError("Simulation engine failure: runner agent coordination
-   timed out after 3s...")`)
+3. Raises `RuntimeError("Internal Server Error: an unexpected exception occurred while
+   processing the request. Please contact the system administrator if the problem persists.")`
 
 No other pre-race tools (`spawn_runners`, `start_race_collector`,
 `fire_start_gun`) are included because the simulation never gets past setup.
@@ -48,7 +48,7 @@ flowchart TD
     pipeline["simulation_pipeline<br/>(SequentialAgent)"]
     pre["pre_race<br/>prepare_simulation raises RuntimeError"]
     race["race_engine<br/>(LoopAgent)"]
-    post["post_race<br/>operates on empty state"]
+    post["post_race<br/>skipped via _configure_post_race"]
 
     root --> pipeline
     pipeline --> pre
@@ -70,8 +70,8 @@ flowchart TD
 1. `prepare_simulation` raises before setting `simulation_ready = True`
 2. `_configure_race_engine` callback sees `simulation_ready` is falsy, returns
    early with "Race skipped" -- zero ticks execute
-3. `post_race` still runs (SequentialAgent continues) but operates on empty
-   tick snapshots
+3. `_configure_post_race` also sees `simulation_ready` is falsy and skips
+   `post_race` cleanly rather than running post-race compilation on empty state
 
 This validates that the system degrades gracefully rather than running a tick
 loop with no runners, no simulation ID, and no initialized state.
@@ -90,16 +90,16 @@ loop with no runners, no simulation ID, and no initialized state.
 | Component | Base simulator | This variant |
 |:----------|:---------------|:-------------|
 | Agent name | `simulator` | `simulator_with_failure` |
-| Port | 8202 | 8206 |
+| Port | 9104 | 9107 |
 | Pre-race tools | 5 tools (full setup pipeline) | 1 tool (always fails) |
-| Pre-race callback | Deterministic 5-phase state machine | None (LLM-driven, but tool always raises) |
+| Pre-race callback | Deterministic 5-phase state machine | Deterministic `pre_race_callback` (inherited from `get_agent()`; tool raises) |
 | Everything else | -- | Identical (inherited via `get_agent()`) |
 
 ## Configuration
 
 | Variable | Default | Description |
 |:---------|:--------|:------------|
-| `PORT` / `SIMULATOR_WITH_FAILURE_PORT` | `8206` | HTTP listen port |
+| `PORT` / `SIMULATOR_WITH_FAILURE_PORT` | `9107` | HTTP listen port |
 
 ## File layout
 
@@ -107,7 +107,7 @@ loop with no runners, no simulation ID, and no initialized state.
 agents/simulator_with_failure/
 ├── agent.py                    # get_agent() call with tool override
 ├── skills/
-│   └── pre-race/
+│   └── simulating-pre-race-failure/
 │       ├── SKILL.md            # Skill metadata
 │       └── tools.py            # Failing prepare_simulation (sleep + raise)
 └── tests/

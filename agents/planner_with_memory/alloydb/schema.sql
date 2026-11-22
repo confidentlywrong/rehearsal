@@ -1,4 +1,6 @@
 -- Copyright 2026 Google LLC
+-- Modifications copyright 2026 Christian Haeussinger
+-- Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -33,6 +35,17 @@ CREATE TABLE IF NOT EXISTS rules (
     embedding   VECTOR(3072)
 );
 
+-- Deduplicate any legacy rows from pre-constraint seed_rules.sql re-runs
+-- before enforcing the natural (source_file, chunk_id) uniqueness key.
+DELETE FROM rules a
+USING rules b
+WHERE a.ctid < b.ctid
+  AND a.source_file = b.source_file
+  AND a.chunk_id = b.chunk_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rules_source_chunk
+    ON rules (source_file, chunk_id);
+
 -- Auto-refresh embeddings whenever rows are inserted/updated.
 CALL ai.initialize_embeddings(
     model_id               => 'gemini-embedding-001',
@@ -54,6 +67,13 @@ CREATE TABLE IF NOT EXISTS planned_routes (
     eval_score FLOAT,
     eval_result JSONB
 );
+
+-- Per-user tenancy (SaaS Phase 3). Nullable for backwards compat with
+-- existing single-tenant deployments (owner_id=NULL is unowned legacy).
+ALTER TABLE planned_routes
+    ADD COLUMN IF NOT EXISTS owner_id VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_planned_routes_owner_created
+    ON planned_routes (owner_id, created_at DESC);
 
 -- ============================================================
 -- 3. SIMULATION RECORDS TABLE
@@ -89,6 +109,13 @@ CREATE TABLE IF NOT EXISTS simulation_summaries (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     embedding   VECTOR(3072)
 );
+
+-- Per-user tenancy. Same semantics as on planned_routes above: nullable
+-- for backwards compat, covering index for scoped semantic recall.
+ALTER TABLE simulation_summaries
+    ADD COLUMN IF NOT EXISTS owner_id VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_simulation_summaries_owner_created
+    ON simulation_summaries (owner_id, created_at DESC);
 
 -- Auto-refresh embeddings whenever rows are inserted/updated.
 CALL ai.initialize_embeddings(

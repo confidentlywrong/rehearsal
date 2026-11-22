@@ -18,10 +18,10 @@ Mirrors agents/planner_with_eval/evaluator/config.py with leadership-
 specific criteria weights and thresholds.
 """
 
-import os
+from agents.utils.models import DEFAULT_EVALUATOR_MODEL, get_model
 
 # Model configuration
-MODEL = os.getenv("EVALUATOR_MODEL", "gemini-3.1-pro-preview")
+MODEL = get_model("EVALUATOR_MODEL", DEFAULT_EVALUATOR_MODEL)
 
 # Criterion weights must sum to 1.0 (equal weighting across 6 criteria)
 CRITERION_WEIGHTS = {

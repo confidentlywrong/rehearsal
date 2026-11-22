@@ -24,11 +24,11 @@ broadcast envelope.
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 
 from agents.utils.redis_pool import get_shared_redis_client
+from agents.utils import simulation_registry
 from agents.utils.simulation_registry import _session_key
 from agents.utils import tenant_keys
 
@@ -37,18 +37,23 @@ logger = logging.getLogger(__name__)
 _READINESS_POLL_INTERVAL = 0.5  # seconds between registry polls
 
 
-def _scoped_broadcast_channel(simulation_id: str) -> str:
+class BroadcastError(RuntimeError):
+    """Raised when Redis broadcast or registry polling fails."""
+
+
+def _scoped_broadcast_channel(simulation_id: str, user_id: str | None = None) -> str:
     """Tenant-scoped name for the per-simulation broadcast channel.
 
     SaaS-aware (Phase 2.5b): in SAAS_MODE=on this returns
     ``{TENANT_KEY_PREFIX}:{org}:simulation:{sim}:broadcast``
-    where ``org`` is read from ``DISPATCHER_USER_ID`` (set by the
-    simulator process's deployment env). In SAAS_MODE=off the helper
-    collapses to the legacy ``simulation:{sim}:broadcast`` byte-for-byte
-    so existing tests and the single-tenant local stack are unchanged.
+    where ``org`` is resolved from explicit ``user_id``,
+    ``simulation_registry.user_scope(...)``, or ``DISPATCHER_USER_ID``.
+    In SAAS_MODE=off the helper collapses to the legacy
+    ``simulation:{sim}:broadcast`` byte-for-byte so existing tests and
+    the single-tenant local stack are unchanged.
     """
-    user_id = os.environ.get("DISPATCHER_USER_ID", "").strip()
-    return tenant_keys.key_for_user(user_id, "simulation", simulation_id, "broadcast")
+    eff_user = simulation_registry._resolve_registry_user(user_id, require_when_saas=False)
+    return tenant_keys.key_for_user(eff_user, "simulation", simulation_id, "broadcast")
 
 
 async def wait_for_runners_ready(
@@ -71,7 +76,7 @@ async def wait_for_runners_ready(
 
     Returns the number of runners confirmed registered for this simulation.
     """
-    expected = len(session_ids)
+    expected = len(session_ids) if session_ids else 0
     if expected == 0:
         return 0
 
@@ -80,8 +85,12 @@ async def wait_for_runners_ready(
         logger.warning("wait_for_runners_ready: no Redis client, skipping spawn readiness gate")
         return 0
 
-    deadline = time.monotonic() + timeout_seconds
+    safe_timeout = timeout_seconds if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0 else 0.0
+    deadline = time.monotonic() + safe_timeout
     registered = 0
+    any_poll_succeeded = False
+    poll_failures = 0
+    last_poll_error: Exception | None = None
 
     while time.monotonic() < deadline:
         try:
@@ -89,14 +98,17 @@ async def wait_for_runners_ready(
             values = await r.mget(*keys)  # type: ignore[misc]
             registered = sum(
                 1
-                for v in values
-                if v is not None and (v == simulation_id or (isinstance(v, bytes) and v.decode() == simulation_id))
+                for v in (values or ())
+                if v is not None and (v == simulation_id or (isinstance(v, bytes) and v.decode(errors="replace") == simulation_id))
             )
+            any_poll_succeeded = True
         except Exception as e:
+            poll_failures += 1
+            last_poll_error = e
             logger.warning("wait_for_runners_ready: registry poll failed, retrying: %s", e)
 
         if registered >= expected:
-            elapsed = timeout_seconds - (deadline - time.monotonic())
+            elapsed = max(0.0, safe_timeout - max(0.0, deadline - time.monotonic()))
             logger.info(
                 "wait_for_runners_ready: all %d runners registered (%.1fs)",
                 expected,
@@ -104,16 +116,30 @@ async def wait_for_runners_ready(
             )
             return registered
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         logger.info(
             "wait_for_runners_ready: %d/%d runners registered, waiting...",
             registered,
             expected,
         )
-        await asyncio.sleep(_READINESS_POLL_INTERVAL)
+        await asyncio.sleep(min(_READINESS_POLL_INTERVAL, remaining))
+
+    if not any_poll_succeeded and poll_failures > 0 and last_poll_error is not None:
+        logger.error(
+            "wait_for_runners_ready: registry poll failed persistently across %d attempt(s): %s",
+            poll_failures,
+            last_poll_error,
+            exc_info=True,
+        )
+        raise BroadcastError(
+            f"wait_for_runners_ready failed persistently across {poll_failures} attempt(s): {last_poll_error}"
+        ) from last_poll_error
 
     logger.warning(
         "wait_for_runners_ready: timeout after %.0fs — %d/%d runners registered, proceeding",
-        timeout_seconds,
+        safe_timeout,
         registered,
         expected,
     )
@@ -124,6 +150,7 @@ async def publish_to_runners(
     data: str,
     simulation_id: str,
     exclude_runner_ids: list[str] | None = None,
+    user_id: str | None = None,
 ) -> None:
     """Publish a serialized event string to runners via Redis broadcast.
 
@@ -135,19 +162,24 @@ async def publish_to_runners(
         simulation_id: Simulation ID for channel scoping.
         exclude_runner_ids: Optional list of runner session IDs the
             dispatcher should skip when fanning out this broadcast.
+        user_id: Optional explicit tenant user_id (falls back to
+            ``simulation_registry.user_scope`` / ``DISPATCHER_USER_ID``).
     """
     payload: dict[str, object] = {"data": data}
     if exclude_runner_ids:
         payload["exclude_runner_ids"] = exclude_runner_ids
+    eff_user = simulation_registry._resolve_registry_user(user_id, require_when_saas=False)
     envelope_dict: dict[str, object] = {
         "type": "broadcast",
         "eventId": str(uuid.uuid4()),
         "payload": payload,
         "simulation_id": simulation_id,
     }
+    if tenant_keys._saas_mode_enabled() and eff_user:
+        envelope_dict["user_id"] = eff_user
     envelope = json.dumps(envelope_dict)
 
-    channel = _scoped_broadcast_channel(simulation_id)
+    channel = _scoped_broadcast_channel(simulation_id, user_id=user_id)
 
     try:
         r = get_shared_redis_client()
@@ -155,10 +187,11 @@ async def publish_to_runners(
             return
         await r.publish(channel, envelope)
     except Exception as e:
-        logger.warning("publish_to_runners: Redis publish failed: %s", e)
+        logger.error("publish_to_runners: Redis publish failed: %s", e, exc_info=True)
+        raise
 
 
-async def publish_end_simulation(simulation_id: str) -> None:
+async def publish_end_simulation(simulation_id: str, user_id: str | None = None) -> None:
     """Publish an end_simulation event so dispatchers remove runner sessions.
 
     This is called by stop_race_collector after the race completes.  Each
@@ -168,15 +201,19 @@ async def publish_end_simulation(simulation_id: str) -> None:
 
     Args:
         simulation_id: The simulation whose runners should be cleaned up.
+        user_id: Optional explicit tenant user_id (falls back to
+            ``simulation_registry.user_scope`` / ``DISPATCHER_USER_ID``).
     """
-    envelope = json.dumps(
-        {
-            "type": "end_simulation",
-            "simulation_id": simulation_id,
-            "eventId": str(uuid.uuid4()),
-        }
-    )
-    channel = _scoped_broadcast_channel(simulation_id)
+    eff_user = simulation_registry._resolve_registry_user(user_id, require_when_saas=False)
+    envelope_dict: dict[str, object] = {
+        "type": "end_simulation",
+        "simulation_id": simulation_id,
+        "eventId": str(uuid.uuid4()),
+    }
+    if tenant_keys._saas_mode_enabled() and eff_user:
+        envelope_dict["user_id"] = eff_user
+    envelope = json.dumps(envelope_dict)
+    channel = _scoped_broadcast_channel(simulation_id, user_id=user_id)
     try:
         r = get_shared_redis_client()
         if r is None:
@@ -184,4 +221,5 @@ async def publish_end_simulation(simulation_id: str) -> None:
         await r.publish(channel, envelope)
         logger.info("publish_end_simulation: published to %s", channel)
     except Exception as e:
-        logger.warning("publish_end_simulation: Redis publish failed: %s", e)
+        logger.error("publish_end_simulation: Redis publish failed: %s", e, exc_info=True)
+        raise

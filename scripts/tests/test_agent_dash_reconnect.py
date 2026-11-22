@@ -1,4 +1,6 @@
 # Copyright 2026 Google LLC
+# Modifications copyright 2026 Christian Haeussinger
+# Changed for The Rehearsal: added regression tests for subscription teardown order and WebSocket disconnect cleanup.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +29,11 @@ def _get_module():
 
 class TestPubSubReconnectBackoff:
     """Tests for exponential backoff in start_subscriber reconnect."""
+
+    @staticmethod
+    def _ensure_project(mod, monkeypatch):
+        monkeypatch.setenv("PUBSUB_PROJECT_ID", "test-project")
+        monkeypatch.setattr(mod, "PROJECT_ID", "test-project")
 
     def _failing_subscribe(self, *args, **kwargs):
         """Create a mock future that raises on .result()."""
@@ -59,9 +66,10 @@ class TestPubSubReconnectBackoff:
             patch("random.uniform", return_value=0),
         )
 
-    def test_reconnect_uses_exponential_backoff(self):
+    def test_reconnect_uses_exponential_backoff(self, monkeypatch):
         """Reconnect delay should increase exponentially after failures."""
         mod = _get_module()
+        self._ensure_project(mod, monkeypatch)
         sleep_values: list[float] = []
         stop_event = threading.Event()
 
@@ -75,9 +83,10 @@ class TestPubSubReconnectBackoff:
         assert sleep_values[2] == 20.0
         assert sleep_values[3] == 40.0
 
-    def test_backoff_caps_at_60_seconds(self):
+    def test_backoff_caps_at_60_seconds(self, monkeypatch):
         """Backoff should never exceed 60 seconds (+ jitter)."""
         mod = _get_module()
+        self._ensure_project(mod, monkeypatch)
         sleep_values: list[float] = []
         stop_event = threading.Event()
 
@@ -88,9 +97,10 @@ class TestPubSubReconnectBackoff:
         for val in sleep_values:
             assert val <= 75.0, f"Sleep value {val} exceeds cap"
 
-    def test_backoff_resets_on_successful_connection(self):
+    def test_backoff_resets_on_successful_connection(self, monkeypatch):
         """After a successful pull cycle, backoff should reset to 5s."""
         mod = _get_module()
+        self._ensure_project(mod, monkeypatch)
         sleep_values: list[float] = []
         stop_event = threading.Event()
         call_count = 0
@@ -135,9 +145,10 @@ class TestPubSubReconnectBackoff:
         # Third failure: should be back to 5s (not 10s)
         assert sleep_values[1] == 5.0
 
-    def test_stop_event_terminates_loop(self):
+    def test_stop_event_terminates_loop(self, monkeypatch):
         """Setting stop_event should cause start_subscriber to exit."""
         mod = _get_module()
+        self._ensure_project(mod, monkeypatch)
         stop_event = threading.Event()
         stop_event.set()  # Pre-set so loop exits immediately
 
@@ -147,3 +158,47 @@ class TestPubSubReconnectBackoff:
         ):
             # Should return immediately without blocking
             mod.start_subscriber(stop_event=stop_event)
+
+    def test_deletes_subscription_before_closing_subscriber_channel(self, monkeypatch):
+        """delete_subscription must execute BEFORE `with subscriber:` closes gRPC."""
+        mod = _get_module()
+        self._ensure_project(mod, monkeypatch)
+        stop_event = threading.Event()
+        events: list[str] = []
+
+        future = MagicMock()
+        future.result.side_effect = lambda: stop_event.set()
+        future.cancel = MagicMock(side_effect=lambda: events.append("cancel"))
+
+        mock_sub = MagicMock()
+        mock_sub.__enter__ = MagicMock(return_value=mock_sub)
+        mock_sub.__exit__ = MagicMock(side_effect=lambda *_: events.append("exit") or False)
+        mock_sub.subscribe.return_value = future
+        mock_sub.topic_path.return_value = "projects/test/topics/t"
+        mock_sub.subscription_path.return_value = "projects/test/subscriptions/s"
+        mock_sub.delete_subscription.side_effect = lambda **_: events.append("delete")
+
+        mock_pub = MagicMock()
+
+        with (
+            patch.object(mod.pubsub_v1, "SubscriberClient", return_value=mock_sub),
+            patch.object(mod.pubsub_v1, "PublisherClient", return_value=mock_pub),
+        ):
+            mod.start_subscriber(stop_event=stop_event)
+
+        assert "delete" in events and "exit" in events
+        assert events.index("delete") < events.index("exit")
+        mock_pub.transport.close.assert_called_once()
+
+    def test_websocket_abnormal_disconnect_removes_connection(self):
+        """Non-WebSocketDisconnect exceptions must still remove dead sockets."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        mod = _get_module()
+        ws = MagicMock()
+        ws.accept = AsyncMock()
+        ws.receive_text = AsyncMock(side_effect=RuntimeError("socket broken"))
+
+        asyncio.run(mod.websocket_endpoint(ws))
+        assert ws not in mod.connections

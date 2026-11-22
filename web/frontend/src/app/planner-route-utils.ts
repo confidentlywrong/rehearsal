@@ -1,5 +1,6 @@
 /**
  * Copyright 2026 Google LLC
+ * Modifications copyright 2026 Christian Haeussinger
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -12,6 +13,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changed for The Rehearsal: clamp Haversine radicand against floating-point overshoot and guard malformed GeoJSON coordinate arrays.
  */
 
 /**
@@ -77,9 +80,10 @@ export function computeDistance(coords: [number, number][]): number {
     const R = 6371000;
     const dLat = ((y1 - y0) * Math.PI) / 180;
     const dLon = ((x1 - x0) * Math.PI) / 180;
-    const a =
+    const rawA =
       Math.sin(dLat / 2) ** 2 +
       Math.cos((y0 * Math.PI) / 180) * Math.cos((y1 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+    const a = Math.min(1, Math.max(0, rawA));
     distM += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
   return distM;
@@ -89,7 +93,7 @@ export function parseGeoJSON(json: any): ParsedRoute | null {
   let features: any[] = [];
 
   if (json?.type === 'Feature') {
-    if (json.geometry?.type === 'LineString') {
+    if (json.geometry?.type === 'LineString' && Array.isArray(json.geometry.coordinates)) {
       return {
         coords: json.geometry.coordinates,
         name: json.properties?.name ?? null,
@@ -99,13 +103,15 @@ export function parseGeoJSON(json: any): ParsedRoute | null {
     }
     return null;
   } else if (json?.type === 'FeatureCollection' || Array.isArray(json?.features)) {
-    features = json.features ?? [];
+    features = Array.isArray(json.features) ? json.features : [];
   } else {
     return null;
   }
 
   // Collect all LineString features and concatenate their coordinates
-  const lineFeatures = features.filter((f: any) => f.geometry?.type === 'LineString');
+  const lineFeatures = features.filter(
+    (f: any) => f?.geometry?.type === 'LineString' && Array.isArray(f.geometry.coordinates),
+  );
   if (lineFeatures.length === 0) return null;
 
   const coords: [number, number][] = [];

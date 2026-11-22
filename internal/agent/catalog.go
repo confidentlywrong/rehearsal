@@ -1,6 +1,6 @@
 // Copyright 2026 Google LLC
 // Modifications copyright 2026 Christian Haeussinger
-// Changed for The Rehearsal: adapted simulation, agents, and infrastructure for leadership scenario rehearsal.
+// Changed for The Rehearsal: adapted simulation runtime, agents, and infrastructure for executive leadership rehearsal.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -95,16 +95,32 @@ func (c *AgentCard) UnmarshalJSON(data []byte) error {
 }
 
 // SetURL updates the URL in both the extracted field and the raw JSON.
-func (c *AgentCard) SetURL(url string) {
-	c.URL = url
-	// Update the raw JSON too so it's consistent when proxied
-	var m map[string]interface{}
-	if err := json.Unmarshal(c.Raw, &m); err == nil {
-		m["url"] = url
-		if updated, err := json.Marshal(m); err == nil {
-			c.Raw = updated
-		}
+func (c *AgentCard) SetURL(rawURL string) {
+	c.URL = rawURL
+	if len(c.Raw) == 0 {
+		return
 	}
+	// Update the raw JSON too so it's consistent when proxied.
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(c.Raw, &m); err != nil {
+		log.Printf("AgentCard.SetURL: WARNING — failed to unmarshal raw card JSON: %v", err)
+		return
+	}
+	if m == nil {
+		m = make(map[string]json.RawMessage)
+	}
+	encodedURL, err := json.Marshal(rawURL)
+	if err != nil {
+		log.Printf("AgentCard.SetURL: WARNING — failed to marshal URL %q: %v", rawURL, err)
+		return
+	}
+	m["url"] = encodedURL
+	updated, err := json.Marshal(m)
+	if err != nil {
+		log.Printf("AgentCard.SetURL: WARNING — failed to marshal updated card JSON: %v", err)
+		return
+	}
+	c.Raw = updated
 }
 
 // OrchestrationBaseURL returns the base URL for orchestration pokes.
@@ -167,6 +183,7 @@ type Catalog struct {
 
 	oidcMu      sync.RWMutex
 	oidcClients map[string]*http.Client
+	oidcFactory func(audience string) (*http.Client, error)
 }
 
 // newRetryableClient wraps an HTTP client with retry logic
@@ -194,7 +211,7 @@ func NewCatalogWithTTL(agentURLs []string, ttl time.Duration) *Catalog {
 }
 
 // NewCatalog creates a catalog that discovers agents from the given base URLs.
-// Each URL should be the agent's base URL (e.g., http://localhost:8201).
+// Each URL should be the agent's base URL (e.g., http://127.0.0.1:9104).
 // For standard A2A agents, appends /.well-known/agent-card.json.
 // For Agent Engine agents, appends /a2a/v1/card and uses GCP auth.
 func NewCatalog(agentURLs []string) *Catalog {
@@ -248,14 +265,26 @@ type discoverResult struct {
 // Results are cached for cacheTTL. Unreachable agents are logged and skipped
 // (not fatal unless none are found).
 func (c *Catalog) DiscoverAgents() (map[string]AgentCard, error) {
+	return c.DiscoverAgentsContext(context.Background())
+}
+
+// DiscoverAgentsContext fetches AgentCards from each configured agent URL concurrently,
+// respecting ctx for cancellation and deadlines. Returns a defensive copy of cached results.
+func (c *Catalog) DiscoverAgentsContext(ctx context.Context) (map[string]AgentCard, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(c.agentURLs) == 0 {
 		return nil, fmt.Errorf("no agent URLs configured (check AGENT_URLS env var)")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Fast path: return cached results if still valid (read lock).
 	c.cacheMu.RLock()
 	if c.cachedAgents != nil && time.Now().Before(c.cacheExpiry) {
-		agents := c.cachedAgents
+		agents := cloneAgentMap(c.cachedAgents)
 		c.cacheMu.RUnlock()
 		return agents, nil
 	}
@@ -267,16 +296,20 @@ func (c *Catalog) DiscoverAgents() (map[string]AgentCard, error) {
 	c.fetchMu.Lock()
 	defer c.fetchMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Double-check: another goroutine may have refreshed while we waited.
 	c.cacheMu.RLock()
 	if c.cachedAgents != nil && time.Now().Before(c.cacheExpiry) {
-		agents := c.cachedAgents
+		agents := cloneAgentMap(c.cachedAgents)
 		c.cacheMu.RUnlock()
 		return agents, nil
 	}
 	c.cacheMu.RUnlock()
 
-	newAgents, err := c.fetchAgents()
+	newAgents, err := c.fetchAgents(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -298,11 +331,160 @@ func (c *Catalog) DiscoverAgents() (map[string]AgentCard, error) {
 	c.cacheExpiry = time.Now().Add(ttl)
 	c.cacheMu.Unlock()
 
-	return newAgents, nil
+	return cloneAgentMap(newAgents), nil
+}
+
+func cloneAgentMap(src map[string]AgentCard) map[string]AgentCard {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]AgentCard, len(src))
+	for k, v := range src {
+		if v.Raw != nil {
+			v.Raw = append(json.RawMessage(nil), v.Raw...)
+		}
+		if v.Capabilities != nil {
+			v.Capabilities = cloneCapabilitiesMap(v.Capabilities)
+		}
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneCapabilitiesMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		dst[k] = cloneCapabilityValue(v)
+	}
+	return dst
+}
+
+func cloneCapabilityValue(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		return cloneCapabilitiesMap(typed)
+	case []interface{}:
+		if typed == nil {
+			return ([]interface{})(nil)
+		}
+		out := make([]interface{}, len(typed))
+		for i, elem := range typed {
+			out[i] = cloneCapabilityValue(elem)
+		}
+		return out
+	case map[string]string:
+		if typed == nil {
+			return (map[string]string)(nil)
+		}
+		out := make(map[string]string, len(typed))
+		for k, val := range typed {
+			out[k] = val
+		}
+		return out
+	case []string:
+		if typed == nil {
+			return ([]string)(nil)
+		}
+		out := make([]string, len(typed))
+		copy(out, typed)
+		return out
+	case []map[string]interface{}:
+		if typed == nil {
+			return ([]map[string]interface{})(nil)
+		}
+		out := make([]map[string]interface{}, len(typed))
+		for i, elem := range typed {
+			out[i] = cloneCapabilitiesMap(elem)
+		}
+		return out
+	case []byte:
+		if typed == nil {
+			return ([]byte)(nil)
+		}
+		out := make([]byte, len(typed))
+		copy(out, typed)
+		return out
+	default:
+		return v
+	}
+}
+
+func (c *Catalog) selectHTTPClient(baseURL string, isAE bool) (*http.Client, error) {
+	if isAE {
+		if c.gcpClient == nil {
+			return nil, fmt.Errorf("GCP auth client unavailable for Agent Engine URL %s", baseURL)
+		}
+		return c.gcpClient, nil
+	}
+	if auth.IsCloudRunURL(baseURL) {
+		c.oidcMu.RLock()
+		var cachedOIDC *http.Client
+		if c.oidcClients != nil {
+			cachedOIDC = c.oidcClients[baseURL]
+		}
+		c.oidcMu.RUnlock()
+		if cachedOIDC != nil {
+			return cachedOIDC, nil
+		}
+
+		c.oidcMu.Lock()
+		defer c.oidcMu.Unlock()
+		if c.oidcClients == nil {
+			c.oidcClients = make(map[string]*http.Client)
+		}
+		if cachedOIDC = c.oidcClients[baseURL]; cachedOIDC != nil {
+			return cachedOIDC, nil
+		}
+		oidcFn := c.oidcFactory
+		if oidcFn == nil {
+			oidcFn = auth.OIDCClientE
+		}
+		oidcClient, err := oidcFn(auth.AudienceFor(baseURL))
+		if err != nil {
+			return nil, fmt.Errorf("OIDC auth client unavailable for Cloud Run URL %s: %w", baseURL, err)
+		}
+		if oidcClient == nil {
+			return nil, fmt.Errorf("OIDC auth client unavailable for Cloud Run URL %s", baseURL)
+		}
+		wrapped := newRetryableClient(oidcClient)
+		c.oidcClients[baseURL] = wrapped
+		return wrapped, nil
+	}
+	if c.client == nil {
+		return nil, fmt.Errorf("HTTP client unavailable for URL %s", baseURL)
+	}
+	return c.client, nil
+}
+
+// resolveAgentCardURL preserves the card's A2A path (e.g. /a2a/simulator/) while
+// replacing the host with the internal discovery baseURL and avoiding double-pathing
+// when baseURL already ends with that path.
+func resolveAgentCardURL(baseURL, cardURL string) string {
+	baseTrimmed := strings.TrimRight(baseURL, "/")
+	if cardURL == "" {
+		return baseTrimmed
+	}
+	origURL, err := url.Parse(cardURL)
+	if err != nil || origURL.Path == "" || origURL.Path == "/" {
+		return baseTrimmed
+	}
+	baseParsed, baseErr := url.Parse(baseTrimmed)
+	if baseErr == nil {
+		basePathTrimmed := strings.TrimRight(baseParsed.Path, "/")
+		origPathTrimmed := strings.TrimRight(origURL.Path, "/")
+		if basePathTrimmed != "" && (basePathTrimmed == origPathTrimmed || strings.HasSuffix(basePathTrimmed, origPathTrimmed)) {
+			prefix := strings.TrimSuffix(baseTrimmed, origPathTrimmed)
+			return prefix + origURL.Path
+		}
+	}
+	return baseTrimmed + origURL.Path
 }
 
 // fetchAgents performs the actual HTTP discovery.
-func (c *Catalog) fetchAgents() (map[string]AgentCard, error) {
+func (c *Catalog) fetchAgents(ctx context.Context) (map[string]AgentCard, error) {
 	results := make(chan discoverResult, len(c.agentURLs))
 	var wg sync.WaitGroup
 
@@ -320,33 +502,19 @@ func (c *Catalog) fetchAgents() (map[string]AgentCard, error) {
 			}
 			cardURL := baseURL + cardPath
 
-			// Auth selection per URL kind:
+			// Auth selection per URL kind (fail-closed — no unauthenticated fallback):
 			//  - Agent Engine: OAuth bearer (cloud-platform scope) via c.gcpClient.
 			//  - Cloud Run (any other https://): OIDC ID token with audience =
 			//    service URL. Cloud Run --no-allow-unauthenticated services
 			//    return 403 to anything else, including OAuth bearers.
 			//  - localhost / http://: plain client (local dev, no auth).
-			httpClient := c.client
-			if isAE && c.gcpClient != nil {
-				httpClient = c.gcpClient
-			} else if auth.IsCloudRunURL(baseURL) {
-				c.oidcMu.RLock()
-				if cachedOIDC := c.oidcClients[baseURL]; cachedOIDC != nil {
-					httpClient = cachedOIDC
-				}
-				c.oidcMu.RUnlock()
-
-				if httpClient == c.client || httpClient == nil {
-					if oidcClient := auth.OIDCClient(auth.AudienceFor(baseURL)); oidcClient != nil {
-						httpClient = newRetryableClient(oidcClient)
-						c.oidcMu.Lock()
-						c.oidcClients[baseURL] = httpClient
-						c.oidcMu.Unlock()
-					}
-				}
+			httpClient, err := c.selectHTTPClient(baseURL, isAE)
+			if err != nil {
+				results <- discoverResult{baseURL: baseURL, err: err}
+				return
 			}
 
-			card, err := c.fetchCard(cardURL, httpClient)
+			card, err := c.fetchCard(ctx, cardURL, httpClient)
 			if err != nil {
 				results <- discoverResult{baseURL: baseURL, err: err}
 				return
@@ -361,18 +529,11 @@ func (c *Catalog) fetchAgents() (map[string]AgentCard, error) {
 				// AE agents: always use the discovery base URL as-is.
 				// The switchboard appends /a2a/v1/message:send for dispatches.
 				card.SetURL(baseURL)
-			} else if card.URL != "" {
-				// Local/Cloud Run: preserve the card's A2A path (e.g.,
-				// /a2a/simulator/) but replace the host with the internal
-				// discovery URL. Cards may self-report public/IAP URLs
-				// unreachable server-to-server.
-				if origURL, err := url.Parse(card.URL); err == nil && origURL.Path != "" && origURL.Path != "/" {
-					card.SetURL(strings.TrimRight(baseURL, "/") + origURL.Path)
-				} else {
-					card.SetURL(baseURL)
-				}
 			} else {
-				card.SetURL(baseURL)
+				// Local/Cloud Run: preserve the card's A2A path (e.g.,
+				// /a2a/simulator/) without double-pathing, replacing the
+				// host with the internal discovery URL.
+				card.SetURL(resolveAgentCardURL(baseURL, card.URL))
 			}
 
 			results <- discoverResult{card: card, baseURL: baseURL}
@@ -395,7 +556,9 @@ func (c *Catalog) fetchAgents() (map[string]AgentCard, error) {
 			continue
 		}
 		if r.card.Name == "" {
-			log.Printf("Catalog: skipping agent at %s — DISCOVERY_FAILURE: card has no name", r.baseURL)
+			err := fmt.Errorf("agent card at %s has no name", r.baseURL)
+			log.Printf("Catalog: skipping agent at %s — DISCOVERY_FAILURE: %v", r.baseURL, err)
+			lastErr = err
 			continue
 		}
 		// Concurrent discovery means duplicate names resolve nondeterministically
@@ -430,10 +593,13 @@ func (c *Catalog) fetchAgents() (map[string]AgentCard, error) {
 const perFetchTimeout = 15 * time.Second
 
 // fetchCard fetches and parses an AgentCard from the given URL using the provided HTTP client.
-func (c *Catalog) fetchCard(url string, httpClient *http.Client) (AgentCard, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), perFetchTimeout)
+func (c *Catalog) fetchCard(ctx context.Context, url string, httpClient *http.Client) (AgentCard, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, perFetchTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return AgentCard{}, fmt.Errorf("build request failed: %w", err)
 	}
@@ -446,22 +612,29 @@ func (c *Catalog) fetchCard(url string, httpClient *http.Client) (AgentCard, err
 	if resp.StatusCode != http.StatusOK {
 		// Read up to 512 bytes of the response body for error diagnostics.
 		// This helps operators debug AE set_up() failures, auth issues, etc.
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if readErr != nil {
+			return AgentCard{}, fmt.Errorf("unexpected status %d (failed reading error body: %w)", resp.StatusCode, readErr)
+		}
 		if len(errBody) > 0 {
 			return AgentCard{}, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(errBody))
 		}
 		return AgentCard{}, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	const maxAgentCardBytes = 4 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAgentCardBytes+1))
 	if err != nil {
 		return AgentCard{}, fmt.Errorf("read body failed: %w", err)
+	}
+	if len(body) > maxAgentCardBytes {
+		return AgentCard{}, fmt.Errorf("agent card exceeds %d byte limit", maxAgentCardBytes)
 	}
 
 	// Validate Content-Type before attempting JSON parse.
 	// Catches HTML error pages returned with 200 status (e.g., reverse proxy fallbacks).
 	ct := resp.Header.Get("Content-Type")
-	if ct != "" && !strings.Contains(ct, "json") {
+	if ct != "" && !strings.Contains(strings.ToLower(ct), "json") {
 		return AgentCard{}, fmt.Errorf("unexpected Content-Type %q (expected application/json)", ct)
 	}
 

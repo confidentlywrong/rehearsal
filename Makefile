@@ -24,7 +24,7 @@ export
 # Set a local uv cache to bypass macOS permissions issues on ~/.cache
 export UV_CACHE_DIR ?= ./.uv_cache
 
-.PHONY: init check-prereqs infra-init infra-plan infra-apply infra-destroy infra-output deploy deploy-local help test lint lint-go lint-py lint-pyright lint-configs check-license fmt build proto ensure-venv coverage coverage-go coverage-py test-unit-go test-integration-go test-py-integration test-web verify perf-test perf-diagnostic eval-stress test-e2e-simulation docker-build-all docker-build-go docker-build-py eval start status stop restart clean
+.PHONY: init check-prereqs infra-init infra-plan infra-apply infra-destroy infra-output deploy deploy-local help test test-go test-py test-deploy-sh lint lint-go lint-py lint-pyright lint-configs check-license fmt fmt-go fmt-py build proto ensure-venv coverage coverage-go coverage-py test-unit-go test-integration-go test-py-integration test-web verify verify-full perf-test perf-diagnostic eval-stress bench-concurrency bench-test scale-test test-e2e-simulation docker-build-all docker-build-go docker-build-py eval start saas-local status stop restart clean
 
 .DEFAULT_GOAL := help
 
@@ -158,7 +158,7 @@ check-license: ## Verify Apache 2.0 license headers across source files
 	go run github.com/google/addlicense@latest -check -y "2024-2030" \
 		-ignore 'LICENSE' -ignore 'gen_proto/**' -ignore 'web/**/node_modules/**' -ignore 'web/**/dist/**' \
 		-ignore 'web/**/.angular/**' -ignore '.venv/**' -ignore '.uv_cache/**' \
-		-ignore '**/.terraform.lock.hcl' .
+		-ignore '**/.terraform/**' -ignore '**/.terraform.lock.hcl' -ignore 'data/**' .
 
 # --- Format ---
 fmt: fmt-go fmt-py ## Format all code (Go + Python)

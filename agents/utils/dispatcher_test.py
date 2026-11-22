@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 
 import pytest
@@ -159,9 +160,7 @@ async def test_callable_dispatcher_skips_redis():
         # We can't easily test the full loop, but we can test that
         # the dispatcher knows it's callable
         dispatcher.start()
-        import time
-
-        time.sleep(0.5)
+        await asyncio.sleep(0.05)
         dispatcher.stop()
 
         # In callable mode, Redis listeners should never be called
@@ -241,7 +240,6 @@ async def test_process_event_a2ui_action():
         assert content.parts is not None
         part_text = content.parts[0].text
         assert part_text is not None
-        import json
 
         action_data = json.loads(part_text)
         assert action_data["a2ui_action"] == "run_simulation"
@@ -315,7 +313,8 @@ async def test_environment_reset_clears_sessions_and_tasks():
     dispatcher = RedisOrchestratorDispatcher(runner=runner)
 
     # Seed some sessions
-    dispatcher.active_sessions = {"s1", "s2", "s3"}
+    for sid in ("s1", "s2", "s3"):
+        dispatcher.active_sessions.add(sid)
     from collections import OrderedDict
 
     dispatcher._seen_events = OrderedDict([("evt1", None), ("evt2", None)])
@@ -399,3 +398,136 @@ async def test_broadcast_skips_a2ui_tool_results():
             assert kwargs.get("msg_type") != "json" or "a2ui" not in json.dumps(kwargs.get("data", {})), (
                 f"Dispatcher emitted A2UI tool result as msg_type='json': {kwargs}"
             )
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_rejects_empty_user_id_when_bound(monkeypatch):
+    """When DISPATCHER_USER_ID is set, spawn_agent without user_id must be rejected."""
+    monkeypatch.setenv("DISPATCHER_USER_ID", "alice")
+
+    agent = LlmAgent(name="tenant_agent", instruction="Test")
+    app = App(name="tenant_app", root_agent=agent)
+    runner = InMemoryRunner(app=app)
+    dispatcher = RedisOrchestratorDispatcher(runner=runner)
+
+    await dispatcher._process_event(
+        {
+            "type": "spawn_agent",
+            "eventId": "evt-missing-uid",
+            "sessionId": "sess-missing-uid",
+            "payload": {
+                "agentType": "tenant_app",
+                "simulation_id": "sim-1",
+            },
+        }
+    )
+    assert "sess-missing-uid" not in dispatcher.active_sessions
+
+
+@pytest.mark.asyncio
+async def test_handle_event_marshals_pubsub_across_loops():
+    """HTTP handle_event() on caller loop marshals _pubsub subscribe/unsubscribe onto self._loop."""
+    import threading
+
+    agent = LlmAgent(name="loop_agent", instruction="Test")
+    app = App(name="loop_app", root_agent=agent)
+    runner = InMemoryRunner(app=app)
+    dispatcher = RedisOrchestratorDispatcher(runner=runner, dispatch_mode="callable")
+
+    loop_ready = threading.Event()
+    sub_loops: list[asyncio.AbstractEventLoop] = []
+
+    class FakePubSub:
+        async def subscribe(self, channel: str) -> None:
+            sub_loops.append(asyncio.get_running_loop())
+
+        async def unsubscribe(self, channel: str) -> None:
+            sub_loops.append(asyncio.get_running_loop())
+
+    bg_loop = asyncio.new_event_loop()
+
+    def _bg() -> None:
+        asyncio.set_event_loop(bg_loop)
+        dispatcher._loop = bg_loop
+        dispatcher._pubsub = FakePubSub()
+        loop_ready.set()
+        bg_loop.run_forever()
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+    assert loop_ready.wait(timeout=2.0)
+    try:
+        await dispatcher.handle_event(
+            {
+                "type": "spawn_agent",
+                "eventId": "evt-cross-loop",
+                "sessionId": "sess-cross",
+                "payload": {"agentType": "loop_app", "simulation_id": "sim-cross"},
+            }
+        )
+        assert sub_loops == [bg_loop]
+        dispatcher.remove_session("sess-cross")
+        await asyncio.sleep(0.05)
+        assert sub_loops == [bg_loop, bg_loop]
+    finally:
+        bg_loop.call_soon_threadsafe(bg_loop.stop)
+        t.join(timeout=2.0)
+        bg_loop.close()
+
+
+def test_prepare_pulses_preserves_empty_dict_function_response():
+    """Empty dict {} function_response must not be dropped by truthiness check."""
+    agent = LlmAgent(name="fr_agent", instruction="Test")
+    app = App(name="fr_app", root_agent=agent)
+    runner = InMemoryRunner(app=app)
+    dispatcher = RedisOrchestratorDispatcher(runner=runner)
+
+    mock_part = MagicMock()
+    mock_part.text = None
+    mock_part.function_call = None
+    mock_part.function_response = MagicMock()
+    mock_part.function_response.response = {}
+
+    mock_event = MagicMock()
+    mock_event.author = "agent"
+    mock_event.content.parts = [mock_part]
+
+    assert dispatcher._prepare_pulses("sess-1", mock_event) == ["{}"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_agent_run_logic_rejects_invalid_redis_max_connections(monkeypatch):
+    """Invalid REDIS_MAX_CONNECTIONS raises ValueError instead of silently falling back."""
+    monkeypatch.setenv("REDIS_MAX_CONNECTIONS", "not-an-int")
+    agent = LlmAgent(name="cfg_agent", instruction="Test")
+    app = App(name="cfg_app", root_agent=agent)
+    runner = InMemoryRunner(app=app)
+    dispatcher = RedisOrchestratorDispatcher(runner=runner)
+
+    content = types.Content(role="user", parts=[types.Part.from_text(text="hi")])
+    with pytest.raises(ValueError, match="REDIS_MAX_CONNECTIONS"):
+        await dispatcher._trigger_agent_run_logic("sess-cfg", content)
+
+
+@pytest.mark.asyncio
+async def test_process_event_handles_null_payload_without_attribute_error(caplog):
+    """Explicit null payload must not raise AttributeError inside _process_event."""
+    import logging
+
+    agent = LlmAgent(name="null_payload_agent", instruction="Test")
+    app = App(name="null_payload_app", root_agent=agent)
+    runner = InMemoryRunner(app=app)
+    dispatcher = RedisOrchestratorDispatcher(runner=runner)
+
+    with caplog.at_level(logging.ERROR):
+        await dispatcher._process_event(
+            {
+                "type": "spawn_agent",
+                "eventId": "evt-null-payload",
+                "sessionId": "sess-null",
+                "payload": None,
+            }
+        )
+
+    assert "sess-null" not in dispatcher.active_sessions
+    assert "AttributeError" not in caplog.text
